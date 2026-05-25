@@ -62,6 +62,7 @@ export function createZergSubagentRunSnapshot(run: ZergSubagentRunSnapshot): Zer
     completedAt: run.completedAt,
     finalSummary: run.finalSummary,
     errorSummary: run.errorSummary,
+    ...(run.recovery ? { recovery: { ...run.recovery } } : {}),
     memberProgress: run.memberProgress?.map((member) => ({ ...member })),
     metadata: cloneOptional(run.metadata, cloneExtensionFields),
   };
@@ -1197,6 +1198,15 @@ function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
   const originalTask = typeof metadata?.originalTask === 'string'
     ? metadata.originalTask
     : typeof metadata?.task === 'string' ? metadata.task : undefined;
+  const recovery = isPlainRecord(metadata?.recovery)
+    ? {
+      recoveredAt: typeof metadata.recovery.recoveredAt === 'string' ? metadata.recovery.recoveredAt : '',
+      reason: 'process-restart' as const,
+      previousStatus: typeof metadata.recovery.previousStatus === 'string' ? metadata.recovery.previousStatus as ZergSubagentRunSnapshot['status'] : undefined,
+      previousSubstate: typeof metadata.recovery.previousSubstate === 'string' ? metadata.recovery.previousSubstate as ZergSubagentRunSnapshot['substate'] : undefined,
+      previousWriterSessionId: typeof metadata.recovery.previousWriterSessionId === 'string' ? metadata.recovery.previousWriterSessionId : undefined,
+    }
+    : undefined;
   return {
     runId: agent.id,
     agentId: agentDefinitionId ?? agent.id,
@@ -1214,6 +1224,7 @@ function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
     completedAt: typeof metadata?.completedAt === 'string' ? metadata.completedAt : undefined,
     finalSummary: typeof metadata?.finalSummary === 'string' ? metadata.finalSummary : undefined,
     errorSummary: typeof metadata?.errorSummary === 'string' ? metadata.errorSummary : undefined,
+    ...(recovery?.recoveredAt ? { recovery } : {}),
     memberProgress: Array.isArray(metadata?.memberProgress) ? metadata.memberProgress.map((member) => ({ ...(member as Record<string, unknown>) })) as unknown as ZergSubagentRunSnapshot['memberProgress'] : undefined,
     metadata: cloneOptional(metadata, cloneExtensionFields),
   };

@@ -2,11 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 
 import { installInternalPatch } from './internal-patch.js';
+import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { deriveThinkingSteps } from './parse.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
 import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
 import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
-import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot } from './types.js';
+import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot } from './types.js';
 
 type ZergIdFactory = {
   runId?: () => string;
@@ -17,9 +18,10 @@ export interface ZergCommandHandlerOptions {
   now?: () => Date;
   subagentAdapter?: ZergSubagentControlAdapter;
   idFactory?: ZergIdFactory;
+  persistence?: ZergPersistenceOptions;
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean };
+type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -82,6 +84,7 @@ const defaultIdFactory: Required<ZergIdFactory> = {
 };
 
 type PiNativeSessionHandle = {
+  prompt?: (message: string, options?: { source?: string }) => Promise<unknown> | unknown;
   abort?: () => Promise<void> | void;
   dispose?: () => void;
 };
@@ -131,8 +134,10 @@ export function registerZergSwarmExtension(
   const sharedSeedSource = readSharedZergState();
   const sharedSeed = seedBuiltinAgentDefinitions(sharedSeedSource);
   const stateContainer = createZergStateContainer(sharedSeed);
+  const persistenceManager = createZergPersistenceManager(options.persistence);
+  persistenceManager?.hydrate(stateContainer, options.now);
   if (sharedSeed !== sharedSeedSource) {
-    replaceSharedZergState(sharedSeed);
+    replaceSharedZergState(stateContainer.snapshot());
   }
   let patch: ZergInternalPatchController | undefined;
   const commandDisposers: RegisteredCommandDisposer[] = [];
@@ -148,16 +153,18 @@ export function registerZergSwarmExtension(
     replace: (nextState) => {
       const snapshot = stateContainer.replace(nextState);
       syncSharedStateFromContainer();
+      persistenceManager?.save(snapshot, options.now);
       return snapshot;
     },
     update: (nextState, patchOptions) => {
       const snapshot = stateContainer.update(nextState, patchOptions);
       syncSharedStateFromContainer();
+      persistenceManager?.save(snapshot, options.now);
       return snapshot;
     },
     subscribe: (listener) => stateContainer.subscribe?.(listener) ?? (() => undefined),
   };
-  const runtimeOptions = { ...options, syncSharedState: true } as RuntimeCommandOptions;
+  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
 
@@ -295,11 +302,31 @@ export function createZergControl(
   stateOrContainer: ZergStateContainer | Partial<ZergState> = createZergStateContainer(),
   options: ZergControlOptions = {},
 ): ZergControl {
-  const container = isZergStateContainer(stateOrContainer)
+  const baseContainer = isZergStateContainer(stateOrContainer)
     ? stateOrContainer
     : createZergStateContainer(seedBuiltinAgentDefinitions(createZergState({ ...options.seedState, ...stateOrContainer })));
-  const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, options as RuntimeCommandOptions);
-  const runtimeOptions = { ...options, subagentAdapter: adapter } as RuntimeCommandOptions;
+  const persistenceManager = createZergPersistenceManager(options.persistence);
+  persistenceManager?.hydrate(baseContainer, options.now);
+  const container: ZergStateContainer = persistenceManager
+    ? {
+      read: () => baseContainer.read(),
+      snapshot: () => baseContainer.snapshot(),
+      replace: (nextState) => {
+        const snapshot = baseContainer.replace(nextState);
+        persistenceManager.save(snapshot, options.now);
+        return snapshot;
+      },
+      update: (nextState, patchOptions) => {
+        const snapshot = baseContainer.update(nextState, patchOptions);
+        persistenceManager.save(snapshot, options.now);
+        return snapshot;
+      },
+      subscribe: (listener) => baseContainer.subscribe?.(listener) ?? (() => undefined),
+    }
+    : baseContainer;
+  const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
+  const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
+  runtimeOptions.subagentAdapter = adapter;
 
   return {
     async execute(action: ZergControlAction): Promise<ZergControlResult> {
@@ -338,6 +365,7 @@ async function executeZergControlAction(
             logs: getZergLogState(snapshot).records.length,
             runs: getSubagentRunSnapshots(snapshot).length,
           },
+          persistence: options.persistenceManager?.info ?? { enabled: false },
         }, renderStatusLine(snapshot, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision);
       }
       case 'agents.list': {
@@ -451,6 +479,16 @@ async function executeZergControlAction(
         const records = getZergLogs(snapshot, { runId: action.runId, level: action.level, limit: action.limit });
         return controlOk(action.action, { records }, renderZergLogList(records, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision, { runId: action.runId });
       }
+      case 'message': {
+        const snapshot = container.snapshot();
+        if (!action.targetId || !action.body?.trim()) return controlError(action.action, 'invalid_request', 'message requires targetId and body.', snapshot.revision, { runId: action.runId });
+        const result = await options.subagentAdapter?.sendMessage?.(action.targetId, action.body, action.runId);
+        if (!result) return controlError(action.action, 'transport_unavailable', 'Current adapter does not support delivered message transport.', snapshot.revision, { runId: action.runId, agentId: action.targetId });
+        const nextSnapshot = container.snapshot();
+        return result.ok
+          ? controlOk(action.action, { message: result }, result.message, nextSnapshot.revision, { runId: result.runId, agentId: result.routedTargetId ?? action.targetId })
+          : controlError(action.action, result.status === 'transport-unavailable' ? 'transport_unavailable' : 'delivery_failed', result.message, nextSnapshot.revision, { runId: result.runId, agentId: result.routedTargetId ?? action.targetId });
+      }
       case 'interrupt': {
         const result = dispatchInterruptCommand(container, action.runId ?? '', options);
         const snapshot = container.snapshot();
@@ -547,10 +585,12 @@ function isZergControlActionName(value: string): value is ZergControlAction['act
     || value === 'runs.list'
     || value === 'runs.show'
     || value === 'logs.list'
+    || value === 'message'
     || value === 'interrupt';
 }
 
-export type { ZergControl, ZergControlAction, ZergControlResult, ZergSubagentRunSnapshot } from './types.js';
+export { createZergPersistenceManager, recoverZergStateAfterRestart } from './persistence.js';
+export type { ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot } from './types.js';
 
 export function createZergCommandHandler(
   stateOrReader: ZergStateSource,
@@ -2277,7 +2317,9 @@ function appendLogToContainer(
   options: RuntimeCommandOptions,
   input: Parameters<typeof appendZergLogRecord>[1],
 ): ZergState {
-  return container.replace(appendLogToState(container.read(), options, input));
+  const updated = container.replace(appendLogToState(container.read(), options, input));
+  options.persistenceManager?.save(updated, options.now);
+  return updated;
 }
 
 function updateRunTaskLifecycle(
@@ -2507,6 +2549,8 @@ function getZergControlState(state: ZergState): ZergControlState {
   return {
     controller,
     selectedTargetId: typeof candidate?.selectedTargetId === 'string' ? candidate.selectedTargetId : undefined,
+    selectedTargetKind: candidate?.selectedTargetKind === 'agent' || candidate?.selectedTargetKind === 'team' || candidate?.selectedTargetKind === 'task' ? candidate.selectedTargetKind : undefined,
+    selectedRunId: typeof candidate?.selectedRunId === 'string' ? candidate.selectedRunId : undefined,
     activeRunId: typeof candidate?.activeRunId === 'string' ? candidate.activeRunId : undefined,
     auditLog: Array.isArray(candidate?.auditLog) ? candidate.auditLog.slice(-20) : [],
   };
@@ -2538,6 +2582,7 @@ function updateZergControlState(
   if (options.syncSharedState) {
     replaceSharedZergState(snapshot);
   }
+  options.persistenceManager?.save(snapshot, options.now);
   return snapshot;
 }
 
@@ -2616,11 +2661,11 @@ function requestPiNativeAbort(runId: string, activeRuns: PiNativeActiveRunRegist
   };
 }
 
-function setRunMetadata(container: ZergStateContainer, runId: string, metadata: Record<string, unknown>): ZergState {
+function setRunMetadata(container: ZergStateContainer, runId: string, metadata: Record<string, unknown>, options?: RuntimeCommandOptions): ZergState {
   const state = container.read();
   const agent = state.agents[runId];
   if (!agent) return state;
-  return container.replace({
+  const updated = container.replace({
     ...state,
     agents: {
       ...state.agents,
@@ -2633,6 +2678,8 @@ function setRunMetadata(container: ZergStateContainer, runId: string, metadata: 
       },
     },
   });
+  options?.persistenceManager?.save(updated, options.now);
+  return updated;
 }
 
 function createPiSlashBridgeAdapter(
@@ -3118,6 +3165,10 @@ function createPiNativeAdapter(
   options: RuntimeCommandOptions,
 ): ZergSubagentControlAdapter {
   const activeRuns: PiNativeActiveRunRegistry = new Map();
+  const persistenceManager = options.persistenceManager ?? createZergPersistenceManager(options.persistence);
+  const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
+  persistenceManager?.hydrate(container, runtimeOptions.now);
+  persistenceManager?.save(container.read(), runtimeOptions.now);
   return {
     kind: 'pi-native',
     listAgentDefinitions() {
@@ -3136,10 +3187,10 @@ function createPiNativeAdapter(
       const requestId = request.runId ?? `zerg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const taskId = typeof request.taskId === 'string' && request.taskId.length > 0 ? request.taskId : undefined;
       const launchMode = resolveLaunchMode(request);
-      const now = (options.now ?? (() => new Date()))().toISOString();
+      const now = (runtimeOptions.now ?? (() => new Date()))().toISOString();
       const definition = getAgentDefinition(container.read(), request.agent);
       const label = definition?.label ?? request.agent;
-      updateZergControlState(container, { activeRunId: requestId }, `launched ${request.agent}`, options);
+      updateZergControlState(container, { activeRunId: requestId }, `launched ${request.agent}`, runtimeOptions);
       const started = applyRuntimeTransition(container.read(), {
         entity: 'agent',
         action: 'start',
@@ -3159,7 +3210,8 @@ function createPiNativeAdapter(
         },
       }, { now: () => new Date(now) });
       container.replace(updateRunTaskLifecycle(started, taskId, 'running', 'starting', 'pi native runner started', now));
-      appendLogToContainer(container, options, {
+      persistenceManager?.save(container.read(), runtimeOptions.now);
+      appendLogToContainer(container, runtimeOptions, {
         source: 'adapter',
         level: 'info',
         kind: 'text',
@@ -3171,10 +3223,30 @@ function createPiNativeAdapter(
       });
       const activeRun = createPiNativeActiveRun(requestId);
       activeRuns.set(requestId, activeRun);
-      activeRun.promise = runPiNativeZergRequest(context, container, options, request, requestId, taskId, launchMode, activeRun)
+      activeRun.promise = runPiNativeZergRequest(context, container, runtimeOptions, request, requestId, taskId, launchMode, activeRun)
         .finally(() => activeRuns.delete(requestId));
       void activeRun.promise;
       return { ok: true, runId: requestId, taskId, message: `zerg launched ${request.agent} as ${requestId} (${launchMode})` };
+    },
+    async sendMessage(targetId, body, runId): Promise<ZergOperatorMessageResult> {
+      const activeRun = runId ? activeRuns.get(runId) : Array.from(activeRuns.values()).at(-1);
+      const targetRunId = activeRun?.runId ?? runId;
+      if (!activeRun || activeRun.sessions.size === 0) {
+        return { ok: false, runId: targetRunId, targetId, routedTargetId: targetId, status: 'transport-unavailable', message: targetRunId ? `No live native session is available for ${targetRunId}.` : 'No live native zerg run is available.' };
+      }
+      const session = Array.from(activeRun.sessions).find((candidate) => typeof candidate.prompt === 'function');
+      if (!session?.prompt) {
+        return { ok: false, runId: targetRunId, targetId, routedTargetId: targetId, status: 'transport-unavailable', message: `Native session for ${activeRun.runId} does not expose prompt transport.` };
+      }
+      try {
+        await session.prompt(`Operator message for ${targetId}: ${body}`, { source: 'extension' });
+        appendLogToContainer(container, runtimeOptions, { source: 'overlay', level: 'info', kind: 'text', message: `operator message delivered to ${targetId}`, runId: activeRun.runId, agentId: targetId, data: { targetId, body } });
+        return { ok: true, runId: activeRun.runId, targetId, routedTargetId: targetId, status: 'delivered', message: `operator message delivered to ${targetId}` };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        appendLogToContainer(container, runtimeOptions, { source: 'overlay', level: 'warn', kind: 'error', message: `operator message delivery failed for ${targetId}: ${detail}`, runId: activeRun.runId, agentId: targetId, data: { targetId } });
+        return { ok: false, runId: activeRun.runId, targetId, routedTargetId: targetId, status: 'delivery-failed', message: `operator message delivery failed for ${targetId}: ${detail}` };
+      }
     },
     async awaitRun(runId) {
       await Promise.resolve();
@@ -3199,9 +3271,10 @@ function createPiNativeAdapter(
         activity: 'interrupt requested',
         substate: 'cancelling',
         substateReason: abortResult.message,
-      }, { now: options.now ?? (() => new Date()) });
+      }, { now: runtimeOptions.now ?? (() => new Date()) });
       container.replace(snapshot);
-      appendLogToContainer(container, options, {
+      persistenceManager?.save(container.read(), runtimeOptions.now);
+      appendLogToContainer(container, runtimeOptions, {
         source: 'adapter',
         level: 'warn',
         kind: 'text',
@@ -3215,6 +3288,7 @@ function createPiNativeAdapter(
         requestPiNativeAbort(runId, activeRuns);
       }
       activeRuns.clear();
+      persistenceManager?.save(container.read(), runtimeOptions.now);
     },
   };
 }
@@ -3245,7 +3319,7 @@ async function runPiNativeZergRequest(
 
   try {
     mkdirSync(coordPath, { recursive: true });
-    setRunMetadata(container, runId, { coordDir, coordPath, originalTask: request.task });
+    setRunMetadata(container, runId, { coordDir, coordPath, originalTask: request.task }, options);
 
     const promptBase = [
       `Run id: ${runId}`,
@@ -3260,7 +3334,7 @@ async function runPiNativeZergRequest(
     let workerSummaries = '';
     if (memberDefinitions.length > 0) {
       const startedAt = timestamp();
-      setRunMetadata(container, runId, { memberProgress: memberDefinitions.map((definition) => ({ agentId: definition.id, runId: `${runId}-${definition.id}`, status: 'queued', handoffPath: `${coordDir}/${definition.id}.md` })) });
+      setRunMetadata(container, runId, { memberProgress: memberDefinitions.map((definition) => ({ agentId: definition.id, runId: `${runId}-${definition.id}`, status: 'queued', handoffPath: `${coordDir}/${definition.id}.md` })) }, options);
       const settledSummaries = await Promise.allSettled(memberDefinitions.map((definition) => runSinglePiNativeAgent(context, definition, {
         task: `${promptBase}\n\nYou are team member ${definition.id}. Complete your assigned slice for the team task, read existing files as needed, preserve the caller's scope, and write only ${coordDir}/${definition.id}.md with your handoff.`,
         runId: `${runId}-${definition.id}`,
@@ -3550,7 +3624,7 @@ function updateMemberProgress(
   const updated = { ...current, agentId, runId: run.runId, status, ...patch };
   if (index >= 0) next[index] = updated;
   else next.push(updated);
-  setRunMetadata(run.container, run.parentRunId, { memberProgress: next });
+  setRunMetadata(run.container, run.parentRunId, { memberProgress: next }, run.options);
 }
 
 function resolvePiNativeCwd(context: StructuralPiExtensionContext): string {
@@ -4021,14 +4095,15 @@ function createManagementOverlayActions(stateOrReader: ZergStateSource, runtimeO
       if (!container) {
         return RUNTIME_WRITABLE_STATE_ERROR;
       }
-      updateZergControlState(container, { selectedTargetId: target.id }, `selected target ${target.id}`, runtimeOptions);
+      updateZergControlState(container, { selectedTargetId: target.id, selectedTargetKind: target.kind }, `selected target ${target.kind} ${target.id}`, runtimeOptions);
       return `selected ${target.kind} ${target.id}`;
     },
     interruptSelected: (target: { id: string; kind: ZergManagementTargetKind } | undefined) => {
       const snapshot = resolveZergStateSnapshot(stateOrReader);
-      const runId = target?.kind === 'agent'
+      const control = getZergControlState(snapshot);
+      const runId = control.selectedRunId ?? (target?.kind === 'agent' && target.id.startsWith(DEFAULT_RUN_ID_PREFIX)
         ? target.id
-        : getZergControlState(snapshot).activeRunId;
+        : control.activeRunId);
       if (!runId) {
         return 'no active run selected for interrupt';
       }
@@ -4039,28 +4114,27 @@ function createManagementOverlayActions(stateOrReader: ZergStateSource, runtimeO
       if (target.kind === 'task') {
         return { status: 'transport-unavailable', statusDetail: 'Tasks have no verified live message transport; operator message retained locally.' };
       }
-      if (target.kind === 'team') {
-        const team = snapshot.teams[target.id];
-        if (!team?.leaderAgentId) {
-          return { status: 'transport-unavailable', statusDetail: `Team ${target.id} has no leader; operator message retained locally.` };
-        }
-        const result = dispatchInterventionCommand(stateOrReader, `leader ${target.id} ${body}`, runtimeOptions);
-        return {
-          status: result.ok ? 'intervention-recorded' : 'transport-unavailable',
-          statusDetail: result.ok ? `${result.output}; not delivered as chat transport.` : result.output,
-          routedTargetId: team.leaderAgentId,
-        };
+      const routedTargetId = target.kind === 'team' ? snapshot.teams[target.id]?.leaderAgentId : target.id;
+      if (!routedTargetId) {
+        return { status: 'transport-unavailable', statusDetail: `${target.kind} ${target.id} is unavailable; operator message retained locally.` };
       }
-      const agent = snapshot.agents[target.id];
-      if (!agent) {
-        return { status: 'transport-unavailable', statusDetail: `Agent ${target.id} is unavailable; operator message retained locally.` };
+      const control = getZergControlState(snapshot);
+      const activeRunId = control.selectedRunId ?? control.activeRunId;
+      if (runtimeOptions.subagentAdapter?.sendMessage && activeRunId) {
+        void Promise.resolve(runtimeOptions.subagentAdapter.sendMessage(routedTargetId, body, activeRunId)).catch(() => undefined);
+        return { status: 'accepted', statusDetail: `delivery requested for ${routedTargetId}; check logs for delivered/failed status.`, routedTargetId };
       }
-      const kind = agent.kind === 'subagent' ? 'subagent' : 'agent';
-      const result = dispatchInterventionCommand(stateOrReader, `${kind} ${target.id} ${body}`, runtimeOptions);
+      const agent = snapshot.agents[routedTargetId];
+      if (!agent && target.kind !== 'team') {
+        return { status: 'transport-unavailable', statusDetail: `Agent ${routedTargetId} is unavailable; operator message retained locally.` };
+      }
+      const result = target.kind === 'team'
+        ? dispatchInterventionCommand(stateOrReader, `leader ${target.id} ${body}`, runtimeOptions)
+        : dispatchInterventionCommand(stateOrReader, `${agent?.kind === 'subagent' ? 'subagent' : 'agent'} ${routedTargetId} ${body}`, runtimeOptions);
       return {
         status: result.ok ? 'intervention-recorded' : 'transport-unavailable',
-        statusDetail: result.ok ? `${result.output}; not delivered as chat transport.` : result.output,
-        routedTargetId: target.id,
+        statusDetail: result.ok ? `${result.output}; live transport unavailable, intervention recorded.` : result.output,
+        routedTargetId,
       };
     },
   };

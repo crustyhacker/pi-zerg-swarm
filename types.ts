@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.0.6' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.0' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -91,8 +91,34 @@ export interface ZergControlAuditEntry {
 export interface ZergControlState {
   controller: ZergControlController;
   selectedTargetId?: string;
+  selectedTargetKind?: ZergManagementTargetKind;
+  selectedRunId?: string;
   activeRunId?: string;
   auditLog?: ZergControlAuditEntry[];
+}
+
+export interface ZergPersistenceOptions {
+  enabled?: boolean;
+  rootDir?: string;
+  snapshotFile?: string;
+}
+
+export interface ZergPersistenceInfo {
+  enabled: boolean;
+  snapshotFile?: string;
+  writerSessionId?: string;
+  lastLoadedAt?: string;
+  lastSavedAt?: string;
+  recoveredRunIds?: string[];
+  lastLoadError?: string;
+}
+
+export interface ZergRunRecoveryInfo {
+  recoveredAt: string;
+  reason: 'process-restart';
+  previousStatus?: AgentStatus;
+  previousSubstate?: ZergLifecycleSubstate;
+  previousWriterSessionId?: string;
 }
 
 export interface ZergSubagentLaunchRequest {
@@ -118,6 +144,15 @@ export interface ZergSubagentControlResult {
   ok: boolean;
   runId?: string;
   taskId?: string;
+  message: string;
+}
+
+export interface ZergOperatorMessageResult {
+  ok: boolean;
+  runId?: string;
+  targetId?: string;
+  routedTargetId?: string;
+  status: ZergOperatorMessageDeliveryStatus;
   message: string;
 }
 
@@ -148,6 +183,7 @@ export interface ZergSubagentRunSnapshot {
   completedAt?: string;
   finalSummary?: string;
   errorSummary?: string;
+  recovery?: ZergRunRecoveryInfo;
   memberProgress?: ZergSubagentMemberProgress[];
   metadata?: ZergExtensionFields;
 }
@@ -202,6 +238,7 @@ export interface ZergSubagentControlAdapter {
   readonly kind: 'pi-native' | 'pi-slash-bridge' | 'fake' | 'unavailable';
   launch(request: ZergSubagentLaunchRequest): ZergSubagentControlResult;
   interrupt?(runId?: string): ZergSubagentControlResult;
+  sendMessage?(targetId: string, body: string, runId?: string): ZergOperatorMessageResult | Promise<ZergOperatorMessageResult>;
   awaitRun?(runId: string): Promise<ZergSubagentRunSnapshot | undefined>;
   listAgentDefinitions?(): readonly ZergAgentDefinition[];
   getAgentDefinition?(id: string): ZergAgentDefinition | undefined;
@@ -221,6 +258,7 @@ export type ZergControlAction =
   | { action: 'runs.list' }
   | { action: 'runs.show'; runId: string }
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }
+  | { action: 'message'; targetId: string; body: string; runId?: string }
   | { action: 'interrupt'; runId?: string };
 
 export interface ZergControlError {
@@ -529,7 +567,7 @@ export type ZergConfigOverlayTab = 'monitor' | 'control' | 'targets' | 'permissi
 
 export type ZergManagementPaneId = 'tree' | 'detail' | 'settings' | 'chat';
 export type ZergManagementTargetKind = 'agent' | 'team' | 'task';
-export type ZergOperatorMessageDeliveryStatus = 'draft' | 'queued-local' | 'transport-unavailable' | 'intervention-recorded';
+export type ZergOperatorMessageDeliveryStatus = 'draft' | 'queued-local' | 'transport-unavailable' | 'intervention-recorded' | 'accepted' | 'delivered' | 'delivery-failed';
 
 export interface ZergOperatorMessageRecord {
   id: string;

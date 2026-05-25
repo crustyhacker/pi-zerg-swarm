@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import test from 'node:test';
 
 import { createPiZergCommandHandler, createZergCommandHandler, createZergControl, registerZergSwarmExtension, type ZergExtensionRegistration } from '../index.js';
 import { installInternalPatch } from '../internal-patch.js';
 import { deriveThinkingSteps } from '../parse.js';
+import { createZergPersistenceManager } from '../persistence.js';
 import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergManagementOverlay } from '../render.js';
 import { appendHookEvent, appendZergLogRecord, appendZergLogRecords, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createBuiltinAgentDefinitions, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getCurrentAgents, getCurrentMode, getCurrentTasks, getCurrentTeams, getCurrentTree, getPendingPermissionRequests, getPermissionQueueState, getSelectedTreeNode, getSubagentRunSnapshot, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, replayRuntimeTransitions, resetZergState, resolvePermissionRequest, selectNode, setMode, snapshotZergState, upsertAgentDefinition, updateSharedZergState, updateZergState, upsertAgent, upsertTask, upsertTeam, upsertTreeNode } from '../state.js';
 import { ZERG_EXTENSION_VERSION, ZERG_STATE_SCHEMA_VERSION, type AgentStatus, type HookLifecycleEvent, type StructuralPiCommandContext, type StructuralPiCommandOptions, type TaskStatus, type TeamIdentity, type ZergLifecycleSubstate, type ZergLogRecord, type ZergRuntimeTransition, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentControlResult, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergTreeNode } from '../types.js';
@@ -3768,6 +3771,65 @@ test('direct Zerg control API runs team ids through the configured leader and pr
   assert.equal(run?.task, task);
   assert.equal((run?.metadata as { teamId?: string; originalTask?: string } | undefined)?.teamId, 'team-direct');
   assert.equal((run?.metadata as { teamId?: string; originalTask?: string } | undefined)?.originalTask, task);
+});
+
+test('direct Zerg control API sends operator messages through adapter transport honestly', async () => {
+  const messages: Array<{ targetId: string; body: string; runId?: string }> = [];
+  const control = createZergControl({}, {
+    subagentAdapter: {
+      kind: 'fake',
+      launch() { return { ok: true, message: 'unused' }; },
+      async sendMessage(targetId, body, runId) {
+        messages.push({ targetId, body, runId });
+        return { ok: true, targetId, routedTargetId: targetId, runId, status: 'delivered', message: `delivered ${targetId}` };
+      },
+    },
+  });
+
+  const result = await control.execute({ action: 'message', targetId: 'worker-direct', body: 'please report', runId: 'zerg-live-run' });
+  assert.equal(result.ok, true);
+  assert.equal(result.output, 'delivered worker-direct');
+  assert.deepEqual(messages, [{ targetId: 'worker-direct', body: 'please report', runId: 'zerg-live-run' }]);
+  assert.equal((result.data as { message?: { status?: string } }).message?.status, 'delivered');
+
+  const unavailable = await createZergControl({}, { subagentAdapter: { kind: 'fake', launch() { return { ok: true, message: 'unused' }; } } })
+    .execute({ action: 'message', targetId: 'worker-direct', body: 'please report' });
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.error?.code, 'transport_unavailable');
+});
+
+test('zerg persistence recovers non-terminal runs and durable logs after restart', () => {
+  const rootDir = mkdtempSync(join(tmpdir(), 'pi-zerg-persist-'));
+  try {
+    const snapshotFile = join(rootDir, 'state.json');
+    const manager = createZergPersistenceManager({ snapshotFile })!;
+    const startedAt = '2026-05-25T00:00:00.000Z';
+    let state = createZergState();
+    state = applyRuntimeTransition(state, {
+      entity: 'agent',
+      action: 'start',
+      id: 'zerg-persisted-run',
+      kind: 'subagent',
+      status: 'running',
+      activity: 'durable task',
+      substate: 'executing',
+      metadata: { taskId: 'task-persisted', originalTask: 'durable task' },
+    }, { now: () => new Date(startedAt) });
+    state = upsertTask(state, { id: 'task-persisted', title: 'durable task', status: 'running', ownerAgentId: 'zerg-persisted-run', updatedAt: startedAt });
+    state = appendZergLogRecord(state, { source: 'adapter', level: 'info', kind: 'text', message: 'persist me', runId: 'zerg-persisted-run', createdAt: startedAt });
+    manager.save(state, () => new Date(startedAt));
+
+    const restored = createZergStateContainer();
+    const loadedInfo = manager.hydrate(restored, () => new Date('2026-05-25T00:01:00.000Z'));
+    const run = getSubagentRunSnapshot(restored.read(), 'zerg-persisted-run');
+    assert.equal(run?.status, 'needs-attention');
+    assert.equal(run?.substate, 'failed');
+    assert.equal(run?.recovery?.reason, 'process-restart');
+    assert.deepEqual(loadedInfo.recoveredRunIds, ['zerg-persisted-run']);
+    assert.ok(getZergLogs(restored.read(), { runId: 'zerg-persisted-run' }).some((record) => record.message.includes('recovered zerg-persisted-run')));
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
 });
 
 test('direct Zerg control API preserves quoted run task text structurally', async () => {

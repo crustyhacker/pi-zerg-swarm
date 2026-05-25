@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-25
+
+### Added
+
+- Added restart-durable run/log snapshot persistence and recovery helpers for native zerg sessions.
+- Added additive structured operator-message transport hooks to direct control and adapters, with honest delivered/unavailable/failure states.
+
+### Changed
+
+- Bumped package/runtime metadata to `1.1.0` and included `persistence.ts` in the public package surface.
+- Updated copyright and package author metadata for Marc Mironescu / `crustyhacker`.
+
+### Fixed
+
+- Recovered non-terminal pre-restart runs are now surfaced as `needs-attention` with recovery metadata instead of disappearing from run inspection.
+
 ## [1.0.6] - 2026-05-16
 
 ### Fixed

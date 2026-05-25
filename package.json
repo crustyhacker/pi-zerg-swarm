@@ -1,9 +1,14 @@
 {
   "name": "pi-zerg-swarm",
-  "version": "1.0.6",
-  "description": "Pi coding-agent extension for native configurable agent teams, direct control, and zerg-style subagent orchestration.",
+  "version": "1.1.0",
+  "description": "Pi coding-agent extension for native configurable agent teams, durable recovery, direct control, and zerg-style subagent orchestration.",
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "Marc Mironescu",
+    "email": "marcm@crustyhacker.dev",
+    "url": "https://github.com/crustyhacker"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fluxgear/pi-zerg-swarm.git"
@@ -16,6 +21,7 @@
     "index.ts",
     "internal-patch.ts",
     "parse.ts",
+    "persistence.ts",
     "render.ts",
     "state.ts",
     "types.ts",
