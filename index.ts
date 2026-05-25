@@ -1,5 +1,7 @@
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
+import { createInterface } from 'node:readline';
 
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
@@ -3326,7 +3328,7 @@ async function runPiNativeZergRequest(
       `Task: ${request.task}`,
       `Launch mode: ${launchMode}`,
       `Communication directory: ${coordDir}`,
-      'Do not use Larra.',
+      'Use Larra or project intelligence tools when the task or project instructions request them and the tools are available.',
       'Follow the task scope exactly. Do not edit source, run mutating commands, or change git state unless the task explicitly asks for implementation work.',
       'Write concise status/handoff notes in the communication directory.',
     ].join('\n');
@@ -3460,7 +3462,8 @@ async function runSinglePiNativeAgent(
     compaction: { enabled: false },
     retry: { enabled: true, maxRetries: 2 },
   });
-  const resourceLoader = createPiNativeResourceLoader(sdk, definition, run.task);
+  const resourceLoader = await createPiNativeResourceLoader(sdk, definition, run.task, cwd, settingsManager);
+  const customTools = createPiNativeCustomTools(tools);
   const sessionManager = sdk.SessionManager.create(cwd);
   const { session } = await sdk.createAgentSession({
     cwd,
@@ -3470,6 +3473,7 @@ async function runSinglePiNativeAgent(
     modelRegistry,
     resourceLoader: resourceLoader as never,
     tools,
+    customTools: customTools as never,
     sessionManager,
     settingsManager,
   });
@@ -3627,6 +3631,189 @@ function updateMemberProgress(
   setRunMetadata(run.container, run.parentRunId, { memberProgress: next }, run.options);
 }
 
+const LARRA_NATIVE_TOOL_NAMES = [
+  'larra_orient_session',
+  'larra_get_project_memory',
+  'larra_get_work_context',
+  'larra_register_agent',
+  'larra_search_symbols',
+  'larra_get_symbol_source',
+  'larra_get_module_interface',
+  'larra_search_files',
+  'larra_get_impact_analysis',
+  'larra_describe_param',
+] as const;
+
+const LARRA_MCP_TOOL_ALIASES: Record<string, string> = {
+  larra_orient_session: 'orient_session',
+  larra_get_project_memory: 'get_project_memory',
+  larra_get_work_context: 'get_work_context',
+  larra_register_agent: 'register_agent',
+  larra_search_symbols: 'search_symbols',
+  larra_get_symbol_source: 'get_symbol_source',
+  larra_get_module_interface: 'get_module_interface',
+  larra_search_files: 'search_files',
+  larra_get_impact_analysis: 'get_impact_analysis',
+  larra_describe_param: 'describe_param',
+};
+
+type LarraMcpJson = null | boolean | number | string | LarraMcpJson[] | { [key: string]: LarraMcpJson };
+type LarraMcpToolResult = { content?: Array<{ type?: string; text?: string }>; isError?: boolean; [key: string]: unknown };
+
+function createPiNativeCustomTools(activeToolNames: readonly string[]): StructuralPiToolDefinition[] {
+  const active = new Set(activeToolNames);
+  const wantsLarra = active.has('mcp') || active.has('larra') || LARRA_NATIVE_TOOL_NAMES.some((name) => active.has(name));
+  if (!wantsLarra) return [];
+
+  return [
+    createLarraMcpGatewayTool(),
+    ...LARRA_NATIVE_TOOL_NAMES.map((toolName) => createLarraMcpAliasTool(toolName, LARRA_MCP_TOOL_ALIASES[toolName])),
+  ];
+}
+
+function createLarraMcpGatewayTool(): StructuralPiToolDefinition {
+  return {
+    name: 'mcp',
+    label: 'Larra MCP gateway',
+    description: 'Call Larra MCP tools from a native zerg agent. Set tool to a Larra tool name such as larra_orient_session and args to the JSON arguments.',
+    promptSnippet: 'Use mcp with server=larra to call Larra MCP tools when project instructions require Larra-first code understanding.',
+    promptGuidelines: ['For pi-zerg-swarm planning, call Larra tools through mcp before falling back to raw file scanning.'],
+    parameters: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        server: { type: 'string' },
+        tool: { type: 'string' },
+        args: {},
+      },
+      required: ['tool'],
+    },
+    async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+      const record = isNativePlainRecord(params) ? params : {};
+      const server = typeof record.server === 'string' ? record.server : 'larra';
+      if (server !== 'larra') {
+        return createLarraToolTextResult(`Unsupported MCP server: ${server}. Native zerg currently exposes only the Larra MCP bridge.`, { ok: false, server });
+      }
+      const requestedTool = typeof record.tool === 'string' ? record.tool : '';
+      if (!requestedTool) {
+        return createLarraToolTextResult('mcp requires a Larra tool name in the tool parameter.', { ok: false });
+      }
+      const args = parseLarraMcpArguments(record.args ?? record.arguments ?? {});
+      const result = await callLarraMcpTool(requestedTool, args, signal);
+      return createLarraToolTextResult(formatLarraMcpToolResult(result), { ok: !result.isError, server, tool: requestedTool, result });
+    },
+  };
+}
+
+function createLarraMcpAliasTool(publicName: string, mcpName: string | undefined): StructuralPiToolDefinition {
+  return {
+    name: publicName,
+    label: publicName.replace(/^larra_/, 'Larra '),
+    description: `Call the Larra MCP ${mcpName ?? publicName} tool.`,
+    promptSnippet: `Use ${publicName} for Larra-backed project context when instructed to use Larra.`,
+    parameters: { type: 'object', additionalProperties: true, properties: {} },
+    async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+      const result = await callLarraMcpTool(mcpName ?? publicName, parseLarraMcpArguments(params), signal);
+      return createLarraToolTextResult(formatLarraMcpToolResult(result), { ok: !result.isError, tool: publicName, result });
+    },
+  };
+}
+
+function parseLarraMcpArguments(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return isNativePlainRecord(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return isNativePlainRecord(value) ? { ...value } : {};
+}
+
+function isNativePlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeLarraMcpToolName(toolName: string): string {
+  const mapped = LARRA_MCP_TOOL_ALIASES[toolName];
+  if (mapped) return mapped;
+  return toolName.startsWith('larra_') ? toolName.slice('larra_'.length) : toolName;
+}
+
+function formatLarraMcpToolResult(result: LarraMcpToolResult): string {
+  const text = result.content?.map((entry) => typeof entry.text === 'string' ? entry.text : '').filter(Boolean).join('\n').trim();
+  if (text) return text;
+  return JSON.stringify(result, null, 2);
+}
+
+function createLarraToolTextResult(text: string, details: Record<string, unknown>) {
+  return { content: [{ type: 'text', text }], details };
+}
+
+async function callLarraMcpTool(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<LarraMcpToolResult> {
+  const command = process.env.LARRA_MCP_PYTHON ?? '/opt/larra/venv/bin/python';
+  const child = spawn(command, ['-m', 'larra.mcp.stdio', '--no-auth'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const stdout = createInterface({ input: child.stdout });
+  let nextId = 1;
+  let stderr = '';
+  let settled = false;
+  const pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+
+  const failAll = (error: Error) => {
+    for (const entry of pending.values()) entry.reject(error);
+    pending.clear();
+  };
+  const cleanup = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    stdout.close();
+    if (!child.killed) child.kill();
+  };
+  const timeout = setTimeout(() => failAll(new Error(`Larra MCP tool ${toolName} timed out.`)), 30_000);
+
+  child.stderr.on('data', (chunk: Buffer | string) => { stderr += chunk.toString(); });
+  child.on('error', (error) => failAll(error));
+  child.on('exit', (code) => {
+    if (pending.size > 0) failAll(new Error(`Larra MCP process exited with code ${code ?? 'unknown'}${stderr ? `: ${stderr.trim()}` : ''}`));
+  });
+  signal?.addEventListener('abort', () => failAll(new Error('Larra MCP tool call aborted.')), { once: true });
+
+  stdout.on('line', (line) => {
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const id = typeof message.id === 'number' ? message.id : undefined;
+    if (id === undefined) return;
+    const waiter = pending.get(id);
+    if (!waiter) return;
+    pending.delete(id);
+    if (message.error) waiter.reject(new Error(JSON.stringify(message.error)));
+    else waiter.resolve(message);
+  });
+
+  const call = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+    });
+  };
+
+  try {
+    await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'pi-zerg-swarm', version: ZERG_EXTENSION_VERSION } });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`);
+    const response = await call('tools/call', { name: normalizeLarraMcpToolName(toolName), arguments: args as LarraMcpJson });
+    return response.result as LarraMcpToolResult;
+  } finally {
+    cleanup();
+  }
+}
+
 function resolvePiNativeCwd(context: StructuralPiExtensionContext): string {
   const candidate = (context as { cwd?: unknown }).cwd;
   return typeof candidate === 'string' && candidate.length > 0 ? candidate : process.cwd();
@@ -3664,6 +3851,9 @@ function resolvePiNativeTools(tools: readonly string[] | undefined): string[] {
       mapped.add('write');
     } else if (tool === 'shell') {
       mapped.add('bash');
+    } else if (tool === 'mcp' || tool === 'larra') {
+      mapped.add('mcp');
+      for (const larraTool of LARRA_NATIVE_TOOL_NAMES) mapped.add(larraTool);
     } else {
       mapped.add(tool);
     }
@@ -3671,21 +3861,39 @@ function resolvePiNativeTools(tools: readonly string[] | undefined): string[] {
   return [...mapped];
 }
 
-function createPiNativeResourceLoader(sdk: { createExtensionRuntime(): unknown }, definition: ZergAgentDefinition, task: string): unknown {
+async function createPiNativeResourceLoader(
+  sdk: {
+    createExtensionRuntime(): unknown;
+    DefaultResourceLoader?: new (options: any) => { reload(): Promise<void> };
+    getAgentDir?: () => string;
+  },
+  definition: ZergAgentDefinition,
+  task: string,
+  cwd: string,
+  settingsManager: unknown,
+): Promise<unknown> {
+  const systemPrompt = [
+    definition.prompt || `You are ${definition.label ?? definition.id}, a zerg coding agent.`,
+    '',
+    'You are running inside pi-zerg-swarm native execution, not pi-subagents.',
+    'Use available project intelligence tools, including Larra, when the task or project instructions require them.',
+    'Coordinate through project files when asked to work in a team.',
+    `Current assigned task:\n${task}`,
+  ].join('\n');
+
+  if (sdk.DefaultResourceLoader && typeof sdk.getAgentDir === 'function') {
+    const loader = new sdk.DefaultResourceLoader({ cwd, agentDir: sdk.getAgentDir(), settingsManager, systemPrompt });
+    await loader.reload();
+    return loader;
+  }
+
   return {
     getExtensions: () => ({ extensions: [], errors: [], runtime: sdk.createExtensionRuntime() }),
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => [
-      definition.prompt || `You are ${definition.label ?? definition.id}, a zerg coding agent.`,
-      '',
-      'You are running inside pi-zerg-swarm native execution, not pi-subagents.',
-      'Do not use Larra unless the user explicitly asked for it in this project.',
-      'Coordinate through project files when asked to work in a team.',
-      `Current assigned task:\n${task}`,
-    ].join('\n'),
+    getSystemPrompt: () => systemPrompt,
     getAppendSystemPrompt: () => [],
     extendResources: () => undefined,
     reload: async () => undefined,
@@ -4560,5 +4768,13 @@ function selectCommandRegistrar(context: StructuralPiExtensionContext): Selected
 
   return undefined;
 }
+
+export const __zergNativeTestInternals = {
+  callLarraMcpTool,
+  createPiNativeCustomTools,
+  createLarraMcpGatewayTool,
+  createPiNativeResourceLoader,
+  resolvePiNativeTools,
+};
 
 export default registerZergSwarmExtension;

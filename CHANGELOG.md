@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-05-25
+
+### Fixed
+
+- Exposed Larra MCP tools to native zerg agents when `mcp` or `larra` tools are requested.
+- Removed contradictory native prompt text that discouraged Larra when tasks explicitly require it.
+- Preserved Pi resource discovery in native runs by using the default resource loader when available.
+
 ## [1.1.0] - 2026-05-25
 
 ### Added

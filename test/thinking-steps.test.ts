@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { createPiZergCommandHandler, createZergCommandHandler, createZergControl, registerZergSwarmExtension, type ZergExtensionRegistration } from '../index.js';
+import { __zergNativeTestInternals, createPiZergCommandHandler, createZergCommandHandler, createZergControl, registerZergSwarmExtension, type ZergExtensionRegistration } from '../index.js';
 import { installInternalPatch } from '../internal-patch.js';
 import { deriveThinkingSteps } from '../parse.js';
 import { createZergPersistenceManager } from '../persistence.js';
@@ -3853,6 +3853,38 @@ test('direct Zerg control API preserves quoted run task text structurally', asyn
   const optionLike = await control.execute({ action: 'run', agent: 'planner', task: '--bg', background: true });
   assert.equal(optionLike.ok, true);
   assert.equal(launches[1]?.task, '--bg');
+});
+
+test('native zerg runner exposes Larra MCP tools when requested', () => {
+  const tools = __zergNativeTestInternals.resolvePiNativeTools(['mcp', 'read']);
+  assert.ok(tools.includes('mcp'));
+  assert.ok(tools.includes('read'));
+  assert.ok(tools.includes('larra_orient_session'));
+  assert.ok(tools.includes('larra_get_project_memory'));
+
+  const customTools = __zergNativeTestInternals.createPiNativeCustomTools(tools);
+  assert.ok(customTools.some((tool) => tool.name === 'mcp'));
+  assert.ok(customTools.some((tool) => tool.name === 'larra_orient_session'));
+
+  const defaultTools = __zergNativeTestInternals.resolvePiNativeTools(undefined);
+  assert.deepEqual(defaultTools, ['read', 'bash']);
+  assert.deepEqual(__zergNativeTestInternals.createPiNativeCustomTools(defaultTools), []);
+});
+
+test('native zerg runner prompt no longer contradicts explicit Larra use', async () => {
+  const loader = await __zergNativeTestInternals.createPiNativeResourceLoader({
+    createExtensionRuntime: () => ({}),
+  }, {
+    id: 'larra-planner',
+    label: 'Larra Planner',
+    prompt: 'Use Larra first when asked.',
+    source: 'runtime',
+  }, 'Use Larra MCP first for this plan.', process.cwd(), {});
+
+  const systemPrompt = (loader as { getSystemPrompt(): string | undefined }).getSystemPrompt() ?? '';
+  assert.equal(systemPrompt.includes('Do not use Larra'), false);
+  assert.ok(systemPrompt.includes('Use available project intelligence tools, including Larra'));
+  assert.ok(systemPrompt.includes('Use Larra MCP first for this plan.'));
 });
 
 test('extension registers zerg_control Pi tool when registerTool is available', async () => {
