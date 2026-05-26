@@ -3377,6 +3377,8 @@ async function runPiNativeZergRequest(
 
     const doneAt = timestamp();
     const wasCancelled = activeRun?.cancelRequested === true || leaderResult.status === 'cancelled';
+    const finalSummary = wasCancelled ? 'pi native run cancelled' : (leaderResult.message ?? 'pi native run complete');
+    const finalActivity = finalSummary.split(/\r?\n/, 1)[0]?.trim() || (wasCancelled ? 'pi native run cancelled' : 'pi native run complete');
     const stopped = applyRuntimeTransition(container.read(), {
       entity: 'agent',
       action: wasCancelled ? 'fail' : 'stop',
@@ -3384,12 +3386,12 @@ async function runPiNativeZergRequest(
       label: leaderDefinition?.label ?? request.agent,
       kind: 'subagent',
       status: wasCancelled ? 'cancelled' : 'done',
-      activity: wasCancelled ? 'pi native run cancelled' : 'pi native run complete',
+      activity: finalActivity,
       substate: wasCancelled ? 'cancelled' : 'completed',
-      substateReason: wasCancelled ? 'pi native run cancelled' : 'pi native run complete',
-      metadata: { completedAt: doneAt, finalSummary: wasCancelled ? 'pi native run cancelled' : 'pi native run complete', originalTask: request.task },
+      substateReason: wasCancelled ? 'pi native run cancelled' : finalActivity,
+      metadata: { completedAt: doneAt, finalSummary, originalTask: request.task },
     }, { now: () => new Date(doneAt) });
-    container.replace(updateRunTaskLifecycle(stopped, taskId, wasCancelled ? 'cancelled' : 'done', wasCancelled ? 'cancelled' : 'completed', wasCancelled ? 'pi native run cancelled' : 'pi native run complete', doneAt));
+    container.replace(updateRunTaskLifecycle(stopped, taskId, wasCancelled ? 'cancelled' : 'done', wasCancelled ? 'cancelled' : 'completed', wasCancelled ? 'pi native run cancelled' : finalActivity, doneAt));
     appendLogToContainer(container, options, {
       source: 'adapter',
       level: 'info',
@@ -3398,6 +3400,7 @@ async function runPiNativeZergRequest(
       runId,
       agentId: request.agent,
       taskId,
+      data: { finalSummary },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -3478,9 +3481,16 @@ async function runSinglePiNativeAgent(
     settingsManager,
   });
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
+  let capturedResponse: string | undefined;
+  const captureResponse = (value: unknown) => {
+    capturedResponse = extractPiNativePromptResponse(value) ?? capturedResponse;
+  };
   run.activeRun?.sessions.add(session as PiNativeSessionHandle);
   updateMemberProgress(run, definition.id, 'running', { startedAt: updateAt(), handoffPath: run.handoffPath });
   const unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
+    if (event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
+      captureResponse(event);
+    }
     if (event.type === 'tool_execution_start') {
       appendLogToContainer(run.container, run.options, {
         source: 'adapter',
@@ -3509,11 +3519,13 @@ async function runSinglePiNativeAgent(
       return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before prompt' };
     }
     const promptResult = await session.prompt(run.task, { source: 'extension' as never });
+    captureResponse(promptResult);
+    captureResponse((session as { messages?: unknown }).messages);
     if (run.activeRun?.cancelRequested) {
       updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancelled' });
       return { agentId: definition.id, status: 'cancelled', message: 'cancelled' };
     }
-    const handoffMessage = ensurePiNativeHandoff(context, run, definition.id, promptResult);
+    const handoffMessage = ensurePiNativeHandoff(context, run, definition.id, capturedResponse ?? promptResult);
     appendLogToContainer(run.container, run.options, {
       source: 'adapter',
       level: 'info',
@@ -3609,6 +3621,43 @@ function stringifyPiNativePromptResult(value: unknown): string | undefined {
       return undefined;
     }
   }
+  return undefined;
+}
+
+function isPiNativeAssistantMessage(value: unknown): boolean {
+  if (!isNativePlainRecord(value)) return false;
+  return value.role === 'assistant' || value.type === 'assistant' || value.kind === 'assistant';
+}
+
+function extractPiNativePromptResponse(value: unknown): string | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'string') return stringifyPiNativePromptResult(value);
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const text = extractPiNativePromptResponse(value[index]);
+      if (text) return text;
+    }
+    return undefined;
+  }
+  if (!isNativePlainRecord(value)) return stringifyPiNativePromptResult(value);
+
+  const messages = value.messages;
+  if (Array.isArray(messages)) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const text = extractPiNativePromptResponse(messages[index]);
+      if (text) return text;
+    }
+  }
+
+  const message = value.message;
+  if (message && isPiNativeAssistantMessage(message)) {
+    return stringifyPiNativePromptResult(message);
+  }
+
+  if (isPiNativeAssistantMessage(value)) {
+    return stringifyPiNativePromptResult(value);
+  }
+
   return undefined;
 }
 
@@ -4774,6 +4823,7 @@ export const __zergNativeTestInternals = {
   createPiNativeCustomTools,
   createLarraMcpGatewayTool,
   createPiNativeResourceLoader,
+  extractPiNativePromptResponse,
   resolvePiNativeTools,
 };
 

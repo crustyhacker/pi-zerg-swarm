@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-05-25
+
+### Fixed
+
+- Captured final assistant text from native Pi sessions so single-agent zerg runs return usable handoffs instead of generic completion placeholders.
+- Propagated captured native run summaries into run metadata and logs for direct `runs.show` inspection.
+
 ## [1.1.1] - 2026-05-25
 
 ### Fixed

@@ -3871,6 +3871,29 @@ test('native zerg runner exposes Larra MCP tools when requested', () => {
   assert.deepEqual(__zergNativeTestInternals.createPiNativeCustomTools(defaultTools), []);
 });
 
+test('native zerg runner extracts final assistant text from Pi session events', () => {
+  const fromAgentEnd = __zergNativeTestInternals.extractPiNativePromptResponse({
+    type: 'agent_end',
+    messages: [
+      { role: 'user', content: 'original task' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Final Larra-backed plan' }] },
+    ],
+  });
+  assert.equal(fromAgentEnd, 'Final Larra-backed plan');
+
+  const fromTurnEnd = __zergNativeTestInternals.extractPiNativePromptResponse({
+    type: 'turn_end',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Turn handoff' }] },
+  });
+  assert.equal(fromTurnEnd, 'Turn handoff');
+
+  const userMessage = __zergNativeTestInternals.extractPiNativePromptResponse({
+    type: 'message_end',
+    message: { role: 'user', content: 'do not capture this task text' },
+  });
+  assert.equal(userMessage, undefined);
+});
+
 test('native zerg runner prompt no longer contradicts explicit Larra use', async () => {
   const loader = await __zergNativeTestInternals.createPiNativeResourceLoader({
     createExtensionRuntime: () => ({}),

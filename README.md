@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.1 release status**
-> The release includes native asynchronous `/zerg run --bg`, durable run/log recovery snapshots, direct structured automation through `createZergControl(...)`, Pi `zerg_control` tool registration when supported by the installed Pi API, a simplified KISS `/zerg config` overlay, and native team handoff/task-preservation fixes.
+> **v1.1.2 release status**
+> The release includes native asynchronous `/zerg run --bg`, durable run/log recovery snapshots, direct structured automation through `createZergControl(...)`, Pi `zerg_control` tool registration when supported by the installed Pi API, a simplified KISS `/zerg config` overlay, native team handoff/task-preservation fixes, native Larra MCP tool exposure, and captured final assistant handoffs for native single-agent runs.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.1** (patch release with native Larra MCP tool exposure for zerg agents, plus the v1.1.0 restart-durable run/log recovery snapshots, native async/background execution, direct structured control API/tool registration, native team member concurrency, team-id direct runs, Claude Code-style runtime agent/team/model configuration, and simplified interactive TUI management overlay).
+- Current release: **v1.1.2** (patch release with native final assistant handoff capture for zerg agents, plus v1.1.1 native Larra MCP tool exposure and the v1.1.0 restart-durable run/log recovery snapshots, native async/background execution, direct structured control API/tool registration, native team member concurrency, team-id direct runs, Claude Code-style runtime agent/team/model configuration, and simplified interactive TUI management overlay).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -147,8 +147,9 @@ npm run check:version
 - v1.0.5: patch release with simplified KISS `/zerg config` overlay UX and Pi theme-aware management panes (completed)
 - v1.0.6: patch release with native team handoff fallback persistence, original task preservation, team-id direct runs, and scope-safe native team prompts (completed)
 - v1.1.0: minor release with restart-durable run/log recovery snapshots, additive direct message transport hooks, and author/copyright metadata alignment
-- v1.1.1: patch release exposing Larra MCP tools to native zerg agents when requested (current release)
-- post-v1.1.1: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.1: patch release exposing Larra MCP tools to native zerg agents when requested
+- v1.1.2: patch release capturing final assistant handoffs from native single-agent zerg runs (current release)
+- post-v1.1.2: deeper delivered-process transport validation and richer multi-window operator console polish
 
 ## License
 
