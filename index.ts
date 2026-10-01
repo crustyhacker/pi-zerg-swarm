@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
-
+import { fileURLToPath } from 'node:url';
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { deriveThinkingSteps } from './parse.js';
@@ -3455,31 +3455,8 @@ async function runSinglePiNativeAgent(
 
   const sdk = await import('@earendil-works/pi-coding-agent');
   const cwd = resolvePiNativeCwd(context);
-  const authStorage = sdk.AuthStorage.create();
-  const modelRegistry = sdk.ModelRegistry.create(authStorage);
-  const modelSpec = definition.model ?? run.request.model;
-  const { modelId, thinkingLevel } = splitModelAndThinking(modelSpec);
-  const model = await resolvePiNativeModel(modelRegistry as never, modelId);
-  const tools = resolvePiNativeTools(definition.tools);
-  const settingsManager = sdk.SettingsManager.inMemory({
-    compaction: { enabled: false },
-    retry: { enabled: true, maxRetries: 2 },
-  });
-  const resourceLoader = await createPiNativeResourceLoader(sdk, definition, run.task, cwd, settingsManager);
-  const customTools = createPiNativeCustomTools(tools);
-  const sessionManager = sdk.SessionManager.create(cwd);
-  const { session } = await sdk.createAgentSession({
-    cwd,
-    model: model as never,
-    thinkingLevel: thinkingLevel as never,
-    authStorage,
-    modelRegistry,
-    resourceLoader: resourceLoader as never,
-    tools,
-    customTools: customTools as never,
-    sessionManager,
-    settingsManager,
-  });
+  const modelSpec = resolvePiNativeRunModel(definition, run.request);
+  const { session, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec);
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
   let capturedResponse: string | undefined;
   const captureResponse = (value: unknown) => {
@@ -3505,6 +3482,7 @@ async function runSinglePiNativeAgent(
   });
 
   try {
+    await session.bindExtensions({ mode: 'print' });
     appendLogToContainer(run.container, run.options, {
       source: 'adapter',
       level: 'info',
@@ -3871,12 +3849,16 @@ function resolvePiNativeCwd(context: StructuralPiExtensionContext): string {
 function splitModelAndThinking(modelSpec: string | undefined): { modelId: string | undefined; thinkingLevel: string | undefined } {
   if (!modelSpec) return { modelId: undefined, thinkingLevel: undefined };
   const index = modelSpec.lastIndexOf(':');
-  if (index <= 0) return { modelId: modelSpec, thinkingLevel: undefined };
-  return { modelId: modelSpec.slice(0, index), thinkingLevel: modelSpec.slice(index + 1) };
+  const suffix = modelSpec.slice(index + 1);
+  // Colons also occur in model IDs (for example local model quantizations).
+  if (index <= 0 || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(suffix)) {
+    return { modelId: modelSpec, thinkingLevel: undefined };
+  }
+  return { modelId: modelSpec.slice(0, index), thinkingLevel: suffix };
 }
 
-async function resolvePiNativeModel(modelRegistry: { getAvailable(): Array<{ provider: string; id: string }> | Promise<Array<{ provider: string; id: string }>> }, modelId: string | undefined): Promise<unknown> {
-  const available = await Promise.resolve(modelRegistry.getAvailable());
+async function resolvePiNativeModel(modelRuntime: { getAvailable(): readonly { provider: string; id: string }[] | Promise<readonly { provider: string; id: string }[]> }, modelId: string | undefined): Promise<unknown> {
+  const available = await modelRuntime.getAvailable();
   if (available.length === 0) {
     throw new Error('No available Pi models for native zerg run.');
   }
@@ -3908,6 +3890,67 @@ function resolvePiNativeTools(tools: readonly string[] | undefined): string[] {
     }
   }
   return [...mapped];
+}
+
+async function createPiNativeSession(
+  sdk: typeof import('@earendil-works/pi-coding-agent'),
+  definition: ZergAgentDefinition,
+  task: string,
+  cwd: string,
+  modelSpec: string | undefined,
+) {
+  const agentDir = sdk.getAgentDir();
+  const modelRuntime = await sdk.ModelRuntime.create({
+    authPath: resolvePath(agentDir, 'auth.json'),
+    modelsPath: resolvePath(agentDir, 'models.json'),
+    allowModelNetwork: false,
+  });
+  const { modelId, thinkingLevel } = splitModelAndThinking(modelSpec);
+  const tools = resolvePiNativeTools(definition.tools);
+  const settingsManager = sdk.SettingsManager.create(cwd, agentDir);
+  // Package discovery reads scoped settings, not applyOverrides(), and reloads
+  // them before loading factories. Filter this child-only manager at that boundary.
+  const extensionPath = fileURLToPath(import.meta.url);
+  for (const getter of ['getGlobalSettings', 'getProjectSettings'] as const) {
+    const getSettings = settingsManager[getter].bind(settingsManager);
+    settingsManager[getter] = () => {
+      const settings = getSettings();
+      return {
+        ...settings,
+        packages: settings.packages?.map((entry) => {
+          const source = typeof entry === 'string' ? entry : entry.source;
+          return /^npm:pi-zerg-swarm(?:@|$)/.test(source)
+            ? { ...(typeof entry === 'string' ? { source } : entry), extensions: [] }
+            : entry;
+        }),
+        extensions: [...(settings.extensions ?? []), `-${extensionPath}`, `-${dirname(extensionPath)}`, '!**/node_modules/pi-zerg-swarm/**'],
+      };
+    };
+  }
+  settingsManager.applyOverrides({
+    compaction: { enabled: false },
+    retry: { enabled: true, maxRetries: 2 },
+    defaultTools: tools,
+  });
+  const resourceLoader = await createPiNativeResourceLoader(sdk, definition, task, cwd, settingsManager);
+  const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
+  const { session } = await sdk.createAgentSession({
+    cwd,
+    agentDir,
+    modelRuntime,
+    model: model as never,
+    thinkingLevel: thinkingLevel as never,
+    resourceLoader: resourceLoader as never,
+    tools,
+    customTools: createPiNativeCustomTools(tools) as never,
+    sessionManager: sdk.SessionManager.create(cwd),
+    settingsManager,
+  });
+  return { session, tools };
+}
+
+function resolvePiNativeRunModel(definition: Pick<ZergAgentDefinition, 'id' | 'model'>, request: Pick<ZergSubagentLaunchRequest, 'agent' | 'model'>): string | undefined {
+  return definition.id === request.agent ? request.model ?? definition.model : definition.model ?? request.model;
 }
 
 async function createPiNativeResourceLoader(
@@ -3943,7 +3986,9 @@ async function createPiNativeResourceLoader(
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [],
+    getAppendSystemPromptSources: () => [],
     extendResources: () => undefined,
     reload: async () => undefined,
   };
@@ -4409,7 +4454,8 @@ export function createPiZergCommandHandler(
     const result = await scaffoldHandler(input);
     const output = typeof result === 'string' ? result : result.output;
 
-    if ((normalized.topic === 'monitor' || normalized.topic === 'config') && context.ui?.custom) {
+    const canUseTerminalUI = context.hasUI !== false && (context.mode === undefined || context.mode === 'tui');
+    if ((normalized.topic === 'monitor' || normalized.topic === 'config') && canUseTerminalUI && context.ui?.custom) {
       if (normalized.topic === 'config') {
         try {
           await openZergManagementOverlay(context, {
@@ -4510,7 +4556,7 @@ export function createPiZergCommandHandler(
       };
 
       try {
-        context.ui.custom(
+        await context.ui.custom(
           (tui?: StructuralPiTuiHandle, _theme?: unknown, _keybindings?: unknown, done?: () => void) => {
             let closed = false;
             let invalidated = false;
@@ -4823,8 +4869,12 @@ export const __zergNativeTestInternals = {
   createPiNativeCustomTools,
   createLarraMcpGatewayTool,
   createPiNativeResourceLoader,
+  createPiNativeSession,
   extractPiNativePromptResponse,
+  resolvePiNativeModel,
+  resolvePiNativeRunModel,
   resolvePiNativeTools,
+  splitModelAndThinking,
 };
 
 export default registerZergSwarmExtension;

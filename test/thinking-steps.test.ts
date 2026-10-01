@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -3972,4 +3972,182 @@ test('terminal run state wins over stale adapter starting substate', () => {
   assert.equal(shown.ok, true);
   assert.ok(shown.output.includes('status: done/completed'));
   assert.equal(shown.output.includes('done/starting'), false);
+});
+
+// Real Pi 1.0 SDK sessions with an in-memory provider: no provider/network calls.
+async function createOfflinePiSdk(directory: string, replies: Array<{ content: unknown[]; stopReason: 'stop' | 'toolUse' }> = []) {
+  const sdk = await import('@earendil-works/pi-coding-agent');
+  const runtime = await sdk.ModelRuntime.create({ authPath: join(directory, 'auth.json'), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+  let requests = 0;
+  runtime.registerProvider('zerg-offline', {
+    api: 'zerg-offline-api', apiKey: 'offline-test-key', baseUrl: 'https://unused.invalid',
+    models: ['local:7b', 'configured-default'].map((id) => ({ id, name: id, reasoning: true, input: ['text'], contextWindow: 8000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
+    streamSimple(model: { api: string; provider: string; id: string }) {
+      const reply = replies[requests++] ?? { content: [{ type: 'text', text: 'Offline final handoff' }], stopReason: 'stop' };
+      const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), ...reply, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      return { async *[Symbol.asyncIterator]() { yield { type: 'start', partial: message }; yield { type: 'done', reason: message.stopReason, message }; }, async result() { return message; } };
+    },
+  } as never);
+  const settings = sdk.SettingsManager.inMemory({ defaultProvider: 'zerg-offline', defaultModel: 'configured-default', extensions: [new URL('../index.ts', import.meta.url).pathname], retry: { enabled: false } });
+  const nativeSdk = {
+    ...sdk,
+    getAgentDir: () => directory,
+    ModelRuntime: { create: async () => runtime },
+    SettingsManager: { create: () => settings },
+    SessionManager: { create: () => sdk.SessionManager.inMemory(directory) },
+  } as unknown as typeof sdk;
+  return { sdk, nativeSdk, runtime, settings, requests: () => requests };
+}
+
+test('Pi 1.0 native initialization wires runtime credentials, configured models and exact tools', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'zerg-pi100-native-'));
+  try {
+    const fixture = await createOfflinePiSdk(directory);
+    let runtimeOptions: unknown;
+    let sessionOptions: Record<string, unknown> | undefined;
+    const nativeSdk = {
+      ...fixture.nativeSdk,
+      ModelRuntime: { create: async (options: unknown) => { runtimeOptions = options; return fixture.runtime; } },
+      createAgentSession: async (options: Parameters<typeof fixture.sdk.createAgentSession>[0]) => { sessionOptions = options as Record<string, unknown>; return fixture.sdk.createAgentSession(options); },
+    } as unknown as typeof fixture.sdk;
+    const initialSharedState = readSharedZergState();
+    const { session } = await __zergNativeTestInternals.createPiNativeSession(nativeSdk, { id: 'offline', label: 'Offline', prompt: 'Read only.', source: 'runtime', tools: ['read'] }, 'Read-only task; no edits.', directory, 'zerg-offline/local:7b:high');
+    try {
+      await session.bindExtensions({ mode: 'print' });
+      assert.equal(session.modelRuntime, fixture.runtime);
+      assert.equal(session.model?.id, 'local:7b');
+      assert.equal(session.thinkingLevel, 'high');
+      assert.deepEqual(session.getActiveToolNames(), ['read']);
+      assert.equal(session.getAllTools().some((tool) => tool.name === 'zerg_control'), false, 'native loader excludes recursive swarm registration');
+      assert.deepEqual(readSharedZergState(), initialSharedState);
+      assert.deepEqual(runtimeOptions, { authPath: join(directory, 'auth.json'), modelsPath: join(directory, 'models.json'), allowModelNetwork: false });
+      assert.equal(sessionOptions?.modelRuntime, fixture.runtime);
+      assert.equal('authStorage' in sessionOptions!, false);
+      assert.equal('modelRegistry' in sessionOptions!, false);
+      assert.ok(session.systemPrompt.includes('Read-only task; no edits.'));
+      await session.prompt('Return the handoff.');
+      assert.equal(__zergNativeTestInternals.extractPiNativePromptResponse(session.messages), 'Offline final handoff');
+      assert.equal(fixture.requests(), 1);
+    } finally { session.dispose(); }
+    const { session: defaultSession } = await __zergNativeTestInternals.createPiNativeSession(nativeSdk, { id: 'offline', label: 'Offline', prompt: 'Read only.', source: 'runtime', tools: ['read'] }, 'Read only.', directory, undefined);
+    try { assert.equal(defaultSession.model?.id, 'configured-default'); } finally { defaultSession.dispose(); }
+    await assert.rejects(__zergNativeTestInternals.resolvePiNativeModel(fixture.runtime, 'zerg-offline/missing'), /not available/);
+    assert.deepEqual(__zergNativeTestInternals.splitModelAndThinking('zerg-offline/local:7b'), { modelId: 'zerg-offline/local:7b', thinkingLevel: undefined });
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Pi 1.0 real extension registration validates structured tool calls without a live model', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'zerg-pi100-registration-'));
+  let registration: ZergExtensionRegistration | undefined;
+  try {
+    const fixture = await createOfflinePiSdk(directory, [
+      { content: [{ type: 'toolCall', id: 'create', name: 'zerg_control', arguments: { action: 'agents.create', id: 'schema-worker', prompt: 'Read only.', tools: ['read'] } }], stopReason: 'toolUse' },
+      { content: [{ type: 'toolCall', id: 'invalid', name: 'zerg_control', arguments: {} }], stopReason: 'toolUse' },
+    ]);
+    const loader = new fixture.sdk.DefaultResourceLoader({ cwd: directory, agentDir: directory, settingsManager: fixture.settings, noExtensions: true, extensionFactories: [(pi) => { registration = registerZergSwarmExtension(pi as never); }] });
+    await loader.reload();
+    const { session } = await fixture.sdk.createAgentSession({ cwd: directory, agentDir: directory, modelRuntime: fixture.runtime, model: fixture.runtime.getModel('zerg-offline', 'configured-default'), resourceLoader: loader, settingsManager: fixture.settings, sessionManager: fixture.sdk.SessionManager.inMemory(directory) });
+    try {
+      await session.bindExtensions({ mode: 'print' });
+      assert.deepEqual(session.extensionRunner?.getRegisteredCommands().map((command) => command.name).filter((name) => ['zerg', 'zerg-swarm', 'swarm'].includes(name)).sort(), ['swarm', 'zerg', 'zerg-swarm']);
+      await session.prompt('Exercise the structured tool.');
+      const results = session.messages.filter((message) => message.role === 'toolResult') as Array<{ isError?: boolean; details?: { ok?: boolean }; content?: Array<{ text?: string }> }>;
+      assert.equal(results[0]?.isError, false);
+      assert.equal(results[0]?.details?.ok, true);
+      assert.equal(getAgentDefinition(registration!.control.getState(), 'schema-worker')?.prompt, 'Read only.');
+      assert.equal(results[1]?.isError, true, 'Pi validates the unchanged plain JSON schema');
+    } finally { session.dispose(); }
+  } finally { registration?.dispose(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Pi 1.0 keeps HTTP Larra aliases active without unrequested built-in tools', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'zerg-pi100-larra-'));
+  try {
+    const fixture = await createOfflinePiSdk(directory);
+    const { session, tools } = await __zergNativeTestInternals.createPiNativeSession(fixture.nativeSdk, { id: 'offline', label: 'Offline', prompt: 'Read only.', source: 'runtime', tools: ['larra', 'read'] }, 'Use Larra HTTP aliases.', directory, undefined);
+    try {
+      await session.bindExtensions({ mode: 'print' });
+      assert.deepEqual(session.getActiveToolNames().sort(), [...tools].sort());
+      assert.ok(session.getActiveToolNames().includes('larra_orient_session'));
+      assert.ok(session.getActiveToolNames().includes('mcp'));
+      for (const name of ['bash', 'edit', 'write', 'codemode', 'tool_search']) {
+        assert.equal(session.getActiveToolNames().includes(name), false);
+      }
+      assert.equal(session.getAllTools().some((tool) => tool.name.startsWith('mcp__')), false);
+      assert.equal(fixture.requests(), 0);
+    } finally { session.dispose(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Pi 1.0 native children exclude differently located npm swarm controllers only', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'zerg-pi100-packages-'));
+  try {
+    const fixture = await createOfflinePiSdk(directory);
+    const controllerPath = new URL('../index.ts', import.meta.url).pathname;
+    for (const base of [directory, join(directory, '.pi')]) {
+      const packageDir = join(base, 'npm', 'node_modules', 'pi-zerg-swarm');
+      mkdirSync(packageDir, { recursive: true });
+      writeFileSync(join(packageDir, 'package.json'), JSON.stringify({ name: 'pi-zerg-swarm', version: '1.1.3', pi: { extensions: ['./index.ts'] } }));
+      writeFileSync(join(packageDir, 'index.ts'), `import { registerZergSwarmExtension } from ${JSON.stringify(controllerPath)}; export default registerZergSwarmExtension;`);
+    }
+    const otherDir = join(directory, 'npm', 'node_modules', 'pi-zerg-swarm-helper');
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, 'package.json'), JSON.stringify({ name: 'pi-zerg-swarm-helper', version: '1.0.0', pi: { extensions: ['./index.ts'] } }));
+    writeFileSync(join(otherDir, 'index.ts'), 'export default (pi) => { pi.registerCommand("unrelated_helper", { description: "Preserved extension", handler: async () => {} }); };');
+    writeFileSync(join(directory, 'settings.json'), JSON.stringify({ defaultProvider: 'zerg-offline', defaultModel: 'configured-default', packages: ['npm:pi-zerg-swarm', 'npm:pi-zerg-swarm-helper@1.0.0'], extensions: [controllerPath], npmCommand: [process.execPath, '-e', 'throw new Error("Unexpected package install in offline fixture")', '--'] }));
+    writeFileSync(join(directory, '.pi', 'settings.json'), JSON.stringify({ packages: [{ source: 'npm:pi-zerg-swarm@1.1.3' }] }));
+    const beforeSettings = readFileSync(join(directory, 'settings.json'), 'utf8');
+    const initialSharedState = readSharedZergState();
+    const nativeSdk = { ...fixture.nativeSdk, SettingsManager: fixture.sdk.SettingsManager } as typeof fixture.sdk;
+    const { session } = await __zergNativeTestInternals.createPiNativeSession(nativeSdk, { id: 'offline', label: 'Offline', prompt: 'Read only.', source: 'runtime', tools: ['read'] }, 'Read only.', directory, undefined);
+    try {
+      const errors: unknown[] = [];
+      await session.bindExtensions({ mode: 'print', onError: (error) => errors.push(error) });
+      assert.deepEqual(errors, []);
+      assert.equal(session.getAllTools().some((tool) => tool.name === 'zerg_control'), false);
+      assert.deepEqual(session.extensionRunner?.getRegisteredCommands().map((command) => command.name), ['unrelated_helper']);
+      assert.deepEqual(readSharedZergState(), initialSharedState);
+      assert.equal(session.model?.id, 'configured-default');
+      assert.equal(readFileSync(join(directory, 'settings.json'), 'utf8'), beforeSettings);
+    } finally { session.dispose(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('native model overrides apply to the launched leader without replacing member models', () => {
+  const request = { agent: 'leader', model: 'leader-override' };
+  assert.equal(__zergNativeTestInternals.resolvePiNativeRunModel({ id: 'leader', model: 'leader-default' }, request), 'leader-override');
+  assert.equal(__zergNativeTestInternals.resolvePiNativeRunModel({ id: 'member', model: 'member-default' }, request), 'member-default');
+  assert.equal(__zergNativeTestInternals.resolvePiNativeRunModel({ id: 'member' }, request), 'leader-override');
+});
+
+test('Pi 1.0 RPC, JSON and print commands stay text-only even with custom UI stubs', async () => {
+  const handler = createPiZergCommandHandler(createZergState());
+  for (const mode of ['rpc', 'json', 'print'] as const) {
+    for (const command of ['/zerg config', '/zerg monitor']) {
+      let customCalls = 0;
+      const output: string[] = [];
+      await handler(command, { mode, hasUI: mode === 'rpc', ui: { custom() { customCalls += 1; }, notify(message) { output.push(message); } } });
+      assert.equal(customCalls, 0);
+      assert.equal(output.length, 1);
+      assert.ok(output[0].includes('zerg'));
+    }
+  }
+});
+
+test('Pi 1.0 terminal overlay awaits completion and catches asynchronous setup failures', async () => {
+  const handler = createPiZergCommandHandler(createZergState());
+  let customCalls = 0;
+  const output: string[] = [];
+  await handler('/zerg monitor', { mode: 'tui', hasUI: true, ui: { async custom() { customCalls += 1; throw new Error('async unsupported UI'); }, notify(message) { output.push(message); } } });
+  assert.equal(customCalls, 2);
+  assert.equal(output.length, 1);
+  let finish: (() => void) | undefined;
+  let resolved = false;
+  const pending = Promise.resolve(handler('/zerg monitor', { mode: 'tui', hasUI: true, ui: { custom: () => new Promise<void>((resolve) => { finish = resolve; }) } })).then(() => { resolved = true; });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(resolved, false);
+  assert.ok(finish);
+  finish();
+  await pending;
+  assert.equal(resolved, true);
 });

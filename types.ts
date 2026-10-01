@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.2' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.3' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -607,6 +607,8 @@ export interface StructuralPiCustomOptions {
 export interface StructuralPiCommandContext {
   cwd?: string;
   hasUI?: boolean;
+  /** Pi 1.0 RPC supports dialogs, but not custom terminal components. */
+  mode?: 'tui' | 'rpc' | 'json' | 'print';
   ui?: {
     notify?(message: string, type?: 'info' | 'warning' | 'error'): void;
     custom?(

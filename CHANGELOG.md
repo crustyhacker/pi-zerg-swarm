@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-01
+
+### Fixed
+
+- Updated native sessions for Pi 1.0.0's asynchronous `ModelRuntime` model and credential APIs, replacing the removed `AuthStorage` integration.
+- Respected configured default models and explicit per-run model overrides in native execution.
+- Bound native extension lifecycle handlers before prompting and prevented recursive swarm loading in child sessions.
+- Kept RPC, JSON, and print-mode management commands on their text fallback instead of opening terminal overlays; awaited overlay setup so asynchronous failures reach the fallback.
+
+### Changed
+
+- Validated against Pi SDK and TUI 1.0.0, with host-provided peer dependencies instead of duplicate bundled runtime copies.
+- Declared the current Pi requirement of Node.js 22.19.0 or newer and updated the development dependency lockfile.
+
 ## [1.1.2] - 2026-05-25
 
 ### Fixed
