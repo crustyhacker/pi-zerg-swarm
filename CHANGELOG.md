@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.8] - 2026-10-02
+
+### Fixed
+
+- Native execution now rejects unsupported fork requests, configured `maxTurns`, and nonempty `fallbackModels` instead of silently ignoring them. Preflight checks the resolved run and selected leader/member definitions before SDK session startup or coordination-directory creation, including workers queued behind the concurrency limit.
+- Reports a bounded, actionable unsupported-option error while preserving cancellation precedence and truthful foreground control/tool errors and eventual background run/task failures.
+- Preserves fresh native defaults and capability forwarding to external adapters or acknowledged slash bridges. This patch does not implement native turn budgets, model failover, or inherited parent context.
+
+### Added
+
+- Localhost-only Pi SDK regression coverage for inherited capability settings, zero extension/session/provider startup on rejection, whole-team validation, cancellation, default success, and control/tool/slash/native-fallback behavior.
+
 ## [1.1.7] - 2026-10-02
 
 ### Added

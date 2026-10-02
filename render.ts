@@ -538,7 +538,7 @@ export function renderHelp(state: ZergState, options: RenderOptions = {}): strin
     'Logs syntax: /zerg logs status|list [--run <id>] [--level debug|info|warn|error] [--limit <n>] | /zerg logs show <id|run-id> [--json] | /zerg logs json [--run <id>] [--limit <n>]',
     'Registry syntax: /zerg agents [list] | show <id> | create|update <id> --prompt <text> [--model <model>] [--tools a,b] | delete <id>',
     'Config syntax: /zerg config opens the Pi overlay configuration window when available',
-    'Run syntax: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--concurrency <n>] (fresh is default isolated launch; native team workers default to concurrency 8; fork requests inherited context where supported) | /zerg runs [list] | /zerg runs show <run-id> | /zerg interrupt [run-id]',
+    'Run syntax: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--concurrency <n>] (fresh is default isolated launch; native team workers default to concurrency 8; native execution rejects unsupported fork/maxTurns/fallbackModels before SDK startup; use a supported external adapter/acknowledged bridge for those capabilities) | /zerg runs [list] | /zerg runs show <run-id> | /zerg interrupt [run-id]',
     'Monitor syntax: /zerg monitor [readonly on|off|toggle|status]',
     'Intervention syntax: /zerg intervene agent <agent-id> <message> | /zerg intervene subagent <agent-id> <message> | /zerg intervene leader <team-id> <message>',
     'Available now: slash-free Pi command registration, aliases, lifecycle state updates, mode/intervention/monitor/control/config commands, runtime health/activity summaries, scaffold status/tree output, thinking-step parsing, text rendering, and Pi event-bus observation.',

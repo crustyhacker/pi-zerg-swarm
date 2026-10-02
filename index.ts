@@ -3553,6 +3553,34 @@ function createPiNativeAdapter(
   };
 }
 
+function validatePiNativeUnsupportedCapabilities(
+  request: ZergSubagentLaunchRequest,
+  leaderDefinition: ZergAgentDefinition | undefined,
+  memberDefinitions: Array<ZergAgentDefinition | undefined>,
+  launchMode: ZergSubagentLaunchMode,
+): string | undefined {
+  const definitionOption = (role: string, definition: ZergAgentDefinition | undefined) => {
+    if (!definition) return undefined;
+    const option = definition.maxTurns !== undefined ? 'maxTurns'
+      : definition.fallbackModels?.length ? 'fallbackModels' : undefined;
+    // Report one bounded diagnostic, not raw fallback lists or the entire team.
+    return option ? `${role} ${definition.id.slice(0, 80).replace(/\s+/g, ' ')} option ${option}` : undefined;
+  };
+  let unsupported = launchMode === 'fork' || request.fork === true
+    ? 'run option launchMode=fork'
+    : definitionOption('leader', leaderDefinition)
+      ?? (request.maxTurns !== undefined ? 'run option maxTurns'
+        : request.fallbackModels?.length ? 'run option fallbackModels' : undefined);
+  if (!unsupported) {
+    for (const definition of memberDefinitions) {
+      unsupported = definitionOption('worker', definition);
+      if (unsupported) break;
+    }
+  }
+  if (!unsupported) return undefined;
+  return `Native zerg runner rejected unsupported capability request before SDK startup: ${unsupported}. Use fresh without maxTurns/fallbackModels, or an external adapter/acknowledged slash bridge that implements these options.`;
+}
+
 async function runPiNativeZergRequest(
   context: StructuralPiExtensionContext,
   container: ZergStateContainer,
@@ -3579,6 +3607,11 @@ async function runPiNativeZergRequest(
   try {
     if (missingMemberIds.length > 0) {
       throw new Error(`Team ${ledTeam?.id ?? request.resolvedTeamId ?? request.agent} references unknown member agent definition(s): ${missingMemberIds.join(', ')}`);
+    }
+
+    const unsupportedCapabilityMessage = validatePiNativeUnsupportedCapabilities(request, leaderDefinition, memberDefinitions, launchMode);
+    if (unsupportedCapabilityMessage) {
+      throw new Error(unsupportedCapabilityMessage);
     }
 
     mkdirSync(coordPath, { recursive: true });

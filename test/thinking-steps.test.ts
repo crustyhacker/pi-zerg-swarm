@@ -82,6 +82,33 @@ ${stderr}`);
   assert.match(stdout, /PASS all native concurrency smoke checks/);
 });
 
+test('native capabilities smoke fixture rejects unsupported native options before SDK startup', { timeout: 90_000 }, async () => {
+  const fixture = new URL('./fixtures/native-capabilities-smoke.mjs', import.meta.url);
+  const child = spawn(process.execPath, ['--import', 'tsx', fixture.pathname], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', resolve);
+  });
+  assert.equal(exitCode, 0, `native capabilities smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  assert.match(stdout, /PASS native capability preflight rejects fork\/maxTurns\/fallbackModels before session_start or provider requests/);
+  assert.match(stdout, /PASS default fresh single and team native runs remain successful/);
+  assert.match(stdout, /PASS foreground cancellation keeps precedence over unsupported native capability rejection/);
+  assert.match(stdout, /PASS external adapter receives unsupported-native capabilities unchanged/);
+  assert.match(stdout, /PASS acknowledged slash bridge path is not rejected by native fallback preflight/);
+  assert.match(stdout, /PASS native fallback foreground tool\/slash\/background rejection and cancellation before startup/);
+  assert.match(stdout, /PASS all native capability checks/);
+});
+
 test('run concurrency validation applies to command and structured control before launch', async () => {
   const launches: ZergSubagentLaunchRequest[] = [];
   const adapter: ZergSubagentControlAdapter = {
@@ -2177,7 +2204,7 @@ test('renderHelp documents fresh default and fork launch mode', () => {
   const help = renderHelp(createZergState());
   assert.ok(help.includes('--fresh|--fork'));
   assert.ok(help.includes('fresh is default isolated launch'));
-  assert.ok(help.includes('fork requests inherited context'));
+  assert.ok(help.includes('native execution rejects unsupported fork/maxTurns/fallbackModels before SDK startup'));
 });
 
 test('createZergCommandHandler blocks unknown definition run when registry is present', () => {

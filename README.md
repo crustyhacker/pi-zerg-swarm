@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.7 release status**
-> Bounds native team worker concurrency per run (default 8), with configurable FIFO admission, cancellation-safe queued workers, and leader execution after worker settlement. The release preserves truthful team outcomes, handoffs, Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
+> **v1.1.8 release status**
+> Rejects unsupported native fork, turn-limit, and fallback-model settings before any selected team's SDK sessions start, rather than silently ignoring them. Fresh native defaults and external-adapter/acknowledged-bridge forwarding remain available. The release preserves bounded worker concurrency, truthful team outcomes, handoffs, Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.7** (bounded native team concurrency and cancellation-safe worker queuing).
+- Current release: **v1.1.8** (fail-closed native capability validation before session startup).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -159,8 +159,9 @@ npm run check:version
 - v1.1.4: patch release hardening native outcomes, cancellation, tool policy, explicit teams, and targeted messaging
 - v1.1.5: patch release isolating state subscribers and bounding extension metadata traversal
 - v1.1.6: patch release propagating required worker failures to native team outcomes while preserving handoffs and cancellation
-- v1.1.7: patch release bounding native team worker concurrency with configurable FIFO admission and cancellation-safe queuing (current release)
-- post-v1.1.7: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.7: patch release bounding native team worker concurrency with configurable FIFO admission and cancellation-safe queuing
+- v1.1.8: patch release rejecting unsupported native fork, turn limits, and fallback models before session startup (current release)
+- post-v1.1.8: deeper delivered-process transport validation and richer multi-window operator console polish
 
 ## License
 
@@ -172,6 +173,7 @@ MIT © 2026 Marc Mironescu (@crustyhacker) <marcm@crustyhacker.dev>
 - All selected team members are required: a worker failure or independent cancellation fails the overall run/task even if the leader succeeds. Parent or leader cancellation still yields a cancelled run; successful handoffs remain available.
 - `tools: []` means no tools. `disallowedTools`/denylist entries remove tools from an allowlist; this is not a sandbox boundary.
 - Native permission modes `manual` and `assisted` are not supported for Pi SDK runner launches; use inherited/default automatic behavior or reject before model execution.
+- Native Pi SDK execution fails closed for `--fork`/`launchMode: 'fork'`, nondefault `maxTurns`, and nonempty `fallbackModels`: the selected leader and every selected team member are checked before any SDK session starts. Clear those options for native runs, or use a supported external adapter/acknowledged slash bridge that implements them. This limitation is in the zerg native runner wiring; Pi's session runtime has fork support, but this runner does not wire parent history yet.
 - Operator messages require a live run/member route. Native delivery reports Pi `steer`/`followUp` acknowledgement as `queued` or `handled`; UI-local drafts may still use `queued-local` and are not delivery proof.
 - Structured `zerg_control` message mode accepts only `steer` or `followUp` (default `steer`); ambiguous live target routes require an explicit `runId`.
 - Native team workers have a per-run concurrency limit (default **8**). Set it with `/zerg run <team> "<task>" --concurrency <n>` (also `--concurrency=<n>`) or a positive safe-integer number in structured `zerg_control` run `concurrency: n`. This is not a global/provider-wide limit, and external adapters are responsible for their own enforcement.
