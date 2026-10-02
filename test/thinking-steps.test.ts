@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,6 +24,32 @@ test('runtime extension version matches package metadata', () => {
   const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
   assert.equal(packageJson.version, ZERG_EXTENSION_VERSION);
 });
+
+test('native control host smoke fixture covers phase1 lifecycle hardening', { timeout: 90_000 }, async () => {
+  const fixture = new URL('./fixtures/native-control-smoke.mjs', import.meta.url);
+  const child = spawn(process.execPath, ['--import', 'tsx', fixture.pathname], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', resolve);
+  });
+  assert.equal(exitCode, 0, `native control smoke failed
+stdout:
+${stdout}
+stderr:
+${stderr}`);
+  assert.match(stdout, /PASS all phase1 host checks/);
+});
+
 
 const VALID_AGENT_RUNTIME_TRANSITION = {
   entity: 'agent',
@@ -3871,6 +3898,39 @@ test('native zerg runner exposes Larra MCP tools when requested', () => {
   assert.deepEqual(__zergNativeTestInternals.createPiNativeCustomTools(defaultTools), []);
 });
 
+test('native zerg runner honors empty tool lists and alias-aware denylists', () => {
+  assert.deepEqual(__zergNativeTestInternals.resolvePiNativeTools([]), []);
+  assert.deepEqual(__zergNativeTestInternals.resolvePiNativeTools(['files', 'shell', 'mcp'], ['write', 'shell', 'larra']).sort(), ['edit', 'read'].sort());
+  assert.deepEqual(__zergNativeTestInternals.resolvePiNativeTools(['files'], ['edit', 'write']).sort(), ['read']);
+});
+
+test('native zerg runner classifies only final assistant stop as success', () => {
+  assert.deepEqual(__zergNativeTestInternals.inspectPiNativeAssistantOutcome({ role: 'assistant', stopReason: 'error', errorMessage: '401 unauthorized' }), { status: 'failed', stopReason: 'error', message: '401 unauthorized' });
+  assert.deepEqual(__zergNativeTestInternals.inspectPiNativeAssistantOutcome([{ role: 'assistant', stopReason: 'aborted', errorMessage: 'operator interrupt' }]), { status: 'cancelled', stopReason: 'aborted', message: 'operator interrupt' });
+  assert.deepEqual(__zergNativeTestInternals.inspectPiNativeAssistantOutcome([{ role: 'assistant', stopReason: 'stop' }, { role: 'assistant', stopReason: 'length' }]), { status: 'failed', stopReason: 'length', message: 'assistant stopped with length' });
+  assert.equal(__zergNativeTestInternals.inspectPiNativeAssistantOutcome([{ role: 'assistant', stopReason: 'stop' }, { role: 'user', content: 'ignore me' }]), undefined);
+});
+
+test('native zerg run preserves explicit team identity with shared leaders', () => {
+  const launches: ZergSubagentLaunchRequest[] = [];
+  const state = [
+    { id: 'lead', label: 'Lead', prompt: 'Lead.', source: 'runtime' as const },
+    { id: 'memberA', label: 'A', prompt: 'A.', source: 'runtime' as const },
+    { id: 'memberB', label: 'B', prompt: 'B.', source: 'runtime' as const },
+  ].reduce((current, definition) => upsertAgentDefinition(current, definition), createZergState({
+    teams: {
+      first: { id: 'first', label: 'First', kind: 'team', status: 'idle', leaderAgentId: 'lead', memberAgentIds: ['lead', 'memberA'] },
+      second: { id: 'second', label: 'Second', kind: 'team', status: 'idle', leaderAgentId: 'lead', memberAgentIds: ['lead', 'memberB'] },
+    },
+  }));
+  const handler = createZergCommandHandler(createZergStateContainer(state), { idFactory: { runId: () => 'zerg-team-run', taskId: () => 'task-team' }, subagentAdapter: { kind: 'fake', launch(request) { launches.push(request); return { ok: true, runId: request.runId, taskId: request.taskId, message: 'accepted' }; } } });
+  const result = handler('/zerg run second Implement');
+  assert.equal(result.ok, true);
+  assert.equal(launches[0]?.agent, 'lead');
+  assert.equal(launches[0]?.resolvedTeamId, 'second');
+  assert.deepEqual(launches[0]?.memberAgentIds, ['memberB']);
+});
+
 test('native zerg runner extracts final assistant text from Pi session events', () => {
   const fromAgentEnd = __zergNativeTestInternals.extractPiNativePromptResponse({
     type: 'agent_end',
@@ -3886,6 +3946,21 @@ test('native zerg runner extracts final assistant text from Pi session events', 
     message: { role: 'assistant', content: [{ type: 'text', text: 'Turn handoff' }] },
   });
   assert.equal(fromTurnEnd, 'Turn handoff');
+
+  const thinkingOnly = __zergNativeTestInternals.extractPiNativePromptResponse({
+    type: 'agent_end',
+    messages: [{ role: 'assistant', content: [{ type: 'thinking', text: 'secret reasoning', thinkingSignature: 'encrypted' }] }],
+  });
+  assert.equal(thinkingOnly, undefined);
+
+  const finalAssistantWithoutText = __zergNativeTestInternals.extractPiNativePromptResponse({
+    type: 'agent_end',
+    messages: [
+      { role: 'assistant', content: [{ type: 'text', text: 'old text' }] },
+      { role: 'assistant', content: [{ type: 'toolCall', name: 'read' }] },
+    ],
+  });
+  assert.equal(finalAssistantWithoutText, undefined);
 
   const userMessage = __zergNativeTestInternals.extractPiNativePromptResponse({
     type: 'message_end',

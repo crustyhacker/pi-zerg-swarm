@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.3' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.4' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -131,6 +131,10 @@ export interface ZergSubagentLaunchRequest {
   runId?: string;
   taskId?: string;
   agentDefinitionId?: string;
+  /** Immutable team selected by the caller, if the launch targeted a team. */
+  resolvedTeamId?: string;
+  /** Immutable team member definition ids validated before launch. */
+  memberAgentIds?: string[];
   description?: string;
   /** LLM/model identifier requested for this launch. */
   model?: string;
@@ -238,7 +242,7 @@ export interface ZergSubagentControlAdapter {
   readonly kind: 'pi-native' | 'pi-slash-bridge' | 'fake' | 'unavailable';
   launch(request: ZergSubagentLaunchRequest): ZergSubagentControlResult;
   interrupt?(runId?: string): ZergSubagentControlResult;
-  sendMessage?(targetId: string, body: string, runId?: string): ZergOperatorMessageResult | Promise<ZergOperatorMessageResult>;
+  sendMessage?(targetId: string, body: string, runId?: string, mode?: ZergOperatorMessageMode): ZergOperatorMessageResult | Promise<ZergOperatorMessageResult>;
   awaitRun?(runId: string): Promise<ZergSubagentRunSnapshot | undefined>;
   listAgentDefinitions?(): readonly ZergAgentDefinition[];
   getAgentDefinition?(id: string): ZergAgentDefinition | undefined;
@@ -258,7 +262,7 @@ export type ZergControlAction =
   | { action: 'runs.list' }
   | { action: 'runs.show'; runId: string }
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }
-  | { action: 'message'; targetId: string; body: string; runId?: string }
+  | { action: 'message'; targetId: string; body: string; runId?: string; mode?: ZergOperatorMessageMode }
   | { action: 'interrupt'; runId?: string };
 
 export interface ZergControlError {
@@ -280,7 +284,7 @@ export interface ZergControlResult<T = unknown> {
 }
 
 export interface ZergControl {
-  execute(action: ZergControlAction): Promise<ZergControlResult>;
+  execute(action: ZergControlAction, signal?: AbortSignal): Promise<ZergControlResult>;
   getState(): ZergState;
   dispose(): void;
 }
@@ -567,7 +571,9 @@ export type ZergConfigOverlayTab = 'monitor' | 'control' | 'targets' | 'permissi
 
 export type ZergManagementPaneId = 'tree' | 'detail' | 'settings' | 'chat';
 export type ZergManagementTargetKind = 'agent' | 'team' | 'task';
-export type ZergOperatorMessageDeliveryStatus = 'draft' | 'queued-local' | 'transport-unavailable' | 'intervention-recorded' | 'accepted' | 'delivered' | 'delivery-failed';
+export type ZergOperatorMessageMode = 'steer' | 'followUp';
+export const ZERG_OPERATOR_MESSAGE_MODES: readonly ZergOperatorMessageMode[] = ['steer', 'followUp'] as const;
+export type ZergOperatorMessageDeliveryStatus = 'draft' | 'queued-local' | 'queued' | 'handled' | 'transport-unavailable' | 'intervention-recorded' | 'accepted' | 'delivered' | 'delivery-failed';
 
 export interface ZergOperatorMessageRecord {
   id: string;
@@ -648,6 +654,7 @@ export interface StructuralPiToolDefinition {
 }
 
 export interface StructuralPiExtensionContext {
+  on?(eventName: unknown, handler: (...args: unknown[]) => unknown): unknown;
   registerCommand?(name: ZergCommandName, options: StructuralPiCommandOptions): unknown;
   registerTool?(definition: StructuralPiToolDefinition): unknown;
   events?: {

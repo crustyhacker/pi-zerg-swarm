@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-10-02
+
+### Fixed
+
+- Classified native completion from the final assistant outcome: errors and incomplete responses fail, aborted responses cancel, and handoffs contain assistant text rather than reasoning or tool metadata.
+- Propagated foreground failures and cancellation through structured control results and tool error status.
+- Cancelled pending native fallback launches on interrupt, disposal, and session shutdown; aborted active sessions and prevented late bridge events or repeated interrupts from reviving terminal runs.
+- Propagated foreground abort signals and kept member progress terminal when cancellation occurs during session startup.
+- Preserved explicit empty tool lists and enforced alias-aware deny precedence, including restrictions on the generic Larra gateway.
+- Preserved the selected team's identity and member plan, rejected missing members before launch, and stopped implicitly choosing a team when its leader is launched directly.
+- Routed native operator messages to the requested live run/member, rejected ambiguous routes, and reported Pi's queued/handled acknowledgement instead of claiming delivery.
+- Removed the obsolete Arria identity from native leader prompts.
+
+### Changed
+
+- Native launches explicitly reject unsupported manual/assisted permission modes rather than silently ignoring them; tool selection is not an operating-system sandbox.
+- Structured messages accept an explicit `steer` or `followUp` mode, defaulting to `steer`.
+
+### Added
+
+- Permanent offline Pi SDK regression coverage using isolated settings, dummy credentials, and a localhost model fixture for outcomes, policy, teams, messaging, and cancellation lifecycle behavior.
+
 ## [1.1.3] - 2026-10-01
 
 ### Fixed

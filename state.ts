@@ -164,7 +164,7 @@ export function upsertAgentDefinition(state: ZergState, definition: ZergAgentDef
     ...(model ? { model } : {}),
     ...(fallbackModels ? { fallbackModels } : {}),
     ...(maxTurns ? { maxTurns } : {}),
-    tools: dedupeSortedTools(definition.tools),
+    tools: definition.tools === undefined ? undefined : dedupeSortedTools(definition.tools) ?? [],
     disallowedTools: dedupeSortedTools(definition.disallowedTools),
     metadata: cloneOptional(definition.metadata, cloneExtensionFields),
     extensions: cloneOptional(definition.extensions, cloneExtensionFields),

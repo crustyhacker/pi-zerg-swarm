@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.3 release status**
-> Updated for Pi 1.0.0, including native SDK model/credential integration. The release retains asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, MCP tool exposure, and captured native agent handoffs.
+> **v1.1.4 release status**
+> Hardens native run outcomes, tool restrictions, explicit team selection, targeted messaging, and cancellation/shutdown handling on Pi 1.0.0. The release retains asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.3** (Pi 1.0.0 compatibility patch, preserving native agent/team execution, structured control, restart-durable recovery, and the interactive management overlay).
+- Current release: **v1.1.4** (native correctness and control hardening for Pi 1.0.0).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -155,9 +155,18 @@ npm run check:version
 - v1.1.0: minor release with restart-durable run/log recovery snapshots, additive direct message transport hooks, and author/copyright metadata alignment
 - v1.1.1: patch release exposing Larra MCP tools to native zerg agents when requested
 - v1.1.2: patch release capturing final assistant handoffs from native single-agent zerg runs
-- v1.1.3: patch release updating native execution and extension integration for Pi 1.0.0 (current release)
-- post-v1.1.3: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.3: patch release updating native execution and extension integration for Pi 1.0.0
+- v1.1.4: patch release hardening native outcomes, cancellation, tool policy, explicit teams, and targeted messaging (current release)
+- post-v1.1.4: deeper delivered-process transport validation and richer multi-window operator console polish
 
 ## License
 
 MIT © 2026 Marc Mironescu (@crustyhacker) <marcm@crustyhacker.dev>
+
+## Native execution and control
+
+- Use explicit team ids when launching teams; a bare shared leader runs as a single leader, not the first matching team.
+- `tools: []` means no tools. `disallowedTools`/denylist entries remove tools from an allowlist; this is not a sandbox boundary.
+- Native permission modes `manual` and `assisted` are not supported for Pi SDK runner launches; use inherited/default automatic behavior or reject before model execution.
+- Operator messages require a live run/member route. Native delivery reports Pi `steer`/`followUp` acknowledgement as `queued` or `handled`; UI-local drafts may still use `queued-local` and are not delivery proof.
+- Structured `zerg_control` message mode accepts only `steer` or `followUp` (default `steer`); ambiguous live target routes require an explicit `runId`.
