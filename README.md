@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.4 release status**
-> Hardens native run outcomes, tool restrictions, explicit team selection, targeted messaging, and cancellation/shutdown handling on Pi 1.0.0. The release retains asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
+> **v1.1.5 release status**
+> Isolates state subscriber failures and rejects cyclic or excessively deep/large extension metadata before updates commit. The release retains Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.4** (native correctness and control hardening for Pi 1.0.0).
+- Current release: **v1.1.5** (state subscriber isolation and bounded metadata validation).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -156,8 +156,9 @@ npm run check:version
 - v1.1.1: patch release exposing Larra MCP tools to native zerg agents when requested
 - v1.1.2: patch release capturing final assistant handoffs from native single-agent zerg runs
 - v1.1.3: patch release updating native execution and extension integration for Pi 1.0.0
-- v1.1.4: patch release hardening native outcomes, cancellation, tool policy, explicit teams, and targeted messaging (current release)
-- post-v1.1.4: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.4: patch release hardening native outcomes, cancellation, tool policy, explicit teams, and targeted messaging
+- v1.1.5: patch release isolating state subscribers and bounding extension metadata traversal (current release)
+- post-v1.1.5: deeper delivered-process transport validation and richer multi-window operator console polish
 
 ## License
 

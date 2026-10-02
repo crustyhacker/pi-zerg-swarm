@@ -2,6 +2,11 @@ import { ZERG_STATE_SCHEMA_VERSION, type AgentIdentity, type AgentKind, type Age
 
 const DEFAULT_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 const MAX_LIFECYCLE_SUBSTATE_REASON_LENGTH = 160;
+const MAX_ZERG_STATE_LISTENER_DIAGNOSTIC_LENGTH = 240;
+// Extension metadata is persisted as JSON-shaped state. Bound traversal so invalid
+// cycles and hostile/deep graphs fail before commits instead of overflowing stacks.
+const MAX_EXTENSION_CLONE_DEPTH = 64;
+const MAX_EXTENSION_CLONE_WORK = 100_000;
 
 const DEFAULT_MODE: PermissionModeState = {
   automation: 'manual',
@@ -728,9 +733,15 @@ export function createZergStateContainer(seed?: Partial<ZergState>): ZergStateCo
 
   const publish = () => {
     const snapshot = snapshotZergState(current);
+    const listenerFailures: unknown[] = [];
     for (const listener of [...listeners]) {
-      listener(snapshotZergState(snapshot));
+      try {
+        listener(snapshotZergState(snapshot));
+      } catch (error) {
+        listenerFailures.push(error);
+      }
     }
+    reportStateListenerFailures(listenerFailures);
     return snapshot;
   };
 
@@ -756,6 +767,34 @@ export function createZergStateContainer(seed?: Partial<ZergState>): ZergStateCo
       };
     },
   };
+}
+
+function reportStateListenerFailures(failures: readonly unknown[]): void {
+  if (failures.length === 0) {
+    return;
+  }
+
+  const firstFailure = formatStateListenerFailure(failures[0]);
+  const diagnostic = `pi-zerg-swarm state listener failure: ${failures.length} subscriber(s) failed${firstFailure ? `: ${firstFailure}` : ''}`
+    .slice(0, MAX_ZERG_STATE_LISTENER_DIAGNOSTIC_LENGTH);
+  try {
+    globalThis.console?.error?.(diagnostic);
+  } catch {
+    // Diagnostics must never affect already-committed state updates.
+  }
+}
+
+function formatStateListenerFailure(error: unknown): string {
+  try {
+    const message = error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : String(error);
+    return message.slice(0, 120).replace(/\s+/g, ' ').trim();
+  } catch {
+    return 'unknown error';
+  }
 }
 
 export let sharedZergState = createZergState();
@@ -1687,20 +1726,96 @@ function cloneMetadata(metadata: Partial<ZergState['metadata']> = {}): ZergState
   };
 }
 
-function cloneExtensionFields(fields: ZergExtensionFields = {}): ZergExtensionFields {
-  return Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, cloneExtensionValue(value)]));
+interface CloneExtensionContext {
+  active: WeakSet<object>;
+  work: number;
 }
 
-function cloneExtensionValue(value: unknown): unknown {
+function cloneExtensionFields(fields: ZergExtensionFields = {}): ZergExtensionFields {
+  const context = createExtensionCloneContext();
+  context.active.add(fields);
+  try {
+    return cloneExtensionRecordEntries(fields, context, 0);
+  } finally {
+    context.active.delete(fields);
+  }
+}
+
+function createExtensionCloneContext(): CloneExtensionContext {
+  return { active: new WeakSet<object>(), work: 0 };
+}
+
+function cloneExtensionValue(value: unknown, context: CloneExtensionContext = createExtensionCloneContext(), depth = 0): unknown {
+  countExtensionCloneWork(context);
+
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  assertExtensionCloneDepth(depth);
+
+  if (context.active.has(value)) {
+    throw new TypeError('Invalid extension metadata: cycle detected');
+  }
+
   if (Array.isArray(value)) {
-    return value.map(cloneExtensionValue);
+    context.active.add(value);
+    try {
+      // Sparse slots also cost work and expand when persisted as JSON. Check
+      // length before allocation, then count holes as well as present values.
+      if (value.length > MAX_EXTENSION_CLONE_WORK - context.work) {
+        throw new TypeError('Invalid extension metadata: too large');
+      }
+      const output = new Array<unknown>(value.length);
+      for (let index = 0; index < value.length; index += 1) {
+        if (index in value) {
+          output[index] = cloneExtensionValue(value[index], context, depth + 1);
+        } else {
+          countExtensionCloneWork(context);
+        }
+      }
+      return output;
+    } finally {
+      context.active.delete(value);
+    }
   }
 
   if (isPlainRecord(value)) {
-    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, cloneExtensionValue(nested)]));
+    context.active.add(value);
+    try {
+      return cloneExtensionRecordEntries(value, context, depth);
+    } finally {
+      context.active.delete(value);
+    }
   }
 
   return value;
+}
+
+function cloneExtensionRecordEntries(record: Record<string, unknown>, context: CloneExtensionContext, depth: number): ZergExtensionFields {
+  const output: ZergExtensionFields = {};
+  for (const [key, nested] of Object.entries(record)) {
+    Object.defineProperty(output, key, {
+      value: cloneExtensionValue(nested, context, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return output;
+}
+
+function countExtensionCloneWork(context: CloneExtensionContext): void {
+  context.work += 1;
+  if (context.work > MAX_EXTENSION_CLONE_WORK) {
+    throw new TypeError('Invalid extension metadata: too large');
+  }
+}
+
+function assertExtensionCloneDepth(depth: number): void {
+  if (depth > MAX_EXTENSION_CLONE_DEPTH) {
+    throw new TypeError('Invalid extension metadata: too deep');
+  }
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

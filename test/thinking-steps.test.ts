@@ -306,6 +306,118 @@ test('snapshot and read helpers deep clone nested metadata and extensions', () =
   assert.deepEqual((rereadState.agents.root?.extensions?.config as { modes: string[] }).modes, ['extension-original']);
 });
 
+test('extension metadata rejects cycles and bounded traversal while preserving valid nested data', () => {
+  const baseMetadata = { createdAt: '1970-01-01T00:00:00.000Z', updatedAt: '1970-01-01T00:00:00.000Z', resetCount: 0 };
+  const shared = { nested: ['shared'] };
+  const protoRecord = Object.create(null) as Record<string, unknown>;
+  Object.defineProperty(protoRecord, '__proto__', {
+    value: { safe: true },
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+
+  const valid = createZergState({
+    metadata: {
+      ...baseMetadata,
+      extensions: {
+        left: shared,
+        right: shared,
+        protoRecord,
+        ordinary: { nested: [{ ok: true }] },
+      },
+    },
+  });
+  const extensions = valid.metadata.extensions as {
+    left: { nested: string[] };
+    right: { nested: string[] };
+    protoRecord: Record<string, unknown>;
+    ordinary: { nested: Array<{ ok: boolean }> };
+  };
+
+  assert.notEqual(extensions.left, shared);
+  assert.notEqual(extensions.right, shared);
+  assert.notEqual(extensions.left, extensions.right);
+  extensions.left.nested.push('mutated-left');
+  assert.deepEqual(extensions.right.nested, ['shared']);
+  shared.nested.push('mutated-input');
+  assert.deepEqual((valid.metadata.extensions?.right as { nested: string[] }).nested, ['shared']);
+  assert.equal(Object.prototype.hasOwnProperty.call(extensions.protoRecord, '__proto__'), true);
+  assert.deepEqual(extensions.protoRecord.__proto__, { safe: true });
+  assert.equal(({} as { polluted?: boolean }).polluted, undefined);
+  assert.doesNotThrow(() => JSON.stringify(valid.metadata.extensions));
+  assert.deepEqual(extensions.ordinary.nested, [{ ok: true }]);
+
+  const selfCycle: Record<string, unknown> = {};
+  selfCycle.self = selfCycle;
+  assert.throws(() => createZergState({ metadata: { ...baseMetadata, extensions: { selfCycle } } }), /Invalid extension metadata: cycle detected/);
+
+  const arrayCycle: unknown[] = [];
+  arrayCycle.push(arrayCycle);
+  assert.throws(() => createZergState({ extensions: { arrayCycle } }), /Invalid extension metadata: cycle detected/);
+
+  const mutualLeft: Record<string, unknown> = {};
+  const mutualRight = { mutualLeft };
+  mutualLeft.mutualRight = mutualRight;
+  assert.throws(() => createZergState({ metadata: { ...baseMetadata, extensions: { mutualLeft, mutualRight } } }), /Invalid extension metadata: cycle detected/);
+
+  let deep: Record<string, unknown> = { leaf: true };
+  for (let index = 0; index < 66; index += 1) {
+    deep = { nested: deep };
+  }
+  assert.throws(() => createZergState({ metadata: { ...baseMetadata, extensions: { deep } } }), /Invalid extension metadata: too deep/);
+
+  assert.throws(() => createZergState({ metadata: { ...baseMetadata, extensions: { many: Array.from({ length: 100_001 }, (_, index) => index) } } }), /Invalid extension metadata: too large/);
+  assert.throws(() => createZergState({ extensions: { sparse: new Array(100_000) } }), /Invalid extension metadata: too large/);
+  const boundary = createZergState({ extensions: { sparse: new Array(99_999) } });
+  const sparse = boundary.extensions.sparse as unknown[];
+  assert.equal(sparse.length, 99_999);
+  assert.equal(0 in sparse, false);
+  assert.doesNotThrow(() => createZergState({ extensions: { ordinary: Array.from({ length: 20_000 }, (_, index) => index) } }));
+  let repeated: unknown = { leaf: true };
+  for (let index = 0; index < 18; index += 1) repeated = { left: repeated, right: repeated };
+  assert.throws(() => createZergState({ extensions: { repeated } }), /Invalid extension metadata: too large/);
+});
+
+test('invalid extension metadata is rejected before replace update and helper commits', () => {
+  const baseMetadata = { createdAt: '1970-01-01T00:00:00.000Z', updatedAt: '1970-01-01T00:00:00.000Z', resetCount: 0 };
+  const container = createZergStateContainer({
+    agents: { root: { id: 'root', label: 'Root', kind: 'team-leader', status: 'running' } },
+  });
+  let notifications = 0;
+  container.subscribe?.(() => {
+    notifications += 1;
+  });
+  const before = container.snapshot();
+  const invalid: Record<string, unknown> = {};
+  invalid.self = invalid;
+
+  assert.throws(() => container.replace({ metadata: { ...baseMetadata, extensions: { invalid } } }), /Invalid extension metadata: cycle detected/);
+  assert.deepEqual(container.snapshot(), before);
+  assert.equal(notifications, 0);
+
+  assert.throws(() => container.update({ agents: { root: { id: 'root', label: 'Bad', kind: 'team-leader', status: 'done', metadata: { invalid } } } }), /Invalid extension metadata: cycle detected/);
+  assert.deepEqual(container.snapshot(), before);
+  assert.equal(notifications, 0);
+
+  assert.throws(() => upsertAgentDefinition(createZergState(), {
+    id: 'cyclic',
+    label: 'Cyclic',
+    prompt: 'cycle metadata',
+    source: 'user',
+    metadata: { invalid },
+  }), /Invalid extension metadata: cycle detected/);
+
+  // Log input already has a bounded, cycle-safe sanitizer; preserve its pruning.
+  const logged = appendZergLogRecord(createZergState(), {
+    source: 'command',
+    message: 'cycle log data',
+    data: { invalid, keep: true },
+  });
+  assert.deepEqual(getZergLogs(logged)[0]?.data, { invalid: {}, keep: true });
+  assert.doesNotThrow(() => JSON.stringify(logged));
+});
+
 test('agent definition helpers normalize ids, clone deep, dedupe tools, and reject invalid inputs', () => {
   const seeded = createZergState();
   const withPlanner = upsertAgentDefinition(seeded, {
@@ -423,6 +535,55 @@ test('state container subscriptions publish async-safe snapshots and unsubscribe
   assert.deepEqual(revisions, [1, 0]);
   assert.deepEqual(labels, ['Root', 'Replacement']);
   assert.equal(container.snapshot().agents.root?.label, 'After unsubscribe');
+});
+
+test('state container listener failures are isolated and diagnostically bounded', () => {
+  const container = createZergStateContainer();
+  const originalConsoleError = console.error;
+  const diagnostics: unknown[][] = [];
+  const deliveredLabels: string[] = [];
+  const deliveredRevisions: number[] = [];
+
+  try {
+    console.error = (...args: unknown[]) => {
+      diagnostics.push(args);
+    };
+
+    container.subscribe?.((state) => {
+      state.agents.root!.label = 'mutated by throwing listener';
+      throw new Error('first listener failed with a long diagnostic payload');
+    });
+    container.subscribe?.(() => {
+      throw new Error('second listener failed');
+    });
+    container.subscribe?.((state) => {
+      deliveredLabels.push(state.agents.root?.label ?? 'missing');
+      deliveredRevisions.push(state.revision);
+      state.agents.root!.label = 'mutated by successful listener';
+    });
+
+    const updated = container.update({
+      agents: { root: { id: 'root', label: 'Root', kind: 'team-leader', status: 'running' } },
+    });
+
+    assert.equal(updated.agents.root?.label, 'Root');
+    assert.equal(container.snapshot().agents.root?.label, 'Root');
+    assert.deepEqual(deliveredLabels, ['Root']);
+    assert.deepEqual(deliveredRevisions, [1]);
+    assert.equal(diagnostics.length, 1);
+    assert.match(String(diagnostics[0]?.[0]), /2 subscriber\(s\) failed/);
+    assert.ok(String(diagnostics[0]?.[0]).length <= 240);
+
+    console.error = () => {
+      throw new Error('diagnostic sink failed');
+    };
+    assert.doesNotThrow(() => container.update({
+      tasks: { task: { id: 'task', title: 'Committed despite listener failure', status: 'done', updatedAt: '2026-10-02T00:00:00.000Z' } },
+    }));
+    assert.equal(container.snapshot().tasks.task?.title, 'Committed despite listener failure');
+  } finally {
+    console.error = originalConsoleError;
+  }
 });
 
 test('installInternalPatch emits monotonic IDs through truncation', () => {

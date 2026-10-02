@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-10-02
+
+### Fixed
+
+- Isolated throwing state subscribers so later subscribers still receive independent snapshots and committed updates return successfully, with bounded diagnostics that cannot interrupt publication.
+- Rejected cyclic, excessively deep, or excessive-work extension metadata with clear errors before state updates commit, including sparse arrays and repeatedly shared object graphs.
+- Preserved independent cloning of valid shared metadata, safe own `__proto__` properties, and existing cycle-safe log-data pruning.
+
+### Added
+
+- Regression coverage for subscriber failure isolation, failing diagnostic sinks, metadata traversal bounds, and atomic rejection of invalid state updates.
+
 ## [1.1.4] - 2026-10-02
 
 ### Fixed
