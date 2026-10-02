@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const dir=mkdtempSync(join(tmpdir(),'zerg-phase1-host-'));
@@ -13,7 +13,11 @@ const server=createServer(async(req,res)=>{
  try{
  let body='';for await(const chunk of req)body+=chunk;
  const input=JSON.parse(body);requests.push(input);
- if(input.model==='error'){res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'offline unauthorized fixture',type:'authentication_error'}}));return;}
+ if(input.model==='error'){
+  res.writeHead(401,{'Content-Type':'application/json'});
+  res.end(JSON.stringify(input.messages).includes('multiline-error-fixture') ? 'first error line\nsecond error line' : JSON.stringify({error:{message:'offline unauthorized fixture',type:'authentication_error'}}));
+  return;
+ }
  res.writeHead(200,{'Content-Type':'text/event-stream'});
  const emit=(delta,finish_reason=null)=>res.write(`data: ${JSON.stringify({id:'phase1',object:'chat.completion.chunk',created:1,model:input.model,choices:[{index:0,delta,finish_reason}]})}\n\n`);
  emit({role:'assistant'});
@@ -32,6 +36,8 @@ const control=zerg.createZergControl();
 let registration;let registeredTool;
 async function agent(id,model,extra={}){const result=await control.execute({action:'agents.create',id,model:'fixture/'+model,prompt:'Only return a concise status. Never execute tools or change files.',tools:[],...extra});assert(result.ok,JSON.stringify(result));}
 async function run(id){const result=await control.execute({action:'run',agent:id,task:'Return concise status. No edits.',background:false});assert(result.runId,JSON.stringify(result));if(['error','length','manual'].includes(id))assert.equal(result.ok,false,JSON.stringify(result));return (await control.execute({action:'runs.show',runId:result.runId})).data.run;}
+
+function assertTeamRequestOrder(actual,workers,leader){assert.equal(actual.at(-1),leader,JSON.stringify(actual));assert.deepEqual(actual.slice(0,-1).sort(),[...workers].sort(),JSON.stringify(actual));}
 try{
  await agent('error','error');assert.equal((await run('error')).status,'failed');
  await agent('length','length');assert.equal((await run('length')).status,'failed');
@@ -58,6 +64,45 @@ try{
  assert.equal(message.data.message.routedTargetId,'slow-b');assert(['queued','handled','accepted'].includes(message.data.message.status),JSON.stringify(message));
  for(const release of gates.values())release();
  await until(async()=>['done','failed','cancelled'].includes((await control.execute({action:'runs.show',runId:bg.runId})).data.run.status),'team completion');
+ const mixedTeam=await control.execute({action:'team.create',id:'mixed-team',leader:'lead',members:['error','a']});assert(mixedTeam.ok,JSON.stringify(mixedTeam));
+ start=requests.length;const mixedForeground=await control.execute({action:'run',agent:'mixed-team',task:'Worker error must fail aggregate.',background:false});assert.equal(mixedForeground.ok,false,JSON.stringify(mixedForeground));assert.equal(mixedForeground.error.code,'run_failed');
+ const mixedRun=(await control.execute({action:'runs.show',runId:mixedForeground.runId})).data.run;assert.equal(mixedRun.status,'failed');assert.equal(mixedRun.metadata.finalSummary,`handoff:${mixedRun.metadata.coordDir}/team-lead-final.md`,JSON.stringify(mixedRun.metadata));assert.equal(readFileSync(join(mixedRun.metadata.coordPath,'team-lead-final.md'),'utf8').includes('done lead'),true);assert.deepEqual(mixedRun.metadata.failedMemberSummaries.map(member=>member.agentId),['error']);assert(mixedRun.memberProgress.some(member=>member.agentId==='error'&&member.status==='failed'),JSON.stringify(mixedRun.memberProgress));assertTeamRequestOrder(requests.slice(start).map(r=>r.model),['error','a'],'lead');
+ start=requests.length;const mixedBackground=await control.execute({action:'run',agent:'mixed-team',task:'Background worker error must fail eventually.',background:true});assert(mixedBackground.ok,JSON.stringify(mixedBackground));
+ await until(async()=>(await control.execute({action:'runs.show',runId:mixedBackground.runId})).data.run.status==='failed','mixed background aggregate failure');assertTeamRequestOrder(requests.slice(start).map(r=>r.model),['error','a'],'lead');
+ await agent('setup-reject','ok',{permissionMode:'manual'});assert((await control.execute({action:'team.create',id:'setup-reject-team',leader:'lead',members:['setup-reject']})).ok);
+ start=requests.length;const setupRejected=await control.execute({action:'run',agent:'setup-reject-team',task:'Setup rejection must fail aggregate.',background:false});assert.equal(setupRejected.ok,false,JSON.stringify(setupRejected));
+ const setupRejectedRun=(await control.execute({action:'runs.show',runId:setupRejected.runId})).data.run;assert.equal(setupRejectedRun.status,'failed');assert(setupRejectedRun.memberProgress.some(member=>member.agentId==='setup-reject'&&member.status==='failed'),JSON.stringify(setupRejectedRun.memberProgress));assert.deepEqual(requests.slice(start).map(r=>r.model),['lead']);
+ assert((await control.execute({action:'team.create',id:'leader-fail-team',leader:'error',members:['a']})).ok);start=requests.length;const leaderFailed=await control.execute({action:'run',agent:'leader-fail-team',task:'Leader failure must fail aggregate.',background:false});assert.equal(leaderFailed.ok,false,JSON.stringify(leaderFailed));assert.equal(leaderFailed.error.code,'run_failed');const leaderFailedRun=(await control.execute({action:'runs.show',runId:leaderFailed.runId})).data.run;assert.equal(leaderFailedRun.status,'failed');assert(leaderFailedRun.metadata.finalSummary.includes('offline unauthorized fixture'),JSON.stringify(leaderFailedRun.metadata));assert.equal(leaderFailedRun.memberProgress.find(member=>member.agentId==='a')?.status,'done',JSON.stringify(leaderFailedRun.memberProgress));assertTeamRequestOrder(requests.slice(start).map(r=>r.model),['a'],'error');
+ assert.equal(control.getState().tasks[mixedForeground.taskId].status,'failed');
+ assert.equal(control.getState().tasks[mixedBackground.taskId].status,'failed');
+ assert.equal(control.getState().tasks[setupRejected.taskId].status,'failed');
+ assert.equal(readFileSync(join(mixedRun.metadata.coordPath,'a.md'),'utf8').trim(),'done a');
+ const detailedFailure=await control.execute({action:'run',agent:'error',task:'multiline-error-fixture',background:false});
+ const detailedFailureRun=(await control.execute({action:'runs.show',runId:detailedFailure.runId})).data.run;
+ assert.equal(detailedFailure.ok,false);assert.equal(detailedFailureRun.errorSummary,'401 first error line\nsecond error line');
+ await agent('error-peer','error');
+ assert((await control.execute({action:'team.create',id:'both-fail-team',leader:'error',members:['error-peer','a']})).ok);
+ const bothFailed=await control.execute({action:'run',agent:'both-fail-team',task:'Preserve worker and leader errors.',background:false});
+ const bothFailedRun=(await control.execute({action:'runs.show',runId:bothFailed.runId})).data.run;
+ assert.equal(bothFailed.ok,false);assert.equal(bothFailedRun.status,'failed');
+ assert.match(bothFailedRun.errorSummary,/offline unauthorized fixture/);assert.match(bothFailedRun.errorSummary,/error-peer/);
+ assert.deepEqual(bothFailedRun.metadata.failedMemberSummaries.map(member=>member.agentId),['error-peer']);
+ assert.equal(readFileSync(join(bothFailedRun.metadata.coordPath,'a.md'),'utf8').trim(),'done a');
+ seen.delete('slowA');
+ assert((await control.execute({action:'team.create',id:'mixed-cancel-team',leader:'lead',members:['error','slow-a']})).ok);
+ start=requests.length;
+ const mixedCancel=await control.execute({action:'run',agent:'mixed-cancel-team',task:'Cancel after a worker failed.',background:true});assert(mixedCancel.ok);
+ await until(async()=>gates.has('slowA')&&(await control.execute({action:'runs.show',runId:mixedCancel.runId})).data.run.memberProgress.some(member=>member.agentId==='error'&&member.status==='failed'),'failed worker alongside active sibling');
+ const failedBeforeCancel=(await control.execute({action:'runs.show',runId:mixedCancel.runId})).data.run.memberProgress.find(member=>member.agentId==='error');
+ assert((await control.execute({action:'interrupt',runId:mixedCancel.runId})).ok);
+ await until(async()=>(await control.execute({action:'runs.show',runId:mixedCancel.runId})).data.run.status==='cancelled','parent cancellation wins over member failure');
+ const cancelledTeam=(await control.execute({action:'runs.show',runId:mixedCancel.runId})).data.run;
+ assert.equal(control.getState().tasks[mixedCancel.taskId].status,'cancelled');assert.equal(cancelledTeam.errorSummary,undefined);
+ assert(cancelledTeam.memberProgress.every(member=>['failed','cancelled'].includes(member.status)),JSON.stringify(cancelledTeam.memberProgress));
+ assert.equal(cancelledTeam.memberProgress.find(member=>member.agentId==='error').completedAt,failedBeforeCancel.completedAt);
+ assert.deepEqual(requests.slice(start).map(request=>request.model).sort(),['error','slowA']);
+ console.log('PASS team cancellation precedence, complete error diagnostics, task outcomes, and preserved sibling handoffs');
+ console.log('PASS actual native team outcome: required worker failures, setup rejections, and leader failures are terminal failures with truthful progress');
  const targeted=requests.filter(r=>JSON.stringify(r.messages).includes(marker));assert(targeted.some(r=>r.model==='slowB'));assert(!targeted.some(r=>r.model==='slowA'));
  console.log('PASS actual native streaming message: queued/handled acknowledgement, correct member only');
  await agent('slow-cancel','slowCancel');const cancel=await control.execute({action:'run',agent:'slow-cancel',task:'Wait.',background:true});
@@ -72,6 +117,12 @@ try{
  const listeners=new Map();const events={on(name,fn){const set=listeners.get(name)??new Set();set.add(fn);listeners.set(name,set);return()=>set.delete(fn);},emit(name,data){for(const fn of listeners.get(name)??[])fn(data);}};
  registration=zerg.registerZergSwarmExtension({events,registerCommand(){},registerTool(tool){registeredTool=tool;}});
  assert((await registration.control.execute({action:'agents.create',id:'bridge',prompt:'No tools.',tools:[],model:'fixture/ok'})).ok);
+ assert((await registration.control.execute({action:'agents.create',id:'bridge-error',prompt:'No tools.',tools:[],model:'fixture/error'})).ok);assert((await registration.control.execute({action:'agents.create',id:'bridge-ok',prompt:'No tools.',tools:[],model:'fixture/ok'})).ok);assert((await registration.control.execute({action:'team.create',id:'bridge-team',leader:'bridge',members:['bridge-error','bridge-ok']})).ok);
+ start=requests.length;const bridgeAggregate=await registration.control.execute({action:'run',agent:'bridge-team',task:'Bridge native aggregate failure.',background:true});assert(bridgeAggregate.ok,JSON.stringify(bridgeAggregate));
+ await until(async()=>(await registration.control.execute({action:'runs.show',runId:bridgeAggregate.runId})).data.run.status==='failed','bridge native aggregate failure');let bridgeAggregateRun=(await registration.control.execute({action:'runs.show',runId:bridgeAggregate.runId})).data.run;assert.equal(bridgeAggregateRun.metadata.finalSummary,`handoff:${bridgeAggregateRun.metadata.coordDir}/team-lead-final.md`,JSON.stringify(bridgeAggregateRun.metadata));assert.equal(readFileSync(join(bridgeAggregateRun.metadata.coordPath,'team-lead-final.md'),'utf8').includes('done ok'),true);assert.deepEqual(bridgeAggregateRun.metadata.failedMemberSummaries.map(member=>member.agentId),['bridge-error']);assertTeamRequestOrder(requests.slice(start).map(r=>r.model),['error','ok'],'ok');
+ start=requests.length;const bridgeToolAggregate=await registeredTool.execute('aggregate-smoke',{action:'run',agent:'bridge-team',task:'Bridge foreground tool aggregate failure.',background:false});assert.equal(bridgeToolAggregate.details.ok,false,JSON.stringify(bridgeToolAggregate));assert.equal(bridgeToolAggregate.isError,true);assert.equal(bridgeToolAggregate.details.error.code,'run_failed');
+ bridgeAggregateRun=(await registration.control.execute({action:'runs.show',runId:bridgeToolAggregate.details.runId})).data.run;assert.equal(bridgeAggregateRun.status,'failed');assertTeamRequestOrder(requests.slice(start).map(r=>r.model),['error','ok'],'ok');
+ console.log('PASS bridge-native aggregate outcome failures propagate through background control and foreground tool calls');
  start=requests.length;const pending=await registration.control.execute({action:'run',agent:'bridge',task:'Do not start after cancellation.',background:true});assert(pending.ok);
  assert((await registration.control.execute({action:'interrupt',runId:pending.runId})).ok);await sleep(500);assert.equal(requests.length,start);
  assert.equal((await registration.control.execute({action:'runs.show',runId:pending.runId})).data.run.status,'cancelled');

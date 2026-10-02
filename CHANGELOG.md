@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-10-02
+
+### Fixed
+
+- Failed native team runs and tasks when a required worker fails or is independently cancelled, rather than allowing a successful leader to mask the outcome; preserved overall cancellation precedence.
+- Propagated aggregate failures through foreground control/tool errors and eventual background run status, including bridge-native execution.
+- Preserved leader and successful-worker handoffs, complete leader error details, and structured member failure diagnostics; terminalized worker progress after setup rejection without overwriting existing completion timestamps.
+
+### Added
+
+- Expanded localhost-only Pi SDK regression coverage for mixed worker outcomes, setup and leader failures, task status, cancellation after worker failure, and preserved handoffs.
+
 ## [1.1.5] - 2026-10-02
 
 ### Fixed

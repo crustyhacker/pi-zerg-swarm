@@ -3530,6 +3530,7 @@ async function runPiNativeZergRequest(
   const cwd = resolvePiNativeCwd(context);
   const coordDir = `coord/zerg-${runId.replace(/^zerg-/, '')}`;
   const coordPath = resolvePath(cwd, coordDir);
+  let failedMemberSummaries: Array<{ agentId: string; status: 'failed' | 'cancelled'; message?: string }> = [];
 
   try {
     if (missingMemberIds.length > 0) {
@@ -3569,6 +3570,26 @@ async function runPiNativeZergRequest(
       const summaries = settledSummaries.map((summary, index) => summary.status === 'fulfilled'
         ? summary.value
         : { agentId: runnableMemberDefinitions[index]?.id ?? `member-${index}`, status: 'failed' as const, message: summary.reason instanceof Error ? summary.reason.message : String(summary.reason) });
+      settledSummaries.forEach((summary, index) => {
+        if (summary.status !== 'rejected') return;
+        const definition = runnableMemberDefinitions[index];
+        const agentId = definition?.id ?? `member-${index}`;
+        updateMemberProgress({
+          task: '',
+          runId: `${runId}-${agentId}`,
+          taskId,
+          parentRunId: runId,
+          request,
+          options,
+          container,
+          activeRun,
+          handoffPath: `${coordDir}/${agentId}.md`,
+          teamStartedAt: startedAt,
+        }, agentId, 'failed', { completedAt: timestamp(), handoffPath: `${coordDir}/${agentId}.md`, message: summary.reason instanceof Error ? summary.reason.message : String(summary.reason) });
+      });
+      failedMemberSummaries = summaries
+        .filter((summary): summary is { agentId: string; status: 'failed' | 'cancelled'; message?: string } => summary.status === 'failed' || summary.status === 'cancelled')
+        .map((summary) => ({ agentId: summary.agentId, status: summary.status, ...(summary.message ? { message: summary.message } : {}) }));
       workerSummaries = summaries.map((summary) => `- ${summary.agentId}: ${summary.status}${summary.message ? ` (${summary.message})` : ''}`).join('\n');
     }
 
@@ -3588,37 +3609,51 @@ async function runPiNativeZergRequest(
       handoffPath: runnableMemberDefinitions.length > 0 ? `${coordDir}/team-lead-final.md` : undefined,
     });
 
-    if (leaderResult.status === 'failed') {
-      throw new Error(leaderResult.message ?? 'pi native leader failed');
-    }
-
     const doneAt = timestamp();
     const wasCancelled = activeRun?.cancelRequested === true || leaderResult.status === 'cancelled';
-    const finalSummary = wasCancelled ? 'pi native run cancelled' : (leaderResult.message ?? 'pi native run complete');
-    const finalActivity = finalSummary.split(/\r?\n/, 1)[0]?.trim() || (wasCancelled ? 'pi native run cancelled' : 'pi native run complete');
+    const leaderFailed = leaderResult.status === 'failed';
+    const hasRequiredMemberFailure = !wasCancelled && failedMemberSummaries.length > 0;
+    const memberFailureSummary = failedMemberSummaries.map((summary) => `${summary.agentId}: ${summary.status}${summary.message ? ` (${summary.message})` : ''}`).join('; ');
+    const failedRun = !wasCancelled && (leaderFailed || hasRequiredMemberFailure);
+    const finalSummary = wasCancelled
+      ? 'pi native run cancelled'
+      : leaderResult.message ?? (leaderFailed ? 'pi native leader failed' : 'pi native run complete');
+    const finalActivity = hasRequiredMemberFailure
+      ? `required team member failure: ${memberFailureSummary}`
+      : finalSummary.split(/\r?\n/, 1)[0]?.trim() || (wasCancelled ? 'pi native run cancelled' : 'pi native run complete');
+    const errorSummary = leaderFailed && !wasCancelled
+      ? hasRequiredMemberFailure ? `${finalSummary}; ${finalActivity}` : finalSummary
+      : failedRun ? finalActivity : undefined;
     const stopped = applyRuntimeTransition(container.read(), {
       entity: 'agent',
-      action: wasCancelled ? 'fail' : 'stop',
+      action: (wasCancelled || failedRun) ? 'fail' : 'stop',
       id: runId,
       label: leaderDefinition?.label ?? request.agent,
       kind: 'subagent',
-      status: wasCancelled ? 'cancelled' : 'done',
+      status: wasCancelled ? 'cancelled' : failedRun ? 'failed' : 'done',
       activity: finalActivity,
-      substate: wasCancelled ? 'cancelled' : 'completed',
+      substate: wasCancelled ? 'cancelled' : failedRun ? 'failed' : 'completed',
       substateReason: wasCancelled ? 'pi native run cancelled' : finalActivity,
-      metadata: { completedAt: doneAt, finalSummary, originalTask: request.task, ...(ledTeam ? { teamId: ledTeam.id } : {}) },
+      metadata: {
+        completedAt: doneAt,
+        finalSummary,
+        originalTask: request.task,
+        ...(errorSummary ? { errorSummary } : {}),
+        ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}),
+        ...(ledTeam ? { teamId: ledTeam.id } : {}),
+      },
     }, { now: () => new Date(doneAt) });
-    container.replace(updateRunTaskLifecycle(stopped, taskId, wasCancelled ? 'cancelled' : 'done', wasCancelled ? 'cancelled' : 'completed', wasCancelled ? 'pi native run cancelled' : finalActivity, doneAt));
+    container.replace(updateRunTaskLifecycle(stopped, taskId, wasCancelled ? 'cancelled' : failedRun ? 'failed' : 'done', wasCancelled ? 'cancelled' : failedRun ? 'failed' : 'completed', wasCancelled ? 'pi native run cancelled' : finalActivity, doneAt));
     appendLogToContainer(container, options, {
       source: 'adapter',
-      level: 'info',
-      kind: 'result',
-      message: wasCancelled ? 'pi native run cancelled' : 'pi native run complete',
+      level: failedRun ? 'error' : 'info',
+      kind: failedRun ? 'error' : 'result',
+      message: wasCancelled ? 'pi native run cancelled' : failedRun ? finalActivity : 'pi native run complete',
       runId,
       agentId: request.agent,
       teamId: ledTeam?.id,
       taskId,
-      data: { finalSummary },
+      data: { finalSummary, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}) },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -3633,7 +3668,7 @@ async function runPiNativeZergRequest(
       status: activeRun?.cancelRequested ? 'cancelled' : 'failed',
       substate: activeRun?.cancelRequested ? 'cancelled' : 'failed',
       substateReason: activeRun?.cancelRequested ? 'pi native run cancelled' : message,
-      metadata: { completedAt: failedAt, errorSummary: activeRun?.cancelRequested ? undefined : message, originalTask: request.task, ...(ledTeam ? { teamId: ledTeam.id } : {}) },
+      metadata: { completedAt: failedAt, errorSummary: activeRun?.cancelRequested ? undefined : message, originalTask: request.task, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}), ...(ledTeam ? { teamId: ledTeam.id } : {}) },
     }, { now: () => new Date(failedAt) });
     container.replace(updateRunTaskLifecycle(failed, taskId, activeRun?.cancelRequested ? 'cancelled' : 'failed', activeRun?.cancelRequested ? 'cancelled' : 'failed', activeRun?.cancelRequested ? 'pi native run cancelled' : message, failedAt));
     appendLogToContainer(container, options, {

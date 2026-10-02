@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.5 release status**
-> Isolates state subscriber failures and rejects cyclic or excessively deep/large extension metadata before updates commit. The release retains Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
+> **v1.1.6 release status**
+> Reports native team failures when required workers fail, even if the leader succeeds, while preserving handoffs and cancellation behavior. The release retains Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.5** (state subscriber isolation and bounded metadata validation).
+- Current release: **v1.1.6** (truthful native team outcomes and preserved failure diagnostics).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -157,8 +157,9 @@ npm run check:version
 - v1.1.2: patch release capturing final assistant handoffs from native single-agent zerg runs
 - v1.1.3: patch release updating native execution and extension integration for Pi 1.0.0
 - v1.1.4: patch release hardening native outcomes, cancellation, tool policy, explicit teams, and targeted messaging
-- v1.1.5: patch release isolating state subscribers and bounding extension metadata traversal (current release)
-- post-v1.1.5: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.5: patch release isolating state subscribers and bounding extension metadata traversal
+- v1.1.6: patch release propagating required worker failures to native team outcomes while preserving handoffs and cancellation (current release)
+- post-v1.1.6: deeper delivered-process transport validation and richer multi-window operator console polish
 
 ## License
 
@@ -167,6 +168,7 @@ MIT © 2026 Marc Mironescu (@crustyhacker) <marcm@crustyhacker.dev>
 ## Native execution and control
 
 - Use explicit team ids when launching teams; a bare shared leader runs as a single leader, not the first matching team.
+- All selected team members are required: a worker failure or independent cancellation fails the overall run/task even if the leader succeeds. Parent or leader cancellation still yields a cancelled run; successful handoffs remain available.
 - `tools: []` means no tools. `disallowedTools`/denylist entries remove tools from an allowlist; this is not a sandbox boundary.
 - Native permission modes `manual` and `assisted` are not supported for Pi SDK runner launches; use inherited/default automatic behavior or reject before model execution.
 - Operator messages require a live run/member route. Native delivery reports Pi `steer`/`followUp` acknowledgement as `queued` or `handled`; UI-local drafts may still use `queued-local` and are not delivery proof.

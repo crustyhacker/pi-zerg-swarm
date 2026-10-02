@@ -25,7 +25,7 @@ test('runtime extension version matches package metadata', () => {
   assert.equal(packageJson.version, ZERG_EXTENSION_VERSION);
 });
 
-test('native control host smoke fixture covers phase1 lifecycle hardening', { timeout: 90_000 }, async () => {
+test('native control host smoke fixture covers phase1 lifecycle and team outcome hardening', { timeout: 90_000 }, async () => {
   const fixture = new URL('./fixtures/native-control-smoke.mjs', import.meta.url);
   const child = spawn(process.execPath, ['--import', 'tsx', fixture.pathname], {
     cwd: new URL('..', import.meta.url).pathname,
@@ -47,6 +47,9 @@ stdout:
 ${stdout}
 stderr:
 ${stderr}`);
+  assert.match(stdout, /PASS actual native team outcome: required worker failures, setup rejections, and leader failures are terminal failures with truthful progress/);
+  assert.match(stdout, /PASS bridge-native aggregate outcome failures propagate through background control and foreground tool calls/);
+  assert.match(stdout, /PASS team cancellation precedence, complete error diagnostics, task outcomes, and preserved sibling handoffs/);
   assert.match(stdout, /PASS all phase1 host checks/);
 });
 
