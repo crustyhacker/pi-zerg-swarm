@@ -69,6 +69,7 @@ export function renderDetailPane(state: ZergState, uiState: ZergManagementUiStat
     }
   }
 
+  lines.push(styleText(theme, 'dim', 'view: v opens read-only coding session chooser'));
   lines.push(styleText(theme, 'dim', 'action: i interrupts selected active run/agent'));
   return renderPane(lines.map((line) => fitLine(line, width - 4)), { title: 'Details', focused: uiState.focusedPane === 'detail', width, height, theme });
 }

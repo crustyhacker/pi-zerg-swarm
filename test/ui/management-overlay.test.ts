@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { createZergState, createZergStateContainer } from '../../state.js';
 import type { StructuralPiCommandContext, ZergManagementTargetKind } from '../../types.js';
-import { openZergManagementOverlay, type ZergManagementOverlayActions } from '../../ui/management-overlay.js';
+import { openZergManagementOverlay, ZergManagementOverlayComponent, type ZergManagementOverlayActions } from '../../ui/management-overlay.js';
 
 test('M9 management overlay uses ctx.ui.custom component path and disposes subscription exactly once', () => {
   const container = createZergStateContainer();
@@ -180,4 +180,121 @@ test('M9 management overlay routes focus and chat keys through focused pane', ()
   assert.ok(rendered.includes('intervention-recorded'));
   assert.ok(rendered.includes('remote rapid quorum'));
   assert.ok((component?.render(110) ?? []).length <= 32);
+});
+
+function codingManagementFixture(viewCoding?: (target: { id: string; kind: ZergManagementTargetKind } | undefined) => Promise<void>, onRender?: () => void) {
+  const container = createZergStateContainer({ agents: { worker: { id: 'worker', label: 'Worker', kind: 'subagent', status: 'running' } } });
+  let mutations = 0;
+  let renders = 0;
+  const actions: ZergManagementOverlayActions = {
+    now: () => new Date('2026-10-02T00:00:00Z'),
+    toggleReadOnly: () => { mutations += 1; return 'toggle'; },
+    setAutomation: () => { mutations += 1; return 'mode'; },
+    setController: () => { mutations += 1; return 'controller'; },
+    approvePermission: () => { mutations += 1; return 'approve'; },
+    denyPermission: () => { mutations += 1; return 'deny'; },
+    selectTarget: () => 'selected', interruptSelected: () => { mutations += 1; return 'interrupt'; },
+    sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: 'unavailable' }),
+  };
+  const component = new ZergManagementOverlayComponent({ requestRender: () => { renders += 1; onRender?.(); } }, undefined, undefined, {
+    getSnapshot: () => container.snapshot(), subscribe: () => () => undefined, adapterKind: 'fake', actions, viewCoding,
+  });
+  component.render(110, 30);
+  return { component, get mutations() { return mutations; }, get renders() { return renders; } };
+}
+const codingTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('coding view is separate from mutations, guards nested opens and preserves exact selected target', async () => {
+  const targets: Array<{ id: string; kind: ZergManagementTargetKind } | undefined> = [];
+  let finish: () => void = () => undefined;
+  const f = codingManagementFixture((target) => { targets.push(target); return new Promise<void>((resolve) => { finish = resolve; }); });
+  f.component.handleInput('v');
+  f.component.handleInput('v');
+  await codingTick();
+  assert.deepEqual(targets, [{ id: 'worker', kind: 'agent' }]);
+  assert.equal(f.mutations, 0);
+  finish();
+  await codingTick();
+  assert.match(f.component.getStateForTests().statusMessage ?? '', /viewer closed/);
+  f.component.handleInput('v');
+  await codingTick();
+  assert.equal(targets.length, 2);
+  finish();
+  await codingTick();
+  f.component.dispose();
+});
+
+test('coding key only applies to tree/detail, remains chat text and leaves settings usable', async () => {
+  let calls = 0;
+  const f = codingManagementFixture(async () => { calls += 1; });
+  f.component.handleInput('tab'); // settings
+  f.component.handleInput('v');
+  await codingTick();
+  assert.equal(calls, 0);
+  f.component.handleInput('tab'); // chat
+  f.component.handleInput('v');
+  assert.equal(f.component.getStateForTests().chatDraft, 'v');
+  f.component.handleInput('tab'); // detail
+  f.component.handleInput('v');
+  await codingTick();
+  assert.equal(calls, 1);
+  f.component.handleInput('r');
+  assert.equal(f.mutations, 1);
+  assert.equal(f.component.getStateForTests().chatDraft, 'v');
+  f.component.dispose();
+});
+
+test('coding callback synchronous/async failures are contained and retryable', async () => {
+  for (const synchronous of [true, false]) {
+    let calls = 0;
+    const f = codingManagementFixture(() => { calls += 1; if (synchronous) throw new Error('host failure'); return Promise.reject(new Error('host failure')); });
+    f.component.handleInput('v');
+    await codingTick();
+    assert.match(f.component.getStateForTests().statusMessage ?? '', /coding viewer unavailable: Error: host failure/);
+    f.component.handleInput('v');
+    await codingTick();
+    assert.equal(calls, 2);
+    f.component.handleInput('r');
+    assert.equal(f.mutations, 1);
+    f.component.dispose();
+  }
+  const absent = codingManagementFixture();
+  absent.component.handleInput('v');
+  assert.match(absent.component.getStateForTests().statusMessage ?? '', /coding viewer unavailable/);
+  absent.component.dispose();
+});
+
+test('disposing management during nested viewer ignores late completion/failure', async () => {
+  for (const reject of [true, false]) {
+    let finish: (error?: Error) => void = () => undefined;
+    const f = codingManagementFixture(() => new Promise<void>((resolve, rejectPromise) => { finish = (error) => error ? rejectPromise(error) : resolve(); }));
+    f.component.handleInput('v');
+    await codingTick();
+    f.component.dispose();
+    const before = f.renders;
+    const status = f.component.getStateForTests().statusMessage;
+    finish(reject ? new Error('late failure') : undefined);
+    await codingTick();
+    assert.equal(f.renders, before);
+    assert.equal(f.component.getStateForTests().statusMessage, status);
+  }
+  let calls = 0;
+  const immediate = codingManagementFixture(async () => { calls += 1; });
+  immediate.component.handleInput('v');
+  immediate.component.dispose();
+  await codingTick();
+  assert.equal(calls, 0);
+});
+
+test('nested coding management survives injected redraw throws without unhandled rejection', async () => {
+  let calls = 0;
+  const f = codingManagementFixture(async () => { calls += 1; }, () => { throw new Error('redraw failed'); });
+  assert.doesNotThrow(() => f.component.handleInput('v'));
+  await codingTick();
+  assert.equal(calls, 1);
+  assert.match(f.component.getStateForTests().statusMessage ?? '', /management redraw unavailable/);
+  assert.doesNotThrow(() => f.component.handleInput('v'));
+  await codingTick();
+  assert.equal(calls, 2);
+  f.component.dispose();
 });

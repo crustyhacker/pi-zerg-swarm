@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.9 release status**
-> Adds exact native Pi session references and immutable transcript provenance for each run/member, exposed through existing run inspection with truthful attachment and restart states. This is the session-identity foundation, not yet long-lived agents, a transcript viewer, or resume controls. The release preserves fail-closed unsupported-capability validation, bounded worker concurrency, truthful team outcomes, handoffs, Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, opt-in durable run/log snapshots, management overlays, and MCP tool exposure.
+> **v1.1.10 release status**
+> Adds a read-only coding overlay for exact native agent sessions: live responses/tool activity, saved raw history, and local branch inspection. Closing the viewer never stops a run. This is not yet long-lived agents, a conversation composer, or resume controls. Existing bounded concurrency, truthful outcomes, fail-closed native capability checks, structured control, and opt-in restart snapshots are preserved.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.9** (native Pi session identity, provenance, and safe reference recovery).
+- Current release: **v1.1.10** (read-only native coding overlay and safe history inspection).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -29,7 +29,7 @@ Pi supplies its SDK and TUI libraries to installed extensions. They are declared
 At v1.1.0 these commands display help, status, expanded tree visibility, deterministic thinking-step parser output, Claude Code-style runtime agent-definition configuration, native Pi SDK-backed run execution, task-first subagent spawn state, explicit fresh/fork launch-mode metadata, command-host permission queue state, fine-grained lifecycle substate hints, bounded structured log/output inspection, restart-durable run/log recovery snapshots, process-lifetime background run status/interrupt/message support, and a componentized Pi-native interactive management TUI for live tree/detail/settings/chat/footer management views through snapshot-safe shared-state-backed Pi command handlers.
 Command-host control grammar is available via `/zerg mode status|manual|assisted|automatic|revert [reason]`, `/zerg intervene agent|subagent|leader ...`, `/zerg agents list|show|create|update|delete` with per-agent `--model`, `--fallback-models`, `--max-turns`, tools, and permission settings, `/zerg agent`/`/zerg team` lifecycle configuration flags for team leaders/members/model metadata, `/zerg runs list|show <run-id>`, `/zerg permission status|list|request|approve|deny|cancel`, `/zerg logs status|list|show|json`, `/zerg config`, and `/zerg run <agent-or-team> <task> [--bg] [--fresh|--fork] [--model <model>]`; `/zerg run` does not require `pi-subagents` and uses the native Pi SDK runner when no slash bridge responds.
 
-`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
+`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane to open the separate read-only coding viewer. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
 
 ## Direct automation API
 
@@ -56,7 +56,17 @@ Before extension binding or prompting, each native Pi manager receives a namespa
 
 Sessions still dispose after each task. `disposed` means confirmed SDK cleanup, not lost history; a throwing cleanup leaves the reference `unavailable` without claiming disposal. With opt-in Zerg snapshot persistence enabled, the ledger survives restart; restored `attached` references become `unavailable`, even for terminal parent runs, without inventing disposal. `unavailable` does not mean reconnected. With persistence disabled, Pi's marker/history survives independently **once Pi actually writes its file**, but Zerg does not rediscover the mapping on restart.
 
-This first foundation slice does not keep conversational agents alive, open/read/scan referenced files, automatically resume or replay prompts/messages, implement native fork/turn budgets/fallbacks, or provide a transcript viewer. Inspection and hydration never create or repair a missing/corrupt referenced transcript. Future viewing/resume controls must separately validate trusted locations and matching Pi headers.
+Session runtimes still end after their tasks. Reference inspection and hydration do not read, create, repair, or scan transcript files. Explicit viewing is separate and validates the known location, Pi header, immutable provenance, and entry graph; it never resumes execution or changes the active branch.
+
+## Read-only agent coding overlay
+
+- `/zerg sessions [parent-run-id]` opens an **exact-session chooser** in an interactive Pi TUI. No leader or operator conversation is selected implicitly. `/zerg sessions list [parent-run-id]` prints bounded references and also works without a terminal UI; command aliases are preserved.
+- Select a row and press **Enter** to inspect live text, available thinking text, and tool arguments/results. **Home** exposes full parent/member/Pi IDs. **Up/Down**, **PageUp/PageDown**, and **Home** pause tail following; **End** follows the live default leaf again. **s** returns to sessions, **b** chooses a raw branch locally, and **q/Esc** closes.
+- `live` means an observer is connected to this owner's native runtime. An already-open viewer becomes `captured` when observation ends: its bounded final display remains, without claiming a durable file or reconnection. Reopening reads `saved` history when validation succeeds; `unavailable` explains missing, unsupported, unsafe, or disconnected state. A saved history from an unconfirmed attachment is explicitly history-only, not a live or confirmed-closed session.
+- This is **raw branch history, not effective model context**. Compaction/context-edit records are notices, not reconstructed model context. Saved history defaults to the last recorded entry, which is not proof of the active leaf. Branch selection never navigates or mutates the native session.
+- Pi JSONL is the sole transcript store. Reads are limited to known, regular, non-symlink v3 files under the configured Pi agent session directory, with matching header and provenance. Missing/corrupt/partial/oversized files are not repaired or opened through `SessionManager.open`; no directories are created or transcripts scanned. Moving a file or changing the agent directory can make its reference unavailable.
+- Views are bounded: saved inputs allow up to 8 MiB, 256 KiB per line, and 10,000 entries; normalized display retains up to 200 blocks with aggregate and per-field limits. Live tool previews can be shorter than finalized results. UI line/text limits and omission notices are explicit. Images, opaque payloads, and thinking signatures are omitted; terminal controls are stripped.
+- Closing/switching a viewer unsubscribes only that viewer. Runs, native persistence, concurrency slots, cancellation, and task-final SDK disposal retain their existing ownership. There is no composer, transcript tool action, automatic prompt/replay/resume, active-branch mutation, or retained completed SDK session.
 
 ## Architecture
 
@@ -114,6 +124,8 @@ The TypeScript modules are intentionally small:
 - `parse.ts` — pure thinking-step derivation
 - `render.ts` — width-aware text rendering
 - `persistence.ts` — restart-durable run/log snapshot save, load, and recovery helpers
+- `native-transcript.ts` — owner-scoped read-only live observers and validated native history loading
+- `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, and local branch inspection
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
 
@@ -170,8 +182,10 @@ npm run check:version
 - v1.1.5: patch release isolating state subscribers and bounding extension metadata traversal
 - v1.1.6: patch release propagating required worker failures to native team outcomes while preserving handoffs and cancellation
 - v1.1.7: patch release bounding native team worker concurrency with configurable FIFO admission and cancellation-safe queuing
-- v1.1.8: patch release rejecting unsupported native fork, turn limits, and fallback models before session startup (current release)
-- post-v1.1.8: deeper delivered-process transport validation and richer multi-window operator console polish
+- v1.1.8: patch release rejecting unsupported native fork, turn limits, and fallback models before session startup
+- v1.1.9: patch release mapping exact native session identities and immutable transcript provenance
+- v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection (current release)
+- Next: reliable two-way workspace messaging/composer, a team communication timeline, and explicit branch/resume/recovery controls
 
 ## License
 

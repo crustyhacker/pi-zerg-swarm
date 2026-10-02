@@ -4612,3 +4612,75 @@ test('native session actual SDK fixture validates provenance, lifecycle and iner
   assert.equal(code, 0, `native session smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
   assert.match(stdout, /PASS all native session reference checks/);
 });
+
+test('native transcript SDK fixture preserves readonly live observer and saved history safety', { timeout: 90_000 }, async () => {
+  const fixture = new URL('./fixtures/native-transcript-smoke.mjs', import.meta.url);
+  const child = spawn(process.execPath, ['--import', 'tsx', fixture.pathname], {
+    cwd: new URL('..', import.meta.url).pathname, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '', stderr = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
+  assert.equal(exitCode, 0, `native transcript SDK fixture failed\n${stdout}\n${stderr}`);
+  assert.match(stdout, /PASS all transcript SDK checks/);
+  assert.match(stdout, /PASS extension bridge-native fallback shares owner-scoped live observer service/);
+});
+
+test('sessions aliases/list/noninteractive fallback filter exact parent references without mutations', async () => {
+  const reference: ZergNativeSessionReference = { schemaVersion: 1, parentRunId: 'zerg-session-test', memberRunId: 'zerg-session-test-member',
+    agentDefinitionId: 'same-definition', piSessionId: 'pi-test', sessionFile: '/missing/pi-test.jsonl', cwd: '/fixture', createdAt: '2026-10-02T00:00:00.000Z', attachment: 'unavailable' };
+  const container = createZergStateContainer({ agents: { 'zerg-session-test': { id: 'zerg-session-test', label: 'test', kind: 'subagent', status: 'done', metadata: { nativeSessions: [reference] } } } });
+  const handler = createZergCommandHandler(container);
+  for (const alias of ['/zerg', '/zerg-swarm', '/swarm']) {
+    const result = handler(`${alias} sessions list zerg-session-test`); assert(result.ok); assert.match(result.output, /pi-test/); assert.match(result.output, /zerg-session-test-member/);
+  }
+  assert.match(handler('sessions list missing').output, /No native session references/);
+  assert.equal(handler('sessions list one two').ok, false);
+  assert.match(handler('help').output, /Sessions syntax/);
+  const revision = container.read().revision; let customCalls = 0; const notices: string[] = [];
+  const piHandler = createPiZergCommandHandler(container);
+  for (const mode of ['rpc', 'json', 'print'] as const) await piHandler('sessions zerg-session-test', { hasUI: true, mode,
+    ui: { custom() { customCalls++; }, notify(message) { notices.push(message); } } });
+  assert.equal(customCalls, 0); assert(notices.every((message) => message.includes('requires an available terminal TUI')));
+  await piHandler('sessions list', { mode: 'tui', ui: { custom() { customCalls++; }, notify(message) { notices.push(message); } } });
+  assert.equal(customCalls, 0); assert.equal(container.read().revision, revision);
+});
+
+test('management coding chooser includes references admitted after opening', async () => {
+  const reference: ZergNativeSessionReference = { schemaVersion: 1, parentRunId: 'zerg-late-team', memberRunId: 'zerg-late-team-first', agentDefinitionId: 'first-member', piSessionId: 'pi-first', sessionFile: '/missing.jsonl', cwd: '/fixture', createdAt: '2026-10-02T00:00:00.000Z', attachment: 'unavailable' };
+  const container = createZergStateContainer({ agents: { 'zerg-late-team': { id: 'zerg-late-team', label: 'team run', kind: 'subagent', status: 'running', metadata: { nativeSessions: [reference] } } } });
+  let management: import('../types.js').StructuralPiCustomComponent | undefined;
+  let viewer: import('../types.js').StructuralPiCustomComponent | undefined;
+  let finishManagement: (() => void) | undefined, finishViewer: (() => void) | undefined;
+  let snapshotReads = 0;
+  const handler = createPiZergCommandHandler({ ...container, snapshot() { snapshotReads++; return container.snapshot(); } });
+  const pending = handler('config', { mode: 'tui', hasUI: true, ui: { custom(factory) {
+    assert.equal(typeof factory, 'function');
+    const component = (factory as import('../types.js').StructuralPiCustomFactory)({ terminal: { rows: 30 }, requestRender() {} });
+    assert(component && !('then' in component));
+    if (!management) { management = component as import('../types.js').StructuralPiCustomComponent; return new Promise<void>((done) => { finishManagement = done; }); }
+    viewer = component as import('../types.js').StructuralPiCustomComponent; return new Promise<void>((done) => { finishViewer = done; });
+  } } });
+  for (let i = 0; i < 10 && !management; i++) await new Promise((done) => setImmediate(done));
+  assert(management); management.render(120); management.handleInput?.('v');
+  for (let i = 0; i < 10 && !viewer; i++) await new Promise((done) => setImmediate(done));
+  assert(viewer); assert.match(viewer.render(200).join('\n'), /first-member/);
+  const beforeRefresh = snapshotReads;
+  const queued = { ...reference, memberRunId: 'zerg-late-team-queued', piSessionId: 'pi-queued', agentDefinitionId: 'queued-member' };
+  const later = Array.from({ length: 64 }, (_, i) => ({ ...reference, memberRunId: `zerg-late-team-${i}`, piSessionId: `pi-later-${i}` }));
+  container.update({ agents: { 'zerg-late-team': { ...container.read().agents['zerg-late-team'], metadata: { nativeSessions: [reference, queued, ...later] } } } });
+  assert.match(viewer.render(200).join('\n'), /queued-member/);
+  assert.ok(snapshotReads - beforeRefresh < 12, 'refresh must not clone whole state once per reference');
+  viewer.dispose?.(); finishViewer?.(); management.dispose?.(); finishManagement?.(); await pending;
+});
+
+test('observer shutdown faults cannot block extension adapter cleanup', async () => {
+  const { createNativeTranscriptService } = await import('../native-transcript.js');
+  const service = createNativeTranscriptService({ getReferences: () => [] });
+  let adapterDisposed = 0;
+  const adapter: ZergSubagentControlAdapter = { kind: 'fake', launch() { return { ok: false, message: 'unused' }; }, dispose() { adapterDisposed++; } };
+  const registration = registerZergSwarmExtension({ registerCommand() {}, registerTool() {} }, { subagentAdapter: adapter,
+    nativeTranscriptService: { ...service, shutdown() { throw Error('observer shutdown failure'); } } });
+  assert.doesNotThrow(() => registration.dispose()); assert.equal(adapterDisposed, 1); service.shutdown();
+});

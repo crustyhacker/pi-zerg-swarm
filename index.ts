@@ -6,8 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { deriveThinkingSteps } from './parse.js';
+import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
+import { openZergAgentOverlay } from './ui/agent-overlay.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
-import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
+import { renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
 import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
 import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference } from './types.js';
 
@@ -21,6 +23,8 @@ export interface ZergCommandHandlerOptions {
   subagentAdapter?: ZergSubagentControlAdapter;
   idFactory?: ZergIdFactory;
   persistence?: ZergPersistenceOptions;
+  /** Explicit owner-scoped observer sharing; closing a viewer never disposes a runner. */
+  nativeTranscriptService?: NativeTranscriptService;
 }
 
 type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager };
@@ -40,7 +44,7 @@ export interface ZergExtensionRegistration {
   dispose(): void;
 }
 
-type ZergCommandTopic = 'help' | 'status' | 'tree' | 'steps' | 'agent' | 'team' | 'mode' | 'intervene' | 'monitor' | 'control' | 'config' | 'run' | 'interrupt' | 'agents' | 'runs' | 'permission' | 'logs';
+type ZergCommandTopic = 'help' | 'status' | 'tree' | 'steps' | 'agent' | 'team' | 'mode' | 'intervene' | 'monitor' | 'control' | 'config' | 'run' | 'interrupt' | 'agents' | 'runs' | 'permission' | 'logs' | 'sessions';
 type ZergCommandDispatcher = (payload: string) => ZergCommandResult;
 type RuntimeParseResult = { ok: false; output: string } | { ok: true; transition: ZergRuntimeTransition };
 type LogsParseResult = { ok: false; output: string } | { ok: true; filter: ZergLogFilter; json: boolean };
@@ -175,10 +179,11 @@ export function registerZergSwarmExtension(
     },
     subscribe: (listener) => stateContainer.subscribe?.(listener) ?? (() => undefined),
   };
-  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager } as RuntimeCommandOptions;
+  const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(syncedStateContainer) });
+  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   if (typeof context.on === 'function') {
-    const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { subagentAdapter.dispose?.(); }));
+    const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
     if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
   }
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
@@ -186,7 +191,7 @@ export function registerZergSwarmExtension(
   try {
     const installedPatch = installInternalPatch(context, syncedStateContainer);
     patch = installedPatch;
-    const handler = createPiZergCommandHandler(syncedStateContainer, { ...options, subagentAdapter, syncSharedState: true } as RuntimeCommandOptions);
+    const handler = createPiZergCommandHandler(syncedStateContainer, { ...runtimeOptions, subagentAdapter } as RuntimeCommandOptions);
 
     for (const name of ZERG_COMMANDS) {
       const commandDisposer = registerCommand(context, {
@@ -228,6 +233,7 @@ export function registerZergSwarmExtension(
         // Preserve startup failure.
       }
     }
+    shutdownNativeTranscript(nativeTranscriptService);
     throw error;
   }
 
@@ -247,6 +253,7 @@ export function registerZergSwarmExtension(
       }
 
       disposed = true;
+      shutdownNativeTranscript(nativeTranscriptService);
       let firstError: unknown;
 
       for (const commandDisposer of commandDisposers.splice(0)) {
@@ -354,7 +361,8 @@ export function createZergControl(
       subscribe: (listener) => baseContainer.subscribe?.(listener) ?? (() => undefined),
     }
     : baseContainer;
-  const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
+  const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(container) });
+  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService } as RuntimeCommandOptions;
   const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
   runtimeOptions.subagentAdapter = adapter;
 
@@ -366,6 +374,7 @@ export function createZergControl(
       return container.snapshot();
     },
     dispose() {
+      if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService);
       if (!options.subagentAdapter) {
         adapter.dispose?.();
       }
@@ -685,6 +694,7 @@ export function createZergCommandHandler(
     config: () => ({ ok: true, output: renderZergConfigOverlay(resolveZergStateSnapshot(stateOrReader), { width: PI_COMMAND_OUTPUT_WIDTH, activeTab: 'config', selectedIndex: 0 }) }),
     run: (payload: string) => dispatchRunCommand(stateOrReader, payload, options),
     runs: (payload: string) => dispatchRunsCommand(stateOrReader, payload, options),
+    sessions: (payload: string) => dispatchSessionsCommand(stateOrReader, payload),
     interrupt: (payload: string) => dispatchInterruptCommand(stateOrReader, payload, options),
   };
 
@@ -744,7 +754,7 @@ function isZergInvocationToken(value: string): value is ZergCommandName {
 }
 
 function isZergCommandTopic(value: string): value is ZergCommandTopic {
-  return value === 'help' || value === 'status' || value === 'tree' || value === 'steps' || value === 'agents' || value === 'agent' || value === 'team' || value === 'mode' || value === 'intervene' || value === 'monitor' || value === 'control' || value === 'permission' || value === 'logs' || value === 'config' || value === 'run' || value === 'runs' || value === 'interrupt';
+  return value === 'help' || value === 'status' || value === 'tree' || value === 'steps' || value === 'agents' || value === 'agent' || value === 'team' || value === 'mode' || value === 'intervene' || value === 'monitor' || value === 'control' || value === 'permission' || value === 'logs' || value === 'config' || value === 'run' || value === 'runs' || value === 'interrupt' || value === 'sessions';
 }
 
 function dispatchAgentDefinitionsCommand(
@@ -3376,6 +3386,7 @@ function createPiSlashBridgeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      shutdownNativeTranscript(options.nativeTranscriptService);
       for (const [runId] of fallbackLaunches) {
         settleFallbackLaunch(runId);
         markRunTerminal(runId, 'cancelled', 'adapter disposed before native start');
@@ -3527,6 +3538,7 @@ function createPiNativeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      shutdownNativeTranscript(runtimeOptions.nativeTranscriptService);
       for (const runId of activeRuns.keys()) {
         const now = (runtimeOptions.now ?? (() => new Date()))().toISOString();
         requestPiNativeAbort(runId, activeRuns);
@@ -3803,6 +3815,7 @@ async function runSinglePiNativeAgent(
   const sessionHandle = session as PiNativeSessionHandle;
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
   let reference: ZergNativeSessionReference | undefined;
+  let releaseTranscript: (() => void) | undefined;
   let unsubscribe: (() => void) | undefined;
   let capturedResponse: string | undefined;
   let assistantOutcome: PiNativeAssistantOutcome | undefined;
@@ -3851,6 +3864,15 @@ async function runSinglePiNativeAgent(
         });
       }
     });
+
+    // Observation is optional and cannot alter task outcomes or cleanup ownership.
+    try {
+      releaseTranscript = run.options.nativeTranscriptService?.register(reference, {
+        subscribe: (listener) => session.subscribe(listener), getMessages: () => session.messages,
+        getEntryCount: () => sessionManager.getEntryCount(), getEntries: () => sessionManager.getEntries(),
+        getLeafId: () => sessionManager.getLeafId(),
+      });
+    } catch { /* A failed observer never prevents execution. */ }
 
     await session.bindExtensions({ mode: 'print', abortHandler: () => { if (run.activeRun) run.activeRun.cancelRequested = true; } });
     appendLogToContainer(run.container, run.options, {
@@ -3933,6 +3955,7 @@ async function runSinglePiNativeAgent(
     updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
     return { agentId: definition.id, status, message };
   } finally {
+    try { releaseTranscript?.(); } catch { /* Observer cleanup never owns SDK disposal. */ }
     try {
       try {
         unregisterPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
@@ -4956,6 +4979,12 @@ export function createPiZergCommandHandler(
 ): ZergPiCommandHandler {
   const scaffoldHandler = createZergCommandHandler(stateOrReader, options);
   const runtimeOptions = options as RuntimeCommandOptions;
+  const transcript = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(stateOrReader) });
+  const viewCoding = (context: StructuralPiCommandContext, select?: (refs: ZergNativeSessionReference[]) => ZergNativeSessionReference[]) => openZergAgentOverlay(context, {
+    getReferences: () => { const refs = transcript.list(); return select ? select(refs) : refs; },
+    subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
+    open: (key, openOptions) => transcript.open(key, openOptions),
+  });
 
   return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
     const normalized = normalizeZergCommandInput(input);
@@ -4963,6 +4992,15 @@ export function createPiZergCommandHandler(
     const output = typeof result === 'string' ? result : result.output;
 
     const canUseTerminalUI = context.hasUI !== false && (context.mode === undefined || context.mode === 'tui');
+    if (normalized.topic === 'sessions') {
+      const parsed = parseSessionsPayload(normalized.payload);
+      if (parsed && !parsed.list && canUseTerminalUI && context.ui?.custom) {
+        try { await viewCoding(context, parsed.parentRunId ? (refs) => refs.filter((ref) => ref.parentRunId === parsed.parentRunId) : undefined); return; }
+        catch { /* Explicit text fallback; no claimed live reconnection. */ }
+      }
+      context.ui?.notify?.(`${output}${parsed && !parsed.list ? '\nCoding viewer requires an available terminal TUI.' : ''}`, result.ok ? 'info' : 'error');
+      return;
+    }
     if ((normalized.topic === 'monitor' || normalized.topic === 'config') && canUseTerminalUI && context.ui?.custom) {
       if (normalized.topic === 'config') {
         try {
@@ -4971,6 +5009,27 @@ export function createPiZergCommandHandler(
             subscribe: (listener) => subscribeToZergState(stateOrReader, listener),
             adapterKind: runtimeOptions.subagentAdapter?.kind ?? 'unavailable',
             actions: createManagementOverlayActions(stateOrReader, runtimeOptions),
+            viewCoding: (target) => viewCoding(context, (refs) => {
+              if (!target) return refs;
+              // Refresh semantic selection once per list, never clone the whole
+              // state once per reference. Queued members remain discoverable.
+              if (target.kind === 'agent' && target.id.startsWith(DEFAULT_RUN_ID_PREFIX)) {
+                return refs.filter((ref) => ref.memberRunId === target.id || ref.parentRunId === target.id);
+              }
+              const snapshot = resolveZergStateSnapshot(stateOrReader);
+              const runs = getSubagentRunSnapshots(snapshot).filter((run) => target.kind === 'team'
+                ? run.metadata?.teamId === target.id : target.kind === 'task' && run.taskId === target.id);
+              if (runs.length) {
+                const ids = new Set(runs.map((run) => run.runId));
+                return refs.filter((ref) => ids.has(ref.parentRunId));
+              }
+              if (target.kind === 'agent') {
+                const definitions = refs.filter((ref) => ref.agentDefinitionId === target.id);
+                if (new Set(definitions.map((ref) => ref.parentRunId)).size <= 1) return definitions;
+              }
+              // Ambiguous definitions/unknown targets explicitly use all-session chooser.
+              return refs;
+            }),
           });
           return;
         } catch {
@@ -5387,3 +5446,25 @@ export const __zergNativeTestInternals = {
 };
 
 export default registerZergSwarmExtension;
+
+function nativeReferences(state: ZergStateSource): ZergNativeSessionReference[] {
+  return getSubagentRunSnapshots(resolveZergStateSnapshot(state)).flatMap((run) => run.nativeSessions ?? []);
+}
+
+function parseSessionsPayload(payload: string): { list: boolean; parentRunId?: string } | undefined {
+  const tokens = payload.trim().split(/\s+/).filter(Boolean);
+  const list = tokens[0] === 'list';
+  if (list) tokens.shift();
+  if (tokens.length > 1 || tokens[0]?.startsWith('-')) return undefined;
+  return { list, parentRunId: tokens[0] };
+}
+
+function dispatchSessionsCommand(state: ZergStateSource, payload: string): ZergCommandResult {
+  const parsed = parseSessionsPayload(payload);
+  if (!parsed) return { ok: false, output: 'Usage: /zerg sessions [list] [parent-run-id]' };
+  return { ok: true, output: renderNativeSessionReferences(nativeReferences(state).filter((ref) => !parsed.parentRunId || ref.parentRunId === parsed.parentRunId), { width: PI_COMMAND_OUTPUT_WIDTH }) };
+}
+
+function shutdownNativeTranscript(service: NativeTranscriptService | undefined): void {
+  try { service?.shutdown(); } catch { /* An observer cannot prevent runner cancellation/disposal. */ }
+}

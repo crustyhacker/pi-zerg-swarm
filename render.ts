@@ -1,4 +1,4 @@
-import { ZERG_COMMAND_INVOCATIONS, ZERG_EXTENSION_VERSION, type AgentIdentity, type HookLifecycleEvent, type TaskRecord, type TeamIdentity, type ZergAgentDefinition, type ZergConfigOverlayTab, type ZergLogRecord, type ZergLogState, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergState, type ZergSubagentRunSnapshot, type ZergTreeNode } from './types.js';
+import { ZERG_COMMAND_INVOCATIONS, ZERG_EXTENSION_VERSION, type AgentIdentity, type HookLifecycleEvent, type TaskRecord, type TeamIdentity, type ZergNativeSessionReference, type ZergAgentDefinition, type ZergConfigOverlayTab, type ZergLogRecord, type ZergLogState, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergState, type ZergSubagentRunSnapshot, type ZergTreeNode } from './types.js';
 
 export interface RenderOptions {
   width?: number;
@@ -539,6 +539,7 @@ export function renderHelp(state: ZergState, options: RenderOptions = {}): strin
     'Registry syntax: /zerg agents [list] | show <id> | create|update <id> --prompt <text> [--model <model>] [--tools a,b] | delete <id>',
     'Config syntax: /zerg config opens the Pi overlay configuration window when available',
     'Run syntax: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--concurrency <n>] (fresh is default isolated launch; native team workers default to concurrency 8; native execution rejects unsupported fork/maxTurns/fallbackModels before SDK startup; use a supported external adapter/acknowledged bridge for those capabilities) | /zerg runs [list] | /zerg runs show <run-id> | /zerg interrupt [run-id]',
+    'Sessions syntax: /zerg sessions [parent-run-id] opens read-only coding history | /zerg sessions list [parent-run-id] prints exact references (no execution/resume/branch mutation)',
     'Monitor syntax: /zerg monitor [readonly on|off|toggle|status]',
     'Intervention syntax: /zerg intervene agent <agent-id> <message> | /zerg intervene subagent <agent-id> <message> | /zerg intervene leader <team-id> <message>',
     'Available now: slash-free Pi command registration, aliases, lifecycle state updates, mode/intervention/monitor/control/config commands, runtime health/activity summaries, scaffold status/tree output, thinking-step parsing, text rendering, and Pi event-bus observation.',
@@ -1078,4 +1079,14 @@ function byLabel<T extends { label: string }>(left: T, right: T): number {
 
 function byTitle(left: TaskRecord, right: TaskRecord): number {
   return safeLabel(left.title, '').localeCompare(safeLabel(right.title, ''));
+}
+
+export function renderNativeSessionReferences(references: ZergNativeSessionReference[], options: RenderOptions = {}): string {
+  const lines = ['Native Pi sessions (attachment is not proof of a live observer or durable file):'];
+  for (const ref of references.slice(0, 40)) {
+    lines.push(`${ref.agentDefinitionId} | parent:${ref.parentRunId} | member:${ref.memberRunId} | pi:${ref.piSessionId} | ${ref.attachment}`);
+  }
+  if (!references.length) lines.push('No native session references available.');
+  if (references.length > 40) lines.push(`${references.length - 40} additional references omitted.`);
+  return lines.map((line) => fit(sanitizeRuntimeActivity(line), options.width ?? DEFAULT_WIDTH)).join('\n');
 }

@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.10] - 2026-10-02
+
+### Added
+
+- Read-only native coding overlay via `/zerg sessions [parent-run-id]` and management tree/detail **v**, with exact parent/member/Pi-session selection, streamed text/thinking/tool cards, paused scrolling, and local raw-branch inspection. `/zerg sessions list` provides a bounded noninteractive fallback.
+- Owner-scoped live transcript observers and validated read-only native JSONL loading. Existing viewers preserve bounded detached captures; new views can inspect saved history without reconnecting, replaying prompts, changing the active leaf, or retaining completed SDK runtimes.
+- Bounded extraction, omission notices, terminal-control sanitization, observer fault isolation, exact header/provenance/graph checks, and regular-file/symlink/race protections. Raw history is explicitly distinguished from effective model context.
+- Focused UI/history/lifecycle regressions, a localhost-only public SDK transcript fixture, and an isolated actual Pi PTY smoke fixture for regular/fullscreen rendering, resize, closing without abort, and byte-identical saved-history inspection.
+
+### Fixed
+
+- Preserved final displayed output on observer detachment; reconciled finalized native entries after event dispatch, retired tool cards, and kept persisted results authoritative over transient events.
+- Kept newly admitted team sessions discoverable in open choosers, isolated redraw/shutdown failures, and prevented aborted loads from exhausting viewer handles.
+- Reserved display space for truncation notices so bounded tail content and full session identity remain visible; transient tool clipping is explicitly marked.
+
 ## [1.1.9] - 2026-10-02
 
 ### Added

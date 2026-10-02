@@ -18,6 +18,7 @@ export interface ZergManagementOverlayOptions {
   subscribe(listener: () => void): () => void;
   adapterKind: string;
   actions: ZergManagementOverlayActions;
+  viewCoding?(target: { id: string; kind: ZergManagementTargetKind } | undefined): Promise<void>;
 }
 
 export async function openZergManagementOverlay(context: StructuralPiCommandContext, options: ZergManagementOverlayOptions): Promise<void> {
@@ -42,6 +43,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   private readonly treeState = createTreePaneState();
   private readonly settingsState = createSettingsPaneState();
   private readonly chatInput = new Input();
+  private codingViewerOpen = false;
   private disposed = false;
   private unsubscribe: () => void;
   private cachedWidth?: number;
@@ -124,6 +126,10 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
       this.requestRender();
       return;
     }
+    if ((data === 'v' || data === 'V') && (this.uiState.focusedPane === 'tree' || this.uiState.focusedPane === 'detail')) {
+      this.openCodingViewer();
+      return;
+    }
 
     if (this.handleGlobalAction(data)) {
       this.requestRender();
@@ -175,7 +181,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   private requestRender(): void {
     if (this.disposed) return;
     this.invalidate();
-    this.tui?.requestRender?.();
+    try { this.tui?.requestRender?.(); } catch { this.uiState.statusMessage = 'management redraw unavailable'; }
   }
 
   private renderHeader(snapshot: ZergState, width: number): string[] {
@@ -226,6 +232,30 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     return !matchesKey(data, 'tab', 'shift-tab');
   }
 
+  private openCodingViewer(): void {
+    if (this.codingViewerOpen) return;
+    if (!this.options.viewCoding) {
+      this.uiState.statusMessage = 'coding viewer unavailable';
+      this.requestRender();
+      return;
+    }
+    this.ensureDefaultTarget(this.options.getSnapshot());
+    const target = resolveSelectedTarget(this.options.getSnapshot(), this.uiState);
+    this.codingViewerOpen = true;
+    this.uiState.statusMessage = 'opening read-only coding viewer';
+    this.requestRender();
+    // Promise boundary catches synchronous throws as well as async host failures.
+    void Promise.resolve().then(() => {
+      if (!this.disposed) return this.options.viewCoding?.(target);
+    }).then(() => {
+      if (!this.disposed) this.uiState.statusMessage = 'coding viewer closed';
+    }, (error: unknown) => {
+      if (!this.disposed) this.uiState.statusMessage = `coding viewer unavailable: ${String(error)}`;
+    }).finally(() => {
+      this.codingViewerOpen = false;
+      this.requestRender();
+    });
+  }
   private handleGlobalAction(data: string): boolean {
     if (data === 'r' || data === 'R') {
       this.uiState.statusMessage = this.options.actions.toggleReadOnly();
