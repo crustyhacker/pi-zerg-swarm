@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.7] - 2026-10-02
+
+### Added
+
+- Configurable per-run native team worker concurrency through `/zerg run --concurrency <n>` (or `--concurrency=<n>`) and structured `zerg_control` run `concurrency`, accepting positive safe integers and defaulting to 8.
+- FIFO worker admission covering asynchronous session setup and execution, with the resolved limit recorded in run metadata; this is not a global, provider-wide, or external-adapter limit.
+- Localhost-only Pi SDK regression coverage for default/custom limits, startup bounds, failure drainage, queued cancellation, disposal, foreground abort, shutdown, and native bridge fallback.
+
+### Changed
+
+- Workers release their slots on failure or setup rejection so remaining queued workers continue; the leader runs after worker settlement, preserving required-worker failure aggregation and handoffs.
+- Cancellation prevents queued workers and the leader from starting; skipped workers receive cancelled progress without misleading start timestamps. Admitted workers remain marked as starting through extension startup.
+
 ## [1.1.6] - 2026-10-02
 
 ### Fixed

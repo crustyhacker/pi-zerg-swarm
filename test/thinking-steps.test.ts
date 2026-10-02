@@ -53,6 +53,79 @@ ${stderr}`);
   assert.match(stdout, /PASS all phase1 host checks/);
 });
 
+test('native concurrency smoke fixture covers bounded workers and cancellation', { timeout: 90_000 }, async () => {
+  const fixture = new URL('./fixtures/native-concurrency-smoke.mjs', import.meta.url);
+  const child = spawn(process.execPath, ['--import', 'tsx', fixture.pathname], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', resolve);
+  });
+  assert.equal(exitCode, 0, `native concurrency smoke failed
+stdout:
+${stdout}
+stderr:
+${stderr}`);
+  assert.match(stdout, /PASS default native team worker concurrency is 8, FIFO, and leader follows workers/);
+  assert.match(stdout, /PASS worker failure releases slot and remaining queued workers continue/);
+  assert.match(stdout, /PASS cancellation prevents queued launches and skips leader/);
+  assert.match(stdout, /PASS SDK startup bounds and interrupt\/dispose\/foreground-abort\/shutdown queue cancellation/);
+  assert.match(stdout, /PASS all native concurrency smoke checks/);
+});
+
+test('run concurrency validation applies to command and structured control before launch', async () => {
+  const launches: ZergSubagentLaunchRequest[] = [];
+  const adapter: ZergSubagentControlAdapter = {
+    kind: 'pi-native',
+    launch(request) {
+      launches.push(request);
+      return { ok: true, runId: request.runId ?? 'run', taskId: request.taskId, message: 'accepted' };
+    },
+  };
+  const container = createZergStateContainer();
+  const handler = createZergCommandHandler(container, { subagentAdapter: adapter, idFactory: { runId: () => `run-${launches.length}`, taskId: () => `task-${launches.length}` } });
+  for (const flag of ['--concurrency', '--concurrency=', '--concurrency --bg', '--concurrency 0', '--concurrency -1', '--concurrency 1.5', '--concurrency NaN', '--concurrency Infinity', '--concurrency 9007199254740992', '--concurrency=abc']) {
+    const before = container.snapshot();
+    const count = launches.length;
+    assert.equal(handler(`/zerg run generalist do work ${flag}`).ok, false, flag);
+    assert.equal(launches.length, count);
+    assert.deepEqual(container.snapshot(), before);
+  }
+  assert.equal(handler('/zerg run generalist do work --max-turns 1e2 --concurrency=2').ok, true);
+  assert.equal(launches.at(-1)?.concurrency, 2);
+  assert.equal(launches.at(-1)?.maxTurns, 100);
+  assert.equal(handler('/zerg run generalist do work --concurrency 1').ok, true);
+  assert.equal(launches.at(-1)?.concurrency, 1);
+  assert.equal(handler('/zerg run generalist do work').ok, true);
+  assert.equal(launches.at(-1)?.concurrency, 8);
+
+  const control = createZergControl(undefined, { subagentAdapter: adapter, idFactory: { runId: () => `control-${launches.length}`, taskId: () => `control-task-${launches.length}` } });
+  try {
+    for (const concurrency of ['2', null, false, {}, [], 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      const before = control.getState();
+      const count = launches.length;
+      const result = await control.execute({ action: 'run', agent: 'generalist', task: 'bad', concurrency: concurrency as never });
+      assert.equal(result.ok, false, String(concurrency));
+      assert.equal(launches.length, count);
+      assert.deepEqual(control.getState(), before);
+    }
+    for (const concurrency of [undefined, 1, 3, Number.MAX_SAFE_INTEGER]) {
+      const result = await control.execute({ action: 'run', agent: 'generalist', task: 'ok', concurrency });
+      assert.equal(result.ok, true);
+      assert.equal(launches.at(-1)?.concurrency, concurrency ?? 8);
+      assert.equal(control.getState().agents[result.runId!]?.metadata?.concurrency, concurrency ?? 8);
+    }
+  } finally { control.dispose(); }
+});
 
 const VALID_AGENT_RUNTIME_TRANSITION = {
   entity: 'agent',
@@ -1293,7 +1366,7 @@ test('read-only run queues permission without launching adapter', () => {
   const request = getPermissionQueueState(container.snapshot()).requests[0];
   assert.equal(request?.kind, 'run');
   assert.equal(request?.summary, 'Run worker: blocked task');
-  assert.deepEqual(request?.metadata, { agent: 'worker', task: 'blocked task', launchMode: 'fork', background: false, model: undefined, fallbackModels: undefined, maxTurns: undefined });
+  assert.deepEqual(request?.metadata, { agent: 'worker', task: 'blocked task', launchMode: 'fork', background: false, concurrency: 8, model: undefined, fallbackModels: undefined, maxTurns: undefined });
 });
 
 
@@ -1928,6 +2001,7 @@ test('createZergCommandHandler launches subagents through configured adapter and
     runId: 'zerg-run-1',
     taskId: 'task-1',
     agentDefinitionId: undefined,
+    concurrency: 8,
     description: 'fix bug',
   });
   assert.equal(launches[0].agentDefinitionId, undefined);
@@ -2248,6 +2322,7 @@ test('dispatch run resolves agent definition IDs and passes normalized identity 
     fork: false,
     launchMode: 'fresh',
     agentDefinitionId: 'bug-fixer',
+    concurrency: 8,
     description: 'inspect issue',
   });
 

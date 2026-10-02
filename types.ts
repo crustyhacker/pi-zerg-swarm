@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.6' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.7' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -135,6 +135,8 @@ export interface ZergSubagentLaunchRequest {
   resolvedTeamId?: string;
   /** Immutable team member definition ids validated before launch. */
   memberAgentIds?: string[];
+  /** Maximum concurrent native team workers for this run. Defaults to 8. */
+  concurrency?: number;
   description?: string;
   /** LLM/model identifier requested for this launch. */
   model?: string;
@@ -258,7 +260,7 @@ export type ZergControlAction =
   | { action: 'agents.create' | 'agents.update'; id: string; label?: string; description?: string; prompt?: string; model?: string; fallbackModels?: string[]; maxTurns?: number; tools?: string[]; disallowedTools?: string[]; permissionMode?: AutomationMode | 'inherit' }
   | { action: 'agents.delete'; id: string }
   | { action: 'team.create' | 'team.update'; id: string; label?: string; leader?: string; members?: string[]; kind?: TeamKind; model?: string; fallbackModels?: string[]; maxTurns?: number }
-  | { action: 'run'; agent: string; task: string; background?: boolean; launchMode?: ZergSubagentLaunchMode; model?: string; fallbackModels?: string[]; maxTurns?: number }
+  | { action: 'run'; agent: string; task: string; background?: boolean; launchMode?: ZergSubagentLaunchMode; concurrency?: number; model?: string; fallbackModels?: string[]; maxTurns?: number }
   | { action: 'runs.list' }
   | { action: 'runs.show'; runId: string }
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }

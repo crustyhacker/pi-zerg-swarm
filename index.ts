@@ -75,6 +75,7 @@ const SLASH_SUBAGENT_UPDATE_EVENT = 'subagent:slash:update';
 const SLASH_SUBAGENT_CANCEL_EVENT = 'subagent:slash:cancel';
 const DEFAULT_RUN_ID_PREFIX = 'zerg-';
 const DEFAULT_TASK_ID_PREFIX = 'task-';
+const DEFAULT_NATIVE_WORKER_CONCURRENCY = 8;
 const NATIVE_BRIDGE_ACK_GRACE_MS = 100;
 const OVERLAY_VISIBLE_ROWS = 14;
 const DEFAULT_OVERLAY_INTERVENTION_DRAFT = 'operator intervention requested from overlay';
@@ -473,6 +474,8 @@ async function executeZergControlAction(
       }
       case 'run': {
         if (!action.agent || !action.task) return controlError(action.action, 'invalid_request', 'run requires agent and task.', container.snapshot().revision);
+        const parsedConcurrency = action.concurrency === undefined ? undefined : parsePositiveSafeIntegerOption(action.concurrency, 'concurrency');
+        if (parsedConcurrency && !parsedConcurrency.ok) return controlError(action.action, 'invalid_request', parsedConcurrency.output, container.snapshot().revision, { agentId: action.agent });
         if (!action.background && signal?.aborted) return controlError(action.action, 'run_cancelled', 'run cancelled before launch.', container.snapshot().revision, { agentId: action.agent });
         const result = dispatchRunRequest(container, {
           agent: action.agent,
@@ -480,6 +483,7 @@ async function executeZergControlAction(
           background: action.background,
           fork: action.launchMode === 'fork',
           launchMode: action.launchMode,
+          ...(parsedConcurrency?.ok ? { concurrency: parsedConcurrency.value } : {}),
           ...(action.model ? { model: action.model } : {}),
           ...(action.fallbackModels?.length ? { fallbackModels: action.fallbackModels } : {}),
           ...(action.maxTurns ? { maxTurns: action.maxTurns } : {}),
@@ -507,7 +511,7 @@ async function executeZergControlAction(
           return controlError(action.action, run.status === 'cancelled' ? 'run_cancelled' : 'run_failed', message, snapshot.revision, { runId: result.runId, taskId: result.taskId, agentId: action.agent });
         }
         const output = !action.background && run ? renderZergSubagentRunSummary(run, { width: PI_COMMAND_OUTPUT_WIDTH }) : result.output;
-        return controlOk(action.action, { run, request: { ...action }, taskId: result.taskId, runId: result.runId }, output, snapshot.revision, { runId: result.runId, taskId: result.taskId, agentId: action.agent });
+        return controlOk(action.action, { run, request: { ...action, ...(parsedConcurrency?.ok ? { concurrency: parsedConcurrency.value } : {}) }, taskId: result.taskId, runId: result.runId }, output, snapshot.revision, { runId: result.runId, taskId: result.taskId, agentId: action.agent });
       }
       case 'runs.list': {
         const runs = resolveAvailableRuns(container, options.subagentAdapter);
@@ -593,6 +597,7 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
         body: { type: 'string' },
         runId: { type: 'string' },
         mode: { type: 'string', enum: ['steer', 'followUp'], default: 'steer' },
+        concurrency: { type: 'integer', minimum: 1, description: 'Positive safe integer per-run native team worker concurrency for run actions; defaults to 8.' },
       },
       required: ['action'],
     },
@@ -1309,6 +1314,12 @@ function dispatchRunRequest(
     return { ok: false, output: RUNTIME_WRITABLE_STATE_ERROR };
   }
 
+  const concurrencyResult = requestInput.concurrency === undefined ? { ok: true as const, value: DEFAULT_NATIVE_WORKER_CONCURRENCY } : parsePositiveSafeIntegerOption(requestInput.concurrency, 'concurrency');
+  if (!concurrencyResult.ok) {
+    return { ok: false, output: concurrencyResult.output };
+  }
+  const resolvedConcurrency = concurrencyResult.value;
+
   const current = container.read();
   const launchMode = resolveLaunchMode(requestInput);
   const definitions = getAgentDefinitions(current);
@@ -1349,6 +1360,7 @@ function dispatchRunRequest(
         task: requestInput.task,
         launchMode,
         background: requestInput.background,
+        concurrency: resolvedConcurrency,
         model: requestInput.model ?? resolvedDefinition?.model ?? teamModel,
         fallbackModels: requestInput.fallbackModels ?? resolvedDefinition?.fallbackModels ?? teamFallbackModels,
         maxTurns: requestInput.maxTurns ?? resolvedDefinition?.maxTurns ?? teamMaxTurns,
@@ -1361,7 +1373,7 @@ function dispatchRunRequest(
       message: `read-only blocked zerg run for ${resolvedTeam?.id ?? resolvedAgentId}`,
       agentId: resolvedAgentId,
       teamId: resolvedTeam?.id,
-      data: { launchMode, background: requestInput.background },
+      data: { launchMode, background: requestInput.background, concurrency: resolvedConcurrency },
     });
     const snapshot = container.replace(logged);
     if (options.syncSharedState) {
@@ -1396,6 +1408,7 @@ function dispatchRunRequest(
     taskId,
     agentDefinitionId: resolvedDefinition?.id,
     ...(resolvedTeam ? { resolvedTeamId: resolvedTeam.id, memberAgentIds: resolvedMemberIds } : {}),
+    concurrency: resolvedConcurrency,
     description: requestInput.task,
     ...(requestedModel ? { model: requestedModel } : {}),
     ...(requestedFallbackModels?.length ? { fallbackModels: requestedFallbackModels } : {}),
@@ -1407,6 +1420,7 @@ function dispatchRunRequest(
     runId,
     originalTask: requestInput.task,
     launchMode,
+    concurrency: resolvedConcurrency,
     ...(resolvedTeam ? { teamId: resolvedTeam.id, teamLabel: resolvedTeam.label, memberAgentIds: resolvedMemberIds } : {}),
     ...(resolvedDefinition ? { agentDefinitionId: resolvedDefinition.id } : {}),
     agentDefinitionLabel: resolvedDefinition?.label,
@@ -1463,7 +1477,7 @@ function dispatchRunRequest(
     agentId: resolvedAgentId,
     teamId: resolvedTeam?.id,
     taskId,
-    data: { launchMode, background: requestInput.background, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
+    data: { launchMode, background: requestInput.background, concurrency: resolvedConcurrency, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
   });
 
   const launchReadyState = container.replace(withLaunchLog);
@@ -1484,7 +1498,7 @@ function dispatchRunRequest(
       agentId: resolvedAgentId,
       teamId: resolvedTeam?.id,
       taskId,
-      data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
+      data: { launchMode, concurrency: resolvedConcurrency, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
     });
     if (options.syncSharedState) {
       replaceSharedZergState(logged);
@@ -1531,7 +1545,7 @@ function dispatchRunRequest(
     agentId: resolvedAgentId,
     teamId: resolvedTeam?.id,
     taskId,
-    data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
+    data: { launchMode, concurrency: resolvedConcurrency, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
   }));
   if (options.syncSharedState) {
     replaceSharedZergState(failedState);
@@ -1732,6 +1746,7 @@ function parseRunCommand(payload: string): { ok: false; output: string } | { ok:
   let model: string | undefined;
   let fallbackModels: string[] | undefined;
   let maxTurns: number | undefined;
+  let concurrency: number | undefined;
   const filtered: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1739,6 +1754,7 @@ function parseRunCommand(payload: string): { ok: false; output: string } | { ok:
     const modelValue = readOptionValue(tokens, index, '--model');
     const fallbackValue = readOptionValue(tokens, index, '--fallback-models') ?? readOptionValue(tokens, index, '--fallback');
     const maxTurnsValue = readOptionValue(tokens, index, '--max-turns') ?? readOptionValue(tokens, index, '--maxTurns');
+    const concurrencyValue = readOptionValue(tokens, index, '--concurrency');
 
     if (token === '--bg' || token === '--background') {
       background = true;
@@ -1761,6 +1777,14 @@ function parseRunCommand(payload: string): { ok: false; output: string } | { ok:
       }
       maxTurns = parsed;
       if (token === '--max-turns' || token === '--maxTurns') index += 1;
+    } else if (token === '--concurrency' || token.startsWith('--concurrency=')) {
+      if (concurrencyValue === undefined || (token === '--concurrency' && concurrencyValue.startsWith('--'))) {
+        return { ok: false, output: '--concurrency must be a positive integer.' };
+      }
+      const parsedConcurrency = parsePositiveSafeIntegerToken(concurrencyValue, '--concurrency');
+      if (!parsedConcurrency.ok) return parsedConcurrency;
+      concurrency = parsedConcurrency.value;
+      if (token === '--concurrency') index += 1;
     } else {
       filtered.push(token);
     }
@@ -1772,7 +1796,7 @@ function parseRunCommand(payload: string): { ok: false; output: string } | { ok:
 
   const [agent, ...taskTokens] = filtered;
   if (!agent) {
-    return { ok: false, output: 'Usage: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--model <model>]' };
+    return { ok: false, output: 'Usage: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--concurrency <n>] [--model <model>]' };
   }
 
   const task = taskTokens.join(' ').trim();
@@ -1788,6 +1812,7 @@ function parseRunCommand(payload: string): { ok: false; output: string } | { ok:
       background,
       fork: launchMode === 'fork',
       launchMode,
+      ...(concurrency ? { concurrency } : {}),
       ...(model ? { model } : {}),
       ...(fallbackModels?.length ? { fallbackModels } : {}),
       ...(maxTurns ? { maxTurns } : {}),
@@ -1802,6 +1827,24 @@ function readOptionValue(tokens: string[], index: number, name: string): string 
   }
   const prefix = `${name}=`;
   return token.startsWith(prefix) ? token.slice(prefix.length) : undefined;
+}
+
+function parsePositiveSafeIntegerOption(value: unknown, name: string): { ok: true; value: number } | { ok: false; output: string } {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    return { ok: false, output: `${name} must be a positive integer.` };
+  }
+  return { ok: true, value };
+}
+
+function parsePositiveSafeIntegerToken(value: string, name: string): { ok: true; value: number } | { ok: false; output: string } {
+  if (!/^\d+$/.test(value.trim())) {
+    return { ok: false, output: `${name} must be a positive integer.` };
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return { ok: false, output: `${name} must be a positive integer.` };
+  }
+  return { ok: true, value: parsed };
 }
 
 function parseLogFilters(tokens: string[]): LogsParseResult {
@@ -3530,6 +3573,7 @@ async function runPiNativeZergRequest(
   const cwd = resolvePiNativeCwd(context);
   const coordDir = `coord/zerg-${runId.replace(/^zerg-/, '')}`;
   const coordPath = resolvePath(cwd, coordDir);
+  const workerConcurrency = request.concurrency ?? DEFAULT_NATIVE_WORKER_CONCURRENCY;
   let failedMemberSummaries: Array<{ agentId: string; status: 'failed' | 'cancelled'; message?: string }> = [];
 
   try {
@@ -3538,7 +3582,7 @@ async function runPiNativeZergRequest(
     }
 
     mkdirSync(coordPath, { recursive: true });
-    setRunMetadata(container, runId, { coordDir, coordPath, originalTask: request.task, ...(ledTeam ? { teamId: ledTeam.id, teamLabel: ledTeam.label, memberAgentIds: requestedMemberIds } : {}) }, options);
+    setRunMetadata(container, runId, { coordDir, coordPath, originalTask: request.task, concurrency: workerConcurrency, ...(ledTeam ? { teamId: ledTeam.id, teamLabel: ledTeam.label, memberAgentIds: requestedMemberIds } : {}) }, options);
 
     const promptBase = [
       `Run id: ${runId}`,
@@ -3555,59 +3599,70 @@ async function runPiNativeZergRequest(
     if (runnableMemberDefinitions.length > 0) {
       const startedAt = timestamp();
       setRunMetadata(container, runId, { memberProgress: runnableMemberDefinitions.map((definition) => ({ agentId: definition.id, runId: `${runId}-${definition.id}`, status: 'queued', handoffPath: `${coordDir}/${definition.id}.md` })) }, options);
-      const settledSummaries = await Promise.allSettled(runnableMemberDefinitions.map((definition) => runSinglePiNativeAgent(context, definition, {
-        task: `${promptBase}\n\nYou are team member ${definition.id}. Complete your assigned slice for the team task, read existing files as needed, preserve the caller's scope, and write only ${coordDir}/${definition.id}.md with your handoff.`,
-        runId: `${runId}-${definition.id}`,
-        taskId,
-        parentRunId: runId,
-        request,
-        options,
-        container,
-        activeRun,
-        handoffPath: `${coordDir}/${definition.id}.md`,
-        teamStartedAt: startedAt,
-      })));
-      const summaries = settledSummaries.map((summary, index) => summary.status === 'fulfilled'
-        ? summary.value
-        : { agentId: runnableMemberDefinitions[index]?.id ?? `member-${index}`, status: 'failed' as const, message: summary.reason instanceof Error ? summary.reason.message : String(summary.reason) });
-      settledSummaries.forEach((summary, index) => {
-        if (summary.status !== 'rejected') return;
-        const definition = runnableMemberDefinitions[index];
-        const agentId = definition?.id ?? `member-${index}`;
-        updateMemberProgress({
-          task: '',
-          runId: `${runId}-${agentId}`,
-          taskId,
-          parentRunId: runId,
-          request,
-          options,
-          container,
-          activeRun,
-          handoffPath: `${coordDir}/${agentId}.md`,
-          teamStartedAt: startedAt,
-        }, agentId, 'failed', { completedAt: timestamp(), handoffPath: `${coordDir}/${agentId}.md`, message: summary.reason instanceof Error ? summary.reason.message : String(summary.reason) });
-      });
-      failedMemberSummaries = summaries
+      const summaries: Array<{ agentId: string; status: 'done' | 'failed' | 'cancelled'; message?: string }> = new Array(runnableMemberDefinitions.length);
+      let nextIndex = 0;
+      const work = async () => {
+        while (nextIndex < runnableMemberDefinitions.length) {
+          // Claim FIFO before awaiting: the slot covers session setup and execution.
+          const index = nextIndex++;
+          const definition = runnableMemberDefinitions[index]!;
+          const workerRun = {
+            task: `${promptBase}\n\nYou are team member ${definition.id}. Complete your assigned slice for the team task, read existing files as needed, preserve the caller's scope, and write only ${coordDir}/${definition.id}.md with your handoff.`,
+            runId: `${runId}-${definition.id}`,
+            taskId,
+            parentRunId: runId,
+            request,
+            options,
+            container,
+            activeRun,
+            handoffPath: `${coordDir}/${definition.id}.md`,
+            teamStartedAt: startedAt,
+          };
+          if (activeRun?.cancelRequested) {
+            const message = 'cancel requested before session start';
+            summaries[index] = { agentId: definition.id, status: 'cancelled', message };
+            updateMemberProgress(workerRun, definition.id, 'cancelled', { completedAt: timestamp(), handoffPath: workerRun.handoffPath, message });
+            continue;
+          }
+          updateMemberProgress(workerRun, definition.id, 'starting', { startedAt: timestamp(), handoffPath: workerRun.handoffPath });
+          try {
+            summaries[index] = await runSinglePiNativeAgent(context, definition, workerRun);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const status = activeRun?.cancelRequested ? 'cancelled' : 'failed';
+            summaries[index] = { agentId: definition.id, status, message };
+            updateMemberProgress(workerRun, definition.id, status, { completedAt: timestamp(), handoffPath: workerRun.handoffPath, message });
+          }
+        }
+      };
+      // Await every lane even if orchestration itself throws; no detached pump promises.
+      const lanes = await Promise.allSettled(Array.from({ length: Math.min(workerConcurrency, runnableMemberDefinitions.length) }, () => work()));
+      const rejectedLane = lanes.find((lane) => lane.status === 'rejected');
+      if (rejectedLane?.status === 'rejected') throw rejectedLane.reason;
+      const completedSummaries = summaries;
+      failedMemberSummaries = completedSummaries
         .filter((summary): summary is { agentId: string; status: 'failed' | 'cancelled'; message?: string } => summary.status === 'failed' || summary.status === 'cancelled')
         .map((summary) => ({ agentId: summary.agentId, status: summary.status, ...(summary.message ? { message: summary.message } : {}) }));
-      workerSummaries = summaries.map((summary) => `- ${summary.agentId}: ${summary.status}${summary.message ? ` (${summary.message})` : ''}`).join('\n');
+      workerSummaries = completedSummaries.map((summary) => `- ${summary.agentId}: ${summary.status}${summary.message ? ` (${summary.message})` : ''}`).join('\n');
     }
 
     const leaderInstruction = runnableMemberDefinitions.length > 0
       ? `The worker pass finished with:\n${workerSummaries}\n\nRead ${coordDir}/ and project files as needed, integrate the workers' results within the original task scope, and write ${coordDir}/team-lead-final.md. Only run validation or modify files when the original task explicitly requests that work.`
       : 'Complete the requested task according to its stated scope, only run validation or modify files when that scope requires it, and report final status.';
     const leaderPrompt = `${promptBase}\n\nYou are ${leaderDefinition?.id ?? request.agent}, the team lead for this zerg run. ${leaderInstruction}`;
-    const leaderResult = await runSinglePiNativeAgent(context, leaderDefinition ?? { id: request.agent, label: request.agent, prompt: '', source: 'runtime' }, {
-      task: leaderPrompt,
-      runId,
-      taskId,
-      parentRunId: runId,
-      request,
-      options,
-      container,
-      activeRun,
-      handoffPath: runnableMemberDefinitions.length > 0 ? `${coordDir}/team-lead-final.md` : undefined,
-    });
+    const leaderResult = activeRun?.cancelRequested
+      ? { agentId: leaderDefinition?.id ?? request.agent, status: 'cancelled' as const, message: 'cancel requested before leader start' }
+      : await runSinglePiNativeAgent(context, leaderDefinition ?? { id: request.agent, label: request.agent, prompt: '', source: 'runtime' }, {
+        task: leaderPrompt,
+        runId,
+        taskId,
+        parentRunId: runId,
+        request,
+        options,
+        container,
+        activeRun,
+        handoffPath: runnableMemberDefinitions.length > 0 ? `${coordDir}/team-lead-final.md` : undefined,
+      });
 
     const doneAt = timestamp();
     const wasCancelled = activeRun?.cancelRequested === true || leaderResult.status === 'cancelled';
@@ -3638,6 +3693,7 @@ async function runPiNativeZergRequest(
         completedAt: doneAt,
         finalSummary,
         originalTask: request.task,
+        concurrency: workerConcurrency,
         ...(errorSummary ? { errorSummary } : {}),
         ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}),
         ...(ledTeam ? { teamId: ledTeam.id } : {}),
@@ -3653,7 +3709,7 @@ async function runPiNativeZergRequest(
       agentId: request.agent,
       teamId: ledTeam?.id,
       taskId,
-      data: { finalSummary, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}) },
+      data: { finalSummary, concurrency: workerConcurrency, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}) },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -3668,7 +3724,7 @@ async function runPiNativeZergRequest(
       status: activeRun?.cancelRequested ? 'cancelled' : 'failed',
       substate: activeRun?.cancelRequested ? 'cancelled' : 'failed',
       substateReason: activeRun?.cancelRequested ? 'pi native run cancelled' : message,
-      metadata: { completedAt: failedAt, errorSummary: activeRun?.cancelRequested ? undefined : message, originalTask: request.task, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}), ...(ledTeam ? { teamId: ledTeam.id } : {}) },
+      metadata: { completedAt: failedAt, errorSummary: activeRun?.cancelRequested ? undefined : message, originalTask: request.task, concurrency: workerConcurrency, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}), ...(ledTeam ? { teamId: ledTeam.id } : {}) },
     }, { now: () => new Date(failedAt) });
     container.replace(updateRunTaskLifecycle(failed, taskId, activeRun?.cancelRequested ? 'cancelled' : 'failed', activeRun?.cancelRequested ? 'cancelled' : 'failed', activeRun?.cancelRequested ? 'pi native run cancelled' : message, failedAt));
     appendLogToContainer(container, options, {
@@ -3725,7 +3781,7 @@ async function runSinglePiNativeAgent(
   };
   registerPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
   if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
-  updateMemberProgress(run, definition.id, 'running', { startedAt: updateAt(), handoffPath: run.handoffPath });
+  updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
   const unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
     if (event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
       captureResponse(event);
@@ -3759,6 +3815,7 @@ async function runSinglePiNativeAgent(
       updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancel requested before prompt' });
       return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before prompt' };
     }
+    updateMemberProgress(run, definition.id, 'running', { handoffPath: run.handoffPath });
     const promptResult = await session.prompt(run.task, { source: 'extension' as never });
     captureResponse(promptResult);
     const finalMessages = sessionHandle.messages;
