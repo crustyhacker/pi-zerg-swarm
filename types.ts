@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.8' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.9' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -172,6 +172,21 @@ export interface ZergSubagentMemberProgress {
   message?: string;
 }
 
+/** Pi-assigned locator and attachment state, not a transcript durability claim. */
+export interface ZergNativeSessionReference {
+  schemaVersion: 1;
+  parentRunId: string;
+  memberRunId: string;
+  agentDefinitionId: string;
+  piSessionId: string;
+  sessionFile: string;
+  cwd: string;
+  createdAt: string;
+  attachment: 'attached' | 'disposed' | 'unavailable';
+  disposedAt?: string;
+  recoveredAt?: string;
+}
+
 export interface ZergSubagentRunSnapshot {
   runId: string;
   agentId: string;
@@ -191,6 +206,8 @@ export interface ZergSubagentRunSnapshot {
   errorSummary?: string;
   recovery?: ZergRunRecoveryInfo;
   memberProgress?: ZergSubagentMemberProgress[];
+  /** Read-only projection of the canonical parent metadata.nativeSessions ledger. */
+  nativeSessions?: ZergNativeSessionReference[];
   metadata?: ZergExtensionFields;
 }
 

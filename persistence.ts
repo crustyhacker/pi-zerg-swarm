@@ -141,6 +141,18 @@ export function recoverZergStateAfterRestart(
   const recoveredRunIds: string[] = [];
 
   for (const run of getSubagentRunSnapshots(state)) {
+    if (run.nativeSessions?.some((reference) => reference.attachment === 'attached')) {
+      const agent = next.agents[run.runId]!;
+      next = {
+        ...next,
+        agents: { ...next.agents, [run.runId]: { ...agent, metadata: {
+          ...agent.metadata,
+          nativeSessions: run.nativeSessions.map((reference) => reference.attachment === 'attached'
+            ? { ...reference, attachment: 'unavailable', recoveredAt }
+            : { ...reference }),
+        } } },
+      };
+    }
     if (isTerminalRun(run.status, run.substate)) continue;
     const previousStatus = run.status;
     const previousSubstate = run.substate;
@@ -162,7 +174,7 @@ export function recoverZergStateAfterRestart(
       activity: 'recovered after Pi restart; live session unavailable',
       substate: 'failed',
       substateReason: 'recovered after Pi restart; live session unavailable',
-      metadata: { ...run.metadata, recovery },
+      metadata: { ...next.agents[run.runId]?.metadata, recovery },
     }, { now: () => new Date(recoveredAt) });
     if (run.taskId && next.tasks[run.taskId]) {
       const task = next.tasks[run.taskId]!;

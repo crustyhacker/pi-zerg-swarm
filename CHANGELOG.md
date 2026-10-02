@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.9] - 2026-10-02
+
+### Added
+
+- Native Pi session references mapping exact parent/member runs and agent definitions to Pi-assigned session IDs and file locators, including leaders, workers, and concurrent runs of the same definition. Existing structured `runs.list` / `runs.show` expose isolated typed references; slash run summaries remain bounded.
+- Immutable, versioned provenance entries and names in native Pi histories before extension binding or prompting, without adding identity metadata to model context or duplicating transcripts. Allocated file locators do not imply that Pi has written a transcript.
+- Localhost-only Pi SDK and state regressions for native identity, context exclusion, lazy persistence, concurrent/team mapping, startup and cleanup failures, cancellation, snapshot isolation, and restart with no automatic prompts or transcript-file mutation.
+
+### Changed
+
+- Opt-in Zerg snapshot recovery detaches all restored attached references, including terminal parent runs, without claiming reconnection or confirmed disposal. Session runtimes still dispose after tasks; history viewing, long-lived conversations, workspace messaging, and resume controls remain future work.
+
+### Fixed
+
+- Ensured SDK cleanup still runs after native registration, subscription, provenance publication, or extension-binding failures. References report confirmed disposal only when SDK cleanup returns; throwing cleanup leaves an unavailable reference rather than a false live attachment.
+
 ## [1.1.8] - 2026-10-02
 
 ### Fixed

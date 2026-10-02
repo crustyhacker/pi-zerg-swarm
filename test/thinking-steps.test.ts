@@ -8,10 +8,10 @@ import test from 'node:test';
 import { __zergNativeTestInternals, createPiZergCommandHandler, createZergCommandHandler, createZergControl, registerZergSwarmExtension, type ZergExtensionRegistration } from '../index.js';
 import { installInternalPatch } from '../internal-patch.js';
 import { deriveThinkingSteps } from '../parse.js';
-import { createZergPersistenceManager } from '../persistence.js';
-import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergManagementOverlay } from '../render.js';
+import { createZergPersistenceManager, recoverZergStateAfterRestart } from '../persistence.js';
+import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergManagementOverlay, renderZergSubagentRunSummary } from '../render.js';
 import { appendHookEvent, appendZergLogRecord, appendZergLogRecords, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createBuiltinAgentDefinitions, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getCurrentAgents, getCurrentMode, getCurrentTasks, getCurrentTeams, getCurrentTree, getPendingPermissionRequests, getPermissionQueueState, getSelectedTreeNode, getSubagentRunSnapshot, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, replayRuntimeTransitions, resetZergState, resolvePermissionRequest, selectNode, setMode, snapshotZergState, upsertAgentDefinition, updateSharedZergState, updateZergState, upsertAgent, upsertTask, upsertTeam, upsertTreeNode } from '../state.js';
-import { ZERG_EXTENSION_VERSION, ZERG_STATE_SCHEMA_VERSION, type AgentStatus, type HookLifecycleEvent, type StructuralPiCommandContext, type StructuralPiCommandOptions, type TaskStatus, type TeamIdentity, type ZergLifecycleSubstate, type ZergLogRecord, type ZergRuntimeTransition, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentControlResult, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergTreeNode } from '../types.js';
+import { ZERG_EXTENSION_VERSION, ZERG_STATE_SCHEMA_VERSION, type AgentStatus, type HookLifecycleEvent, type StructuralPiCommandContext, type StructuralPiCommandOptions, type TaskStatus, type TeamIdentity, type ZergLifecycleSubstate, type ZergLogRecord, type ZergRuntimeTransition, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentControlResult, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergTreeNode, type ZergNativeSessionReference } from '../types.js';
 
 type AssertAssignable<T extends true> = T;
 type ContainerReadReturnsState = AssertAssignable<ReturnType<ZergStateContainer['read']> extends ZergState ? true : false>;
@@ -4491,4 +4491,124 @@ test('Pi 1.0 terminal overlay awaits completion and catches asynchronous setup f
   finish();
   await pending;
   assert.equal(resolved, true);
+});
+
+
+test('native session reference normalization and projections are isolated; legacy snapshots remain additive', () => {
+  const reference: ZergNativeSessionReference = {
+    schemaVersion: 1, parentRunId: 'zerg-parent', memberRunId: 'zerg-parent-worker',
+    agentDefinitionId: 'worker', piSessionId: 'pi-id', sessionFile: '/inert/session.jsonl',
+    cwd: '/inert', createdAt: '2026-10-02T00:00:00.000Z', attachment: 'attached',
+  };
+  const invalid = [
+    { ...reference, schemaVersion: 2 }, { ...reference, parentRunId: 'other-parent' },
+    { ...reference, memberRunId: '' }, { ...reference, agentDefinitionId: 1 },
+    { ...reference, piSessionId: null }, { ...reference, sessionFile: {} },
+    { ...reference, cwd: [] }, { ...reference, createdAt: 'not-a-time' },
+    { ...reference, attachment: ['attached'] }, { ...reference, disposedAt: 42 },
+    { ...reference, recoveredAt: 'invalid' },
+  ];
+  const state = createZergState({ agents: { 'zerg-parent': {
+    id: 'zerg-parent', label: 'Parent', kind: 'subagent', status: 'running',
+    metadata: { nativeSessions: [reference, ...invalid, { ...reference, piSessionId: 'last-id', extra: { mutable: true } }] },
+  } } });
+  reference.piSessionId = 'input-mutated';
+  const run = getSubagentRunSnapshot(state, 'zerg-parent')!;
+  assert.equal(run.nativeSessions?.length, 1);
+  assert.equal(run.nativeSessions![0]!.piSessionId, 'last-id');
+  assert.equal('extra' in run.nativeSessions![0]!, false);
+  run.nativeSessions![0]!.sessionFile = 'typed-mutated';
+  (run.metadata!.nativeSessions as ZergNativeSessionReference[])[0]!.cwd = 'metadata-mutated';
+  run.nativeSessions!.push({ ...run.nativeSessions![0]!, memberRunId: 'another' });
+  const fresh = getSubagentRunSnapshot(state, 'zerg-parent')!;
+  assert.equal(fresh.nativeSessions!.length, 1);
+  assert.equal(fresh.nativeSessions![0]!.sessionFile, '/inert/session.jsonl');
+  assert.equal(fresh.nativeSessions![0]!.cwd, '/inert');
+  const nonRun = createZergState({ agents: { unrelated: { id: 'unrelated', label: 'Unrelated', kind: 'teammate', status: 'idle', metadata: { nativeSessions: [{ arbitrary: { value: 1 } }] } } } });
+  assert.deepEqual(nonRun.agents.unrelated!.metadata!.nativeSessions, [{ arbitrary: { value: 1 } }]);
+  for (const malformed of [null, undefined, 'invalid', []]) {
+    const authoritative = createZergSubagentRunSnapshot({ ...fresh, metadata: { nativeSessions: malformed } });
+    assert.deepEqual(authoritative.nativeSessions, malformed === undefined ? undefined : []);
+  }
+  const cloned = createZergSubagentRunSnapshot(fresh);
+  cloned.nativeSessions![0]!.piSessionId = 'clone-mutated';
+  assert.equal(fresh.nativeSessions![0]!.piSessionId, 'last-id');
+  const standalone = createZergSubagentRunSnapshot({ runId: 'zerg-parent', agentId: 'worker', status: 'done', nativeSessions: fresh.nativeSessions });
+  standalone.nativeSessions![0]!.cwd = 'standalone-mutated';
+  assert.equal(fresh.nativeSessions![0]!.cwd, '/inert');
+  const legacy = createZergSubagentRunSnapshot({ runId: 'zerg-old', agentId: 'worker', status: 'done' });
+  assert.equal(Object.hasOwn(legacy, 'nativeSessions'), false);
+  assert.equal(Object.hasOwn(getSubagentRunSnapshot(createZergState({ agents: { 'zerg-old': { id: 'zerg-old', label: 'Old', kind: 'subagent', status: 'done' } } }), 'zerg-old')!, 'nativeSessions'), false);
+  const pruned = appendZergLogRecords(state, Array.from({ length: 20 }, (_, i) => ({ source: 'adapter' as const, kind: 'text' as const, level: 'info' as const, message: `log ${i}`, createdAt: reference.createdAt })), { maxRecords: 2 });
+  assert.equal(getZergLogs(pruned).length, 2);
+  assert.deepEqual(getSubagentRunSnapshot(pruned, 'zerg-parent')!.nativeSessions, fresh.nativeSessions);
+});
+
+test('native reference recovery detaches active and terminal parents without fictional disposal or replay', () => {
+  const createdAt = '2026-10-01T00:00:00.000Z';
+  const recoveredAt = '2026-10-02T00:00:00.000Z';
+  const agents = Object.fromEntries((['running', 'done', 'failed', 'cancelled'] as const).map((status) => {
+    const id = `zerg-${status}`;
+    const base: ZergNativeSessionReference = { schemaVersion: 1, parentRunId: id, memberRunId: id,
+      agentDefinitionId: 'same', piSessionId: `pi-${status}`, sessionFile: `/never-open/${status}.jsonl`, cwd: '/never-open', createdAt, attachment: 'attached' };
+    return [id, { id, label: id, kind: 'subagent' as const, status, metadata: { nativeSessions: [base,
+      { ...base, memberRunId: `${id}-disposed`, attachment: 'disposed', disposedAt: createdAt },
+      { ...base, memberRunId: `${id}-unavailable`, attachment: 'unavailable', recoveredAt: createdAt },
+    ] } }];
+  }));
+  const input = createZergState({ agents });
+  const recovered = recoverZergStateAfterRestart(input, { now: () => new Date(recoveredAt) });
+  assert.deepEqual(recovered.recoveredRunIds, ['zerg-running']);
+  for (const status of ['running', 'done', 'failed', 'cancelled']) {
+    const id = `zerg-${status}`;
+    const refs = getSubagentRunSnapshot(recovered.state, id)!.nativeSessions!;
+    assert.equal(refs[0]!.attachment, 'unavailable');
+    assert.equal(refs[0]!.recoveredAt, recoveredAt);
+    assert.equal(refs[0]!.disposedAt, undefined);
+    assert.equal(refs[0]!.piSessionId, `pi-${status}`);
+    assert.equal(refs[0]!.createdAt, createdAt);
+    assert.equal(refs[1]!.attachment, 'disposed');
+    assert.equal(refs[1]!.disposedAt, createdAt);
+    assert.equal(refs[2]!.recoveredAt, createdAt);
+    assert.equal(getSubagentRunSnapshot(input, id)!.nativeSessions![0]!.attachment, 'attached');
+    if (status !== 'running') assert.equal(recovered.state.agents[id]!.status, status);
+  }
+  const repeated = recoverZergStateAfterRestart(recovered.state, { now: () => new Date('2026-10-03T00:00:00.000Z') });
+  assert.deepEqual(repeated.state, recovered.state);
+  assert.deepEqual(repeated.recoveredRunIds, []);
+});
+
+test('native session summary bounds locators and shares slash and structured run inspection', async () => {
+  const references: ZergNativeSessionReference[] = Array.from({ length: 20 }, (_, i) => ({ schemaVersion: 1,
+    parentRunId: 'zerg-parent', memberRunId: `zerg-parent-${i}`, agentDefinitionId: 'same', piSessionId: `pi-${i}`,
+    sessionFile: '/inert/session.jsonl', cwd: '/inert', createdAt: '2026-10-02T00:00:00.000Z', attachment: 'disposed' }));
+  const container = createZergStateContainer({ agents: { 'zerg-parent': { id: 'zerg-parent', label: 'Parent', kind: 'subagent', status: 'done', metadata: { nativeSessions: references } } } });
+  const control = createZergControl(container);
+  try {
+    const show = await control.execute({ action: 'runs.show', runId: 'zerg-parent' });
+    const list = await control.execute({ action: 'runs.list' });
+    assert.equal(((show.data as { run: ZergSubagentRunSnapshot }).run).nativeSessions?.length, 20);
+    assert.equal(((list.data as { runs: ZergSubagentRunSnapshot[] }).runs)[0]!.nativeSessions?.length, 20);
+    const summary = renderZergSubagentRunSummary(((show.data as { run: ZergSubagentRunSnapshot }).run), { width: 100 });
+    assert.match(summary, /native-sessions: 20/);
+    assert.match(summary, /12 more; use structured runs.show/);
+    assert.equal(summary.includes('pi:pi-8'), false);
+    assert(summary.split('\n').every((line) => line.length <= 100));
+    const slash = createZergCommandHandler(container)('runs show zerg-parent');
+    assert.match(slash.output, /native-sessions: 20/);
+    assert.match(slash.output, /pi:pi-0/);
+  } finally { control.dispose(); }
+});
+
+test('native session actual SDK fixture validates provenance, lifecycle and inert recovery', { timeout: 90_000 }, async () => {
+  const child = spawn(process.execPath, ['--import', 'tsx', new URL('./fixtures/native-session-smoke.mjs', import.meta.url).pathname], {
+    cwd: new URL('..', import.meta.url).pathname, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = ''; let stderr = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
+  assert.equal(code, 0, `native session smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  assert.match(stdout, /PASS all native session reference checks/);
 });

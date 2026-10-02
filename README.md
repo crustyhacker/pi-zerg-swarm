@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.8 release status**
-> Rejects unsupported native fork, turn-limit, and fallback-model settings before any selected team's SDK sessions start, rather than silently ignoring them. Fresh native defaults and external-adapter/acknowledged-bridge forwarding remain available. The release preserves bounded worker concurrency, truthful team outcomes, handoffs, Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, durable run/log snapshots, management overlays, and MCP tool exposure.
+> **v1.1.9 release status**
+> Adds exact native Pi session references and immutable transcript provenance for each run/member, exposed through existing run inspection with truthful attachment and restart states. This is the session-identity foundation, not yet long-lived agents, a transcript viewer, or resume controls. The release preserves fail-closed unsupported-capability validation, bounded worker concurrency, truthful team outcomes, handoffs, Pi 1.0.0 native control hardening, asynchronous `/zerg run --bg`, structured `zerg_control` automation, opt-in durable run/log snapshots, management overlays, and MCP tool exposure.
 > Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
 
 ## Release status
 
-- Current release: **v1.1.8** (fail-closed native capability validation before session startup).
+- Current release: **v1.1.9** (native Pi session identity, provenance, and safe reference recovery).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -47,6 +47,16 @@ const status = await control.execute({ action: 'runs.show', runId: run.runId! })
 `registerZergSwarmExtension(...)` also registers a Pi custom tool named `zerg_control` when the installed Pi extension API exposes `registerTool(...)`. The tool calls the same structured control core and returns JSON-compatible `details`; callers do not need to parse slash-command output. Slash commands remain the human-facing wrapper.
 
 Background jobs are inspectable through `/zerg runs`, `/zerg logs`, direct `runs.*`/`logs.list`, and `/zerg interrupt`/`{ action: 'interrupt' }` while the Pi process/session remains alive. v1.1.0 also supports opt-in durable snapshots under `.pi/zerg-swarm/v1/state.json` through `persistence: { enabled: true, rootDir }`, so restart can recover run/log history and mark previously active sessions as `needs-attention` instead of losing them.
+
+## Native session reference foundation
+
+Native runs expose `nativeSessions` through existing structured `runs.list` / `runs.show` results and a bounded `/zerg runs show <run-id>` summary. The parent run's `metadata.nativeSessions` is the canonical ledger; typed results are isolated copies. Each schema-version-1 reference maps the exact parent/member run and agent definition to Pi's own session ID, file locator, cwd, creation timestamp, and attachment state. Team workers and the leader have separate references; simultaneous runs of the same definition are separate conversations.
+
+Before extension binding or prompting, each native Pi manager receives a namespaced `pi-zerg-swarm/native-session/v1` custom identity entry and session name. Custom identity is tree metadata, not model context. Pi owns the JSONL transcript and branching/compaction format; Zerg does not duplicate it. **The SDK allocates the ID/path before writing a file**: setup/custom entries alone do not create a transcript, and a file can be absent after startup failure or cancellation before prompting. A locator is not proof of existence, persistence, or permission to read that path.
+
+Sessions still dispose after each task. `disposed` means confirmed SDK cleanup, not lost history; a throwing cleanup leaves the reference `unavailable` without claiming disposal. With opt-in Zerg snapshot persistence enabled, the ledger survives restart; restored `attached` references become `unavailable`, even for terminal parent runs, without inventing disposal. `unavailable` does not mean reconnected. With persistence disabled, Pi's marker/history survives independently **once Pi actually writes its file**, but Zerg does not rediscover the mapping on restart.
+
+This first foundation slice does not keep conversational agents alive, open/read/scan referenced files, automatically resume or replay prompts/messages, implement native fork/turn budgets/fallbacks, or provide a transcript viewer. Inspection and hydration never create or repair a missing/corrupt referenced transcript. Future viewing/resume controls must separately validate trusted locations and matching Pi headers.
 
 ## Architecture
 

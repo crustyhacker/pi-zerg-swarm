@@ -9,7 +9,7 @@ import { deriveThinkingSteps } from './parse.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
 import { renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
 import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
-import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot } from './types.js';
+import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference } from './types.js';
 
 type ZergIdFactory = {
   runId?: () => string;
@@ -3799,9 +3799,11 @@ async function runSinglePiNativeAgent(
   const sdk = await import('@earendil-works/pi-coding-agent');
   const cwd = resolvePiNativeCwd(context);
   const modelSpec = resolvePiNativeRunModel(definition, run.request);
-  const { session, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec);
+  const { session, sessionManager, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec);
   const sessionHandle = session as PiNativeSessionHandle;
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
+  let reference: ZergNativeSessionReference | undefined;
+  let unsubscribe: (() => void) | undefined;
   let capturedResponse: string | undefined;
   let assistantOutcome: PiNativeAssistantOutcome | undefined;
   const captureResponse = (value: unknown) => {
@@ -3812,27 +3814,44 @@ async function runSinglePiNativeAgent(
       assistantOutcome = outcome;
     }
   };
-  registerPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
-  if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
-  updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
-  const unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
-    if (event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
-      captureResponse(event);
-    }
-    if (event.type === 'tool_execution_start') {
-      appendLogToContainer(run.container, run.options, {
-        source: 'adapter',
-        level: 'info',
-        kind: 'tool',
-        message: `tool running: ${String((event as { toolName?: unknown }).toolName ?? 'tool')}`,
-        runId: run.parentRunId,
-        agentId: definition.id,
-        taskId: run.taskId,
-      });
-    }
-  });
-
   try {
+    const sessionFile = sessionManager.getSessionFile();
+    if (!sessionFile) throw new Error('Native Pi session manager did not allocate a session file locator');
+    reference = {
+      schemaVersion: 1, parentRunId: run.parentRunId, memberRunId: run.runId,
+      agentDefinitionId: definition.id, piSessionId: sessionManager.getSessionId(),
+      sessionFile, cwd: sessionManager.getCwd(), createdAt: updateAt(), attachment: 'attached',
+    };
+    // A custom entry is Pi tree metadata, never a model-context message. Neither
+    // this marker nor session_info forces the SDK's lazy JSONL file to exist.
+    sessionManager.appendCustomEntry('pi-zerg-swarm/native-session/v1', {
+      schemaVersion: reference.schemaVersion, parentRunId: reference.parentRunId,
+      memberRunId: reference.memberRunId, agentDefinitionId: reference.agentDefinitionId,
+      piSessionId: reference.piSessionId, sessionFile: reference.sessionFile,
+      cwd: reference.cwd, createdAt: reference.createdAt,
+    });
+    sessionManager.appendSessionInfo(`zerg ${run.runId} (${definition.id})`.slice(0, 160));
+    setNativeSessionReference(run, reference);
+    registerPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
+    if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
+    updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
+    unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
+      if (event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
+        captureResponse(event);
+      }
+      if (event.type === 'tool_execution_start') {
+        appendLogToContainer(run.container, run.options, {
+          source: 'adapter',
+          level: 'info',
+          kind: 'tool',
+          message: `tool running: ${String((event as { toolName?: unknown }).toolName ?? 'tool')}`,
+          runId: run.parentRunId,
+          agentId: definition.id,
+          taskId: run.taskId,
+        });
+      }
+    });
+
     await session.bindExtensions({ mode: 'print', abortHandler: () => { if (run.activeRun) run.activeRun.cancelRequested = true; } });
     appendLogToContainer(run.container, run.options, {
       source: 'adapter',
@@ -3914,11 +3933,35 @@ async function runSinglePiNativeAgent(
     updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
     return { agentId: definition.id, status, message };
   } finally {
-    unregisterPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
-    if (run.runId === run.parentRunId) unregisterPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
-    unsubscribe();
-    session.dispose();
+    try {
+      try {
+        unregisterPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
+        if (run.runId === run.parentRunId) unregisterPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
+      } finally {
+        unsubscribe?.();
+      }
+    } finally {
+      // Cleanup can fail after routing is removed: that is unavailable, not attached.
+      let disposed = false;
+      try {
+        session.dispose();
+        disposed = true;
+      } finally {
+        if (reference) setNativeSessionReference(run, {
+          ...reference, attachment: disposed ? 'disposed' : 'unavailable',
+          ...(disposed ? { disposedAt: updateAt() } : {}),
+        });
+      }
+    }
   }
+}
+
+function setNativeSessionReference(run: PiNativeRunContext, reference: ZergNativeSessionReference): void {
+  const references = getSubagentRunSnapshot(run.container.read(), run.parentRunId)?.nativeSessions ?? [];
+  const index = references.findIndex((entry) => entry.memberRunId === reference.memberRunId);
+  if (index < 0) references.push(reference);
+  else references[index] = reference;
+  setRunMetadata(run.container, run.parentRunId, { nativeSessions: references }, run.options);
 }
 
 
@@ -4396,6 +4439,7 @@ async function createPiNativeSession(
   });
   const resourceLoader = await createPiNativeResourceLoader(sdk, definition, task, cwd, settingsManager);
   const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
+  const sessionManager = sdk.SessionManager.create(cwd);
   const { session } = await sdk.createAgentSession({
     cwd,
     agentDir,
@@ -4407,10 +4451,10 @@ async function createPiNativeSession(
     ...(toolPolicy.noTools ? { noTools: toolPolicy.noTools } : {}),
     excludeTools: toolPolicy.excludeTools,
     customTools: createPiNativeCustomTools(toolPolicy.customTools) as never,
-    sessionManager: sdk.SessionManager.create(cwd),
+    sessionManager,
     settingsManager,
   });
-  return { session, tools };
+  return { session, sessionManager, tools };
 }
 
 function resolvePiNativeRunModel(definition: Pick<ZergAgentDefinition, 'id' | 'model'>, request: Pick<ZergSubagentLaunchRequest, 'agent' | 'model'>): string | undefined {

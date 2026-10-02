@@ -674,6 +674,15 @@ export function renderZergSubagentRunSummary(run: ZergSubagentRunSnapshot, optio
     }
   }
 
+  if (run.nativeSessions?.length) {
+    lines.push(`native-sessions: ${run.nativeSessions.length} (locators; transcript may be absent)`);
+    for (const reference of run.nativeSessions.slice(0, 8)) {
+      lines.push(`- ${sanitizeRuntimeActivity(reference.memberRunId)}: ${reference.attachment} pi:${sanitizeRuntimeActivity(reference.piSessionId)}`);
+      lines.push(`  file: ${sanitizeRuntimeActivity(reference.sessionFile)}`);
+    }
+    if (run.nativeSessions.length > 8) lines.push(`  ... ${run.nativeSessions.length - 8} more; use structured runs.show`);
+  }
+
   return lines.map((line) => fit(line, width)).join('\n');
 }
 

@@ -1,4 +1,4 @@
-import { ZERG_STATE_SCHEMA_VERSION, type AgentIdentity, type AgentKind, type AgentStatus, type HookLifecycleEvent, type PermissionModeIntervention, type PermissionModeInterventionInput, type PermissionModeSnapshot, type PermissionModeState, type PermissionModeTransitionInput, type TaskRecord, type TeamIdentity, type TeamKind, type ZergAgentDefinition, type ZergAgentRuntimeTransition, type ZergContext, type ZergExtensionFields, type ZergPermissionDecision, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergPermissionRequester, type ZergPermissionRequestKind, type ZergPermissionRequestStatus, type ZergPermissionResolver, type ZergLifecycleSubstate, type ZergLogLevel, type ZergLogRecord, type ZergLogSource, type ZergLogState, type ZergOutputKind, type ZergRuntimeHealth, type ZergRuntimeModeContext, type ZergRuntimeState, type ZergRuntimeTransition, type ZergState, type ZergStateContainer, type ZergStateListener, type ZergStatePatch, type ZergStateUpdateOptions, type ZergSubagentRunSnapshot, type ZergTeamRuntimeTransition, type ZergTreeNode } from './types.js';
+import { ZERG_STATE_SCHEMA_VERSION, type AgentIdentity, type AgentKind, type AgentStatus, type HookLifecycleEvent, type PermissionModeIntervention, type PermissionModeInterventionInput, type PermissionModeSnapshot, type PermissionModeState, type PermissionModeTransitionInput, type TaskRecord, type TeamIdentity, type TeamKind, type ZergAgentDefinition, type ZergAgentRuntimeTransition, type ZergContext, type ZergExtensionFields, type ZergPermissionDecision, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergPermissionRequester, type ZergPermissionRequestKind, type ZergPermissionRequestStatus, type ZergPermissionResolver, type ZergLifecycleSubstate, type ZergLogLevel, type ZergLogRecord, type ZergLogSource, type ZergLogState, type ZergOutputKind, type ZergRuntimeHealth, type ZergRuntimeModeContext, type ZergRuntimeState, type ZergRuntimeTransition, type ZergState, type ZergStateContainer, type ZergStateListener, type ZergStatePatch, type ZergStateUpdateOptions, type ZergSubagentRunSnapshot, type ZergNativeSessionReference, type ZergTeamRuntimeTransition, type ZergTreeNode } from './types.js';
 
 const DEFAULT_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 const MAX_LIFECYCLE_SUBSTATE_REASON_LENGTH = 160;
@@ -50,6 +50,13 @@ export function createBuiltinAgentDefinitions(): Record<string, ZergAgentDefinit
 }
 
 export function createZergSubagentRunSnapshot(run: ZergSubagentRunSnapshot): ZergSubagentRunSnapshot {
+  // Parent metadata is authoritative whenever the reserved key is present,
+  // including malformed/null/undefined values. Typed-only adapter snapshots
+  // remain supported when no canonical ledger key was supplied.
+  const nativeSessions = normalizeNativeSessionReferences(
+    run.metadata && Object.hasOwn(run.metadata, 'nativeSessions') ? run.metadata.nativeSessions : run.nativeSessions,
+    run.runId,
+  );
   return {
     runId: run.runId,
     agentId: run.agentId,
@@ -69,7 +76,8 @@ export function createZergSubagentRunSnapshot(run: ZergSubagentRunSnapshot): Zer
     errorSummary: run.errorSummary,
     ...(run.recovery ? { recovery: { ...run.recovery } } : {}),
     memberProgress: run.memberProgress?.map((member) => ({ ...member })),
-    metadata: cloneOptional(run.metadata, cloneExtensionFields),
+    ...(nativeSessions !== undefined ? { nativeSessions } : {}),
+    metadata: cloneRunMetadata(run.metadata, run.runId),
   };
 }
 
@@ -1223,14 +1231,52 @@ function isPiSubagentRunAgentId(id: string): boolean {
 function cloneSubagentRunSnapshot(run: ZergSubagentRunSnapshot): ZergSubagentRunSnapshot {
   return {
     ...run,
-    metadata: cloneOptional(run.metadata, cloneExtensionFields),
+    ...(run.nativeSessions !== undefined ? { nativeSessions: normalizeNativeSessionReferences(run.nativeSessions, run.runId) } : {}),
+    metadata: cloneRunMetadata(run.metadata, run.runId),
   };
+}
+
+/** Validate only scalar identity data; paths remain inert locators. Last exact member wins. */
+function normalizeNativeSessionReferences(value: unknown, parentRunId: string): ZergNativeSessionReference[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return [];
+  const references = new Map<string, ZergNativeSessionReference>();
+  const text = (input: unknown): input is string => typeof input === 'string'
+    && input.trim().length > 0 && input.length <= 8192 && !/[\u0000-\u001f\u007f]/.test(input);
+  const timestamp = (input: unknown): input is string => text(input) && Number.isFinite(Date.parse(input));
+  for (const entry of value) {
+    if (!isPlainRecord(entry) || entry.schemaVersion !== 1 || entry.parentRunId !== parentRunId
+      || !text(entry.memberRunId) || !text(entry.agentDefinitionId) || !text(entry.piSessionId)
+      || !text(entry.sessionFile) || !text(entry.cwd) || !timestamp(entry.createdAt)
+      || (entry.attachment !== 'attached' && entry.attachment !== 'disposed' && entry.attachment !== 'unavailable')
+      || (entry.disposedAt !== undefined && !timestamp(entry.disposedAt))
+      || (entry.recoveredAt !== undefined && !timestamp(entry.recoveredAt))) continue;
+    references.set(entry.memberRunId, {
+      schemaVersion: 1, parentRunId, memberRunId: entry.memberRunId,
+      agentDefinitionId: entry.agentDefinitionId, piSessionId: entry.piSessionId,
+      sessionFile: entry.sessionFile, cwd: entry.cwd, createdAt: entry.createdAt,
+      attachment: entry.attachment as ZergNativeSessionReference['attachment'],
+      ...(entry.disposedAt !== undefined ? { disposedAt: entry.disposedAt as string } : {}),
+      ...(entry.recoveredAt !== undefined ? { recoveredAt: entry.recoveredAt as string } : {}),
+    });
+  }
+  return [...references.values()];
+}
+
+function cloneRunMetadata(metadata: ZergExtensionFields | undefined, parentRunId: string): ZergExtensionFields | undefined {
+  const cloned = cloneOptional(metadata, cloneExtensionFields);
+  if (cloned && 'nativeSessions' in cloned) {
+    const nativeSessions = normalizeNativeSessionReferences(cloned.nativeSessions, parentRunId);
+    if (nativeSessions === undefined) delete cloned.nativeSessions;
+    else cloned.nativeSessions = nativeSessions;
+  }
+  return cloned;
 }
 
 function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
   const runtimeTask = agent.runtime?.lastActivity;
   const runtime = agent.runtime;
-  const metadata = agent.metadata;
+  const metadata = cloneRunMetadata(agent.metadata, agent.id);
   const taskId = typeof metadata?.taskId === 'string' ? metadata.taskId : undefined;
   const launchMode = metadata?.launchMode === 'fork' || metadata?.launchMode === 'fresh' ? metadata.launchMode : undefined;
   const agentDefinitionId = typeof metadata?.agentDefinitionId === 'string' ? metadata.agentDefinitionId : undefined;
@@ -1265,7 +1311,8 @@ function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
     errorSummary: typeof metadata?.errorSummary === 'string' ? metadata.errorSummary : undefined,
     ...(recovery?.recoveredAt ? { recovery } : {}),
     memberProgress: Array.isArray(metadata?.memberProgress) ? metadata.memberProgress.map((member) => ({ ...(member as Record<string, unknown>) })) as unknown as ZergSubagentRunSnapshot['memberProgress'] : undefined,
-    metadata: cloneOptional(metadata, cloneExtensionFields),
+    ...(metadata?.nativeSessions !== undefined ? { nativeSessions: normalizeNativeSessionReferences(metadata.nativeSessions, agent.id) } : {}),
+    metadata,
   };
 }
 
@@ -1596,7 +1643,9 @@ function cloneAgent(agent: AgentIdentity): AgentIdentity {
     ...agent,
     childIds: cloneArray(agent.childIds),
     runtime: cloneOptional(agent.runtime, cloneRuntimeState),
-    metadata: cloneOptional(agent.metadata, cloneExtensionFields),
+    metadata: isPiSubagentRunAgentId(agent.id)
+      ? cloneRunMetadata(agent.metadata, agent.id)
+      : cloneOptional(agent.metadata, cloneExtensionFields),
     extensions: cloneOptional(agent.extensions, cloneExtensionFields),
   };
 }
