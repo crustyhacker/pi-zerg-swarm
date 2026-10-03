@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-
+import { CURSOR_MARKER, visibleWidth } from '@earendil-works/pi-tui';
+import { sanitizeUiText } from '../../ui/components.js';
+import { renderChatPane } from '../../ui/chat-pane.js';
+import { renderDetailPane } from '../../ui/detail-pane.js';
+import { renderManagementFooter } from '../../ui/footer.js';
+import { renderSettingsPane, createSettingsPaneState } from '../../ui/settings-pane.js';
+import { createManagementUiState } from '../../ui/state.js';
+import { renderTreePane, createTreePaneState } from '../../ui/tree-pane.js';
 import { createZergState, createZergStateContainer } from '../../state.js';
 import type { StructuralPiCommandContext, ZergManagementTargetKind } from '../../types.js';
 import { openZergManagementOverlay, ZergManagementOverlayComponent, type ZergManagementOverlayActions } from '../../ui/management-overlay.js';
@@ -89,7 +96,7 @@ test('M9 management overlay preserves existing selected target and shows zerg co
     sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: 'transport unavailable' }),
   };
 
-  await openZergManagementOverlay({
+  void openZergManagementOverlay({
     ui: {
       custom(factory) {
         component = (factory as () => typeof component)();
@@ -130,7 +137,7 @@ test('M9 management overlay keeps tree navigation usable after default selection
     interruptSelected: () => 'interrupt unavailable',
     sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: 'transport unavailable' }),
   };
-  await openZergManagementOverlay({ ui: { custom(factory) { component = (factory as () => typeof component)(); return undefined; } } }, {
+  void openZergManagementOverlay({ ui: { custom(factory) { component = (factory as () => typeof component)(); return undefined; } } }, {
     getSnapshot: () => container.snapshot(),
     subscribe: () => () => undefined,
     adapterKind: 'fake',
@@ -346,4 +353,95 @@ test('shared viewer callbacks keep options receiver and contain noncoercible thr
     f.component.handleInput('t'); await codingTick(); assert.match(f.component.getStateForTests().statusMessage ?? '', /management redraw unavailable/); f.component.dispose();
     const visible = codingManagementFixture(undefined, undefined, () => { throw nonText; }); visible.component.handleInput('t'); await codingTick(); assert.match(visible.component.getStateForTests().statusMessage ?? '', /Unknown failure/); visible.component.dispose();
   }
+});
+
+
+function hardeningActions(): ZergManagementOverlayActions {
+  return { now: () => new Date('2026-10-03T00:00:00Z'), toggleReadOnly: () => 'toggle', setAutomation: () => 'mode', setController: () => 'controller', approvePermission: () => 'approve', denyPermission: () => 'deny', selectTarget: () => 'select', interruptSelected: () => 'interrupt', sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: 'unavailable' }) };
+}
+
+test('management host sync/async failure disposes every observer and completes despite throwing cleanup', async () => {
+  for (const sync of [true, false]) {
+    let watchers = 0; let unsubs = 0; let done = 0; let renders = 0;
+    let listener: () => void = () => undefined;
+    let component: ZergManagementOverlayComponent | undefined;
+    const error = Object.create(null);
+    const promise = openZergManagementOverlay({ ui: { custom(factory) {
+      component = (factory as (tui: { requestRender(): void }, theme: undefined, keys: undefined, done: () => void) => ZergManagementOverlayComponent)(
+        { requestRender: () => { renders++; } }, undefined, undefined, () => { done++; throw error; });
+      if (sync) throw error;
+      return Promise.reject(error);
+    } } }, {
+      getSnapshot: () => createZergState(), subscribe: (next) => { watchers++; listener = next; return () => { watchers--; unsubs++; throw error; }; }, adapterKind: 'fake', actions: hardeningActions(),
+    });
+    await assert.rejects(promise);
+    const before = renders; const state = component!.getStateForTests();
+    listener(); component!.handleInput('r'); component!.dispose();
+    assert.equal(watchers, 0); assert.equal(unsubs, 1); assert.equal(done, 1); assert.equal(renders, before);
+    assert.deepEqual(component!.getStateForTests(), state);
+  }
+});
+
+test('management subscribe failures are readable and cannot prevent close', () => {
+  let done = 0;
+  const c = new ZergManagementOverlayComponent(undefined, undefined, () => { done++; }, {
+    getSnapshot: () => createZergState(), subscribe: () => { throw Object.create(null); }, adapterKind: 'fake', actions: hardeningActions(),
+  });
+  assert.match(c.render(180, 30).join('\n'), /Unknown failure/);
+  c.dispose(); c.dispose(); assert.equal(done, 1);
+});
+
+test('management render honors narrow/tiny/Unicode geometry and retains normal Pi Input focus marker', () => {
+  const state = createZergState({ agents: { a: { id: 'a', label: '界👩‍💻é', kind: 'subagent', status: 'running' } } });
+  const c = new ZergManagementOverlayComponent({ terminal: { rows: 5 } }, undefined, undefined, {
+    getSnapshot: () => state, subscribe: () => () => undefined, adapterKind: 'fake', actions: hardeningActions(),
+  });
+  for (const width of [1, 2, 10, 42, 71, 72, 100, 180, 512]) {
+    for (const height of [1, 2, 5, 17, 18, 30, 80]) {
+      const lines = c.render(width, height);
+      assert.ok(lines.length <= height);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width), 'frame fits physical width');
+    }
+  }
+  assert.ok(c.render(10).length <= 5);
+  c.focused = true; c.handleInput('tab'); c.handleInput('tab'); c.handleInput('code界');
+  assert.ok(c.render(180, 30).some((line) => line.includes(CURSOR_MARKER)), 'public Input IME marker preserved');
+  assert.equal(c.getStateForTests().chatDraft, 'code界');
+  c.render(10, 5); c.render(180, 30);
+  assert.equal(c.getStateForTests().chatDraft, 'code界'); c.dispose();
+});
+
+test('retained malicious fields are bounded/sanitized before styling without stripping trusted Pi ANSI', () => {
+  // Fake strings only: never send these controls to a terminal or print raw payloads in assertions.
+  const attack = 'safe\x1b]52;c;FAKE_OSC\x07\x1b[2J\x9b2J\x9d8;;FAKE_C1\x9c\x1b_GFAKE_APC\x1b\\\nforged\rrow';
+  const state = createZergState();
+  state.agents[attack] = { id: attack, label: attack, kind: 'subagent', status: 'idle' };
+  state.extensions.zergPermissions = { requests: [{ id: attack, kind: attack, summary: attack, status: 'pending', targetId: attack }] };
+  state.extensions.zergLogs = { records: [{ id: attack, level: 'warn', source: attack, message: attack, agentId: attack }] };
+  const ui = createManagementUiState(); ui.selectedTargetId = attack; ui.selectedTargetKind = 'agent'; ui.statusMessage = attack;
+  ui.messages = [{ id: 'fake', targetId: attack, targetKind: 'agent', routedTargetId: attack, body: attack, status: 'queued-local', statusDetail: attack, createdAt: attack }];
+  ui.chatDraft = attack;
+  const theme = { fg: (_token: string, text: string) => `\x1b[32m${text}\x1b[0m`, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+  const settings = createSettingsPaneState(); settings.confirmation = { action: 'approve', requestId: attack };
+  const frames = [
+    renderTreePane(state, ui, createTreePaneState(), 200, 40, theme),
+    renderSettingsPane(state, ui, settings, attack, 200, 40, theme),
+    renderChatPane(state, ui, 200, 40, undefined, theme),
+    renderDetailPane(state, ui, 200, 40, theme),
+    renderManagementFooter(state, ui, attack, 200, theme),
+  ];
+  ui.selectedTargetId = undefined; ui.selectedTargetKind = undefined;
+  frames.push(renderDetailPane(state, ui, 200, 40, theme));
+  for (const lines of frames) {
+    assert.ok(lines.some((line) => line.includes('\x1b[32m')), 'trusted theme survives');
+    for (const line of lines) {
+      const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+      assert.equal(/[\x00-\x1f\x7f-\x9f]/.test(plain), false, 'no terminal/control/newline instructions from retained fields');
+      assert.equal(/FAKE_OSC|FAKE_C1|FAKE_APC/.test(plain), false, 'sequence payload removed');
+      assert.ok(visibleWidth(line) <= 200);
+    }
+  }
+  assert.ok(sanitizeUiText('x'.repeat(100000)).length <= 4096);
+  assert.equal(sanitizeUiText(Object.create(null)), '');
+  assert.equal(state.agents[attack]?.id, attack, 'display cleaning never rewrites identities');
 });

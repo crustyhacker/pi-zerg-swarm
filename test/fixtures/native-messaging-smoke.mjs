@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Local fetch restoration restores the retained guard, not ambient fetch.
+installFixtureSafety({ name: 'messaging', maxRequests: 24 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -39,6 +42,7 @@ writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { fixtu
 writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'fixture', defaultModel: 'message', packages: [], extensions: [], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true }));
 writeFileSync(join(dir, '.pi', 'settings.json'), JSON.stringify({ packages: [], extensions: [], noExtensions: true }));
 const sdk = await import('@earendil-works/pi-coding-agent');
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(sdk);
 const zerg = await import(new URL('../../index.ts', import.meta.url).href);
 const state = await import(new URL('../../state.ts', import.meta.url).href);
 const messaging = await import(new URL('../../session-messages.ts', import.meta.url).href);

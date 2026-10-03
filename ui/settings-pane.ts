@@ -1,5 +1,5 @@
 import type { AutomationMode, ZergControlController, ZergManagementUiState, ZergPermissionRequest, ZergState } from '../types.js';
-import { renderPane, styleText, type UiThemeLike } from './components.js';
+import { renderPane, sanitizeUiText, styleText, type UiThemeLike } from './components.js';
 
 export interface SettingsPaneActions {
   toggleReadOnly(): string;
@@ -58,11 +58,11 @@ export function renderSettingsPane(state: ZergState, uiState: ZergManagementUiSt
   settingsState.pendingCursor = pending.length === 0 ? 0 : Math.max(0, Math.min(settingsState.pendingCursor, pending.length - 1));
   const controller = getControlController(state);
   const readOnly = state.mode.readOnly ? styleText(theme, 'warning', 'on') : styleText(theme, 'success', 'off');
-  const mode = styleText(theme, state.mode.automation === 'automatic' ? 'warning' : state.mode.automation === 'assisted' ? 'accent' : 'muted', state.mode.automation);
+  const mode = styleText(theme, state.mode.automation === 'automatic' ? 'warning' : state.mode.automation === 'assisted' ? 'accent' : 'muted', sanitizeUiText(state.mode.automation));
   const lines = [
     `${styleText(theme, 'accent', 'Mode')} ${mode}   ${styleText(theme, 'accent', 'Read-only')} ${readOnly}`,
-    `${styleText(theme, 'accent', 'Controller')} ${controller}   ${styleText(theme, 'accent', 'Adapter')} ${adapterKind}`,
-    `Selected: ${uiState.selectedTargetKind ?? 'none'} ${uiState.selectedTargetId ?? ''}`.trim(),
+    `${styleText(theme, 'accent', 'Controller')} ${controller}   ${styleText(theme, 'accent', 'Adapter')} ${sanitizeUiText(adapterKind)}`,
+    `Selected: ${sanitizeUiText(uiState.selectedTargetKind ?? 'none')} ${sanitizeUiText(uiState.selectedTargetId)}`.trim(),
     '',
     'Quick keys:',
     '  r read-only   m manual   a assisted   u automatic   c controller',
@@ -75,13 +75,12 @@ export function renderSettingsPane(state: ZergState, uiState: ZergManagementUiSt
   } else {
     for (let index = 0; index < Math.min(pending.length, Math.max(1, height - 12)); index += 1) {
       const request = pending[index]!;
-      lines.push(`${index === settingsState.pendingCursor ? '>' : ' '} ${request.id} [${request.kind}] ${request.summary}`);
+      lines.push(`${index === settingsState.pendingCursor ? '>' : ' '} ${sanitizeUiText(request.id)} [${sanitizeUiText(request.kind)}] ${sanitizeUiText(request.summary)}`);
     }
     lines.push('p approve selected | d deny selected (press twice to confirm)');
   }
-
   if (settingsState.confirmation) {
-    lines.push(`confirm: press ${settingsState.confirmation.action === 'approve' ? 'p' : 'd'} again for ${settingsState.confirmation.requestId}`);
+    lines.push(`confirm: press ${settingsState.confirmation.action === 'approve' ? 'p' : 'd'} again for ${sanitizeUiText(settingsState.confirmation.requestId)}`);
   }
 
   return renderPane(lines, { title: '2 Settings', focused: uiState.focusedPane === 'settings', width, height, theme });

@@ -16,12 +16,28 @@ export interface RenderPaneOptions {
 }
 
 export function sanitizeUiText(value: unknown): string {
-  return String(value ?? '')
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+  // Retained/recovered fields are data, never terminal instructions. Bound before regex work.
+  const text = typeof value === 'string' ? value.slice(0, 4096)
+    : typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
+  return text
+    .replace(/(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|$)/g, '')
+    .replace(/(?:\x1b[PX^_]|[\x90\x98\x9e\x9f])[\s\S]*?(?:\x1b\\|\x9c|$)/g, '')
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+
+/** Host failures may be arbitrary, even objects with throwing accessors/coercion. */
+export function uiErrorText(error: unknown): string {
+  try {
+    const message: unknown = error instanceof Error ? error.message : error;
+    return typeof message === 'string' ? sanitizeUiText(`${error instanceof Error ? 'Error: ' : ''}${message.slice(0, 256)}`).slice(0, 256)
+      : 'Unknown failure (non-text error).';
+  } catch { return 'Unknown failure (unreadable error).'; }
+}
 export function fitLine(value: string, width: number): string {
   const safeWidth = Math.max(1, Math.floor(width));
   const clean = sanitizeUiText(value);

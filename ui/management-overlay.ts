@@ -1,7 +1,7 @@
 import { Input, type Component, type Focusable } from '@earendil-works/pi-tui';
 import type { AutomationMode, StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergControlController, ZergManagementTargetKind, ZergManagementUiState, ZergOperatorMessageDeliveryStatus, ZergState } from '../types.js';
 import { sanitizeTranscriptText } from './agent-overlay.js';
-import { boldText, columns, fitRawLine, styleText, type UiThemeLike } from './components.js';
+import { boldText, columns, fitRawLine, sanitizeUiText, styleText, type UiThemeLike } from './components.js';
 import { ChatPaneActions, cancelChatDraft, renderChatPane, sendChatDraft } from './chat-pane.js';
 import { renderDetailPane, resolveSelectedTarget } from './detail-pane.js';
 import { renderManagementFooter } from './footer.js';
@@ -33,19 +33,16 @@ export interface ZergManagementOverlayOptions {
 }
 
 export async function openZergManagementOverlay(context: StructuralPiCommandContext, options: ZergManagementOverlayOptions): Promise<void> {
-  await Promise.resolve(context.ui?.custom?.(
-    (tui?: StructuralPiTuiHandle, theme?: unknown, _keybindings?: unknown, done?: (result?: void) => void) => new ZergManagementOverlayComponent(tui, theme as UiThemeLike | undefined, () => done?.(undefined), options),
-    {
-      overlay: true,
-      overlayOptions: {
-        title: 'zerg config',
-        anchor: 'center',
-        width: '78%',
-        maxHeight: '82%',
-        minWidth: 72,
+  let component: ZergManagementOverlayComponent | undefined;
+  try {
+    await Promise.resolve(context.ui?.custom?.(
+      (tui?: StructuralPiTuiHandle, theme?: unknown, _keybindings?: unknown, done?: (result?: void) => void) => {
+        component?.dispose();
+        return component = new ZergManagementOverlayComponent(tui, theme as UiThemeLike | undefined, () => done?.(undefined), options);
       },
-    },
-  ));
+      { overlay: true, overlayOptions: { title: 'zerg config', anchor: 'center', width: '78%', maxHeight: '82%', minWidth: 72 } },
+    ));
+  } finally { component?.dispose(); }
 }
 
 export class ZergManagementOverlayComponent implements StructuralPiCustomComponent, Component, Focusable {
@@ -56,7 +53,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   private readonly chatInput = new Input();
   private codingViewerOpen = false;
   private disposed = false;
-  private unsubscribe: () => void;
+  private unsubscribe: () => void = () => undefined;
   private cachedWidth?: number;
   private cachedHeight?: number;
   private cachedLines?: string[];
@@ -75,7 +72,11 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     this.chatInput.onEscape = () => {
       this.dispose();
     };
-    this.unsubscribe = options.subscribe(() => this.requestRender());
+    try {
+      const unsubscribe = options.subscribe(() => this.requestRender());
+      if (this.disposed) { try { unsubscribe(); } catch { /* Reentrant close still releases observer. */ } }
+      else this.unsubscribe = unsubscribe;
+    } catch (error) { this.uiState.statusMessage = `Management observer unavailable: ${viewerError(error)}`; }
   }
 
   render(width = 120, requestedHeight?: number): string[] {
@@ -84,8 +85,13 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
       return this.cachedLines;
     }
     const snapshot = this.options.getSnapshot();
-    const safeWidth = Math.max(72, Math.floor(width));
-    const safeHeight = Math.max(18, Math.floor(height));
+    const safeWidth = Math.max(1, Math.min(512, Math.floor(width) || 1));
+    const safeHeight = height;
+    if (safeWidth < 72 || safeHeight < 18) {
+      this.chatInput.focused = false;
+      return [styleText(this.theme, 'warning', 'zerg config: resize terminal (72 columns / 18 rows); Esc closes')]
+        .slice(0, safeHeight).map((line) => fitRawLine(line, safeWidth));
+    }
     this.ensureDefaultTarget(snapshot);
     const footer = renderManagementFooter(snapshot, this.uiState, this.options.adapterKind, safeWidth, this.theme);
     const header = this.renderHeader(snapshot, safeWidth);
@@ -173,8 +179,10 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.unsubscribe();
-    this.done?.();
+    const unsubscribe = this.unsubscribe;
+    this.unsubscribe = () => undefined;
+    try { unsubscribe(); } catch { /* A failing observer cannot block host completion. */ }
+    try { this.done?.(); } catch { /* Host completion is attempted once. */ }
   }
 
   getStateForTests(): ZergManagementUiState {
@@ -186,11 +194,8 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   }
 
   private resolveHeight(requestedHeight?: number): number {
-    if (typeof requestedHeight === 'number') {
-      return Math.max(18, Math.floor(requestedHeight));
-    }
-    const rows = typeof this.tui?.terminal?.rows === 'number' ? this.tui.terminal.rows : 32;
-    return Math.max(18, Math.floor(rows * 0.82));
+    const rows = requestedHeight ?? (this.tui?.terminal?.rows ?? 32) * 0.82;
+    return Math.max(1, Math.min(128, Math.floor(rows) || 1));
   }
 
   private requestRender(): void {
@@ -207,7 +212,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     return [
       fitRawLine(`${title} ${styleText(this.theme, 'muted', '·')} ${styleText(this.theme, 'muted', counts)} ${styleText(this.theme, 'muted', '·')} ${readOnly}`, width),
       fitRawLine(`${styleText(this.theme, 'dim', 'Use three steps:')} ${styleText(this.theme, 'accent', 'Select')} → ${styleText(this.theme, 'accent', 'Settings')} → ${styleText(this.theme, 'accent', 'Message')}   ${styleText(this.theme, 'dim', 'Tab changes focus')}`, width),
-      fitRawLine(`${styleText(this.theme, 'muted', 'Mode')} ${snapshot.mode.automation}   ${styleText(this.theme, 'muted', 'Controller')} ${this.resolveControlController(snapshot)}   ${styleText(this.theme, 'muted', 'Pending approvals')} ${pendingPermissions}`, width),
+      fitRawLine(`${styleText(this.theme, 'muted', 'Mode')} ${sanitizeUiText(snapshot.mode.automation)}   ${styleText(this.theme, 'muted', 'Controller')} ${this.resolveControlController(snapshot)}   ${styleText(this.theme, 'muted', 'Pending approvals')} ${pendingPermissions}`, width),
     ];
   }
 

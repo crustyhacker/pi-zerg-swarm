@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Dedicated subprocess: guard/empty environment installed before SDK resources.
+installFixtureSafety({ name: 'session', maxRequests: 32 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -61,6 +64,7 @@ writeFileSync(join(dir, '.pi', 'settings.json'), JSON.stringify({ packages: [], 
 assert.deepEqual(JSON.parse(readFileSync(join(agentDir, 'settings.json'))).packages, []);
 
 const sdk = await import('@earendil-works/pi-coding-agent');
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(sdk);
 const zerg = await import(new URL('../../index.ts', import.meta.url).href);
 const stateApi = await import(new URL('../../state.ts', import.meta.url).href);
 const persistenceApi = await import(new URL('../../persistence.ts', import.meta.url).href);

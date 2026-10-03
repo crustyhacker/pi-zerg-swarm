@@ -2483,16 +2483,10 @@ test('registerZergSwarmExtension unavailable slash bus returns empty run reads s
   registration.dispose();
 });
 
-test('registerZergSwarmExtension falls back to native runner when slash bridge does not respond', async () => {
+test('registerZergSwarmExtension falls back to native runner when slash bridge does not respond', { timeout: 5_000 }, async () => {
   const eventBus = createFakePiEventBus();
   const notifications: string[] = [];
-  const piCommandContext = {
-    ui: {
-      notify(message: string) {
-        notifications.push(message);
-      },
-    },
-  };
+  const piCommandContext = { ui: { notify(message: string) { notifications.push(message); } } };
   let commandHandler: ((input: string, ctx: StructuralPiCommandContext) => Promise<void> | void) | undefined;
   const registration = registerZergSwarmExtension({
     events: eventBus,
@@ -2501,37 +2495,41 @@ test('registerZergSwarmExtension falls back to native runner when slash bridge d
       return { dispose: () => undefined };
     },
   }, {
-    idFactory: {
-      runId: () => 'zerg-stalled-run',
-      taskId: () => 'task-stalled-run',
-    },
+    idFactory: { runId: () => 'zerg-stalled-run', taskId: () => 'task-stalled-run' },
   });
 
-  assert.ok(commandHandler);
-  await commandHandler!('/zerg run planner "wait forever"', piCommandContext as StructuralPiCommandContext);
-  await new Promise((resolve) => setTimeout(resolve, 130));
+  try {
+    assert.ok(commandHandler);
+    // The bridge may support this option, but native fallback rejects it before
+    // SDK/resource discovery. This proves fallback without ambient model/config.
+    await commandHandler!('/zerg run planner "wait forever" --max-turns 1', piCommandContext as StructuralPiCommandContext);
+    const deadline = Date.now() + 2_000;
+    while (registration.state.tasks['task-stalled-run']?.status !== 'failed' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
 
-  assert.equal(notifications.some((message) => message.includes('zerg launched planner as zerg-stalled-run')), true);
-  assert.equal(notifications.some((message) => message.includes('task-stalled-run')), true);
+    assert.equal(notifications.some((message) => message.includes('zerg launched planner as zerg-stalled-run')), true);
+    assert.equal(notifications.some((message) => message.includes('task-stalled-run')), true);
+    const requestEvent = eventBus.emitted.find((entry) => entry.eventName === 'subagent:slash:request');
+    assert.equal((requestEvent?.args[0] as { requestId?: string } | undefined)?.requestId, 'zerg-stalled-run');
+    const stalledParams = (requestEvent?.args[0] as { params?: { taskId?: string; context?: string; maxTurns?: number } } | undefined)?.params;
+    assert.equal(stalledParams?.taskId, 'task-stalled-run');
+    assert.equal(stalledParams?.context, undefined);
+    assert.equal(stalledParams?.maxTurns, 1);
 
-  const requestEvent = eventBus.emitted.find((entry) => entry.eventName === 'subagent:slash:request');
-  assert.equal((requestEvent?.args[0] as { requestId?: string } | undefined)?.requestId, 'zerg-stalled-run');
-  const stalledParams = (requestEvent?.args[0] as { params?: { taskId?: string; context?: string } } | undefined)?.params;
-  assert.equal(stalledParams?.taskId, 'task-stalled-run');
-  assert.equal(stalledParams?.context, undefined);
-
-  const state = registration.state;
-  assert.equal(state.tasks['task-stalled-run']?.status, 'running');
-  assert.equal(state.tasks['task-stalled-run']?.ownerAgentId, 'zerg-stalled-run');
-  assert.equal(state.agents['zerg-stalled-run']?.status, 'running');
-  assert.equal(state.agents['zerg-stalled-run']?.runtime?.substate, 'starting');
-  assert.equal((state.agents['zerg-stalled-run']?.metadata as { taskId?: string } | undefined)?.taskId, 'task-stalled-run');
-  assert.equal((state.agents['zerg-stalled-run']?.metadata as { launchMode?: string } | undefined)?.launchMode, 'fresh');
-  assert.equal((state.tasks['task-stalled-run']?.metadata as { launchMode?: string } | undefined)?.launchMode, 'fresh');
-  assert.ok(state.events.some((event) => event.type === 'agent' && event.action === 'start' && event.agentId === 'zerg-stalled-run'));
-  assert.ok(getZergLogs(state, { level: 'info' }).some((record) => record.runId === 'zerg-stalled-run' && record.message.includes('pi native')));
-
-  registration.dispose();
+    const state = registration.state;
+    assert.equal(state.tasks['task-stalled-run']?.status, 'failed');
+    assert.equal(state.tasks['task-stalled-run']?.ownerAgentId, 'zerg-stalled-run');
+    assert.equal(state.agents['zerg-stalled-run']?.status, 'failed');
+    assert.equal(state.agents['zerg-stalled-run']?.runtime?.substate, 'failed');
+    assert.match(state.agents['zerg-stalled-run']?.runtime?.substateReason ?? '', /Native zerg runner rejected unsupported capability request before SDK startup: .*maxTurns/);
+    assert.equal((state.agents['zerg-stalled-run']?.metadata as { taskId?: string } | undefined)?.taskId, 'task-stalled-run');
+    assert.equal((state.agents['zerg-stalled-run']?.metadata as { launchMode?: string } | undefined)?.launchMode, 'fresh');
+    assert.equal((state.tasks['task-stalled-run']?.metadata as { launchMode?: string } | undefined)?.launchMode, 'fresh');
+    assert.ok(getZergLogs(state, { level: 'error' }).some((record) => record.runId === 'zerg-stalled-run' && record.message.includes('before SDK startup')));
+  } finally {
+    registration.dispose();
+  }
 });
 
 test('registerZergSwarmExtension wires zerg run to pi-subagents slash bridge events', async () => {

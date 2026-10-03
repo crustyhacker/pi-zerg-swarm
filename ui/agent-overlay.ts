@@ -3,7 +3,7 @@ import { CURSOR_MARKER, Editor, getKeybindings, matchesKey as piMatchesKey, Text
 import type { NativeTranscriptKey, NativeTranscriptReadHandle, NativeTranscriptSnapshot } from '../native-transcript.js';
 import type { NativeContinuationService } from '../native-continuation.js';
 import type { StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergNativeSessionReference } from '../types.js';
-import { styleText, type UiThemeLike } from './components.js';
+import { styleText, uiErrorText, type UiThemeLike } from './components.js';
 import { ZergContinuationReviewComponent, type ContinuationSource } from './continuation-review.js';
 import { matchesKey } from './state.js';
 
@@ -82,11 +82,16 @@ export async function openZergAgentOverlay(context: StructuralPiCommandContext, 
   if (context.hasUI === false || (context.mode !== undefined && context.mode !== 'tui') || !context.ui?.custom) {
     throw new Error('Coding viewer requires an interactive Pi TUI.');
   }
-  await Promise.resolve(context.ui.custom(
-    (tui?: StructuralPiTuiHandle, theme?: unknown, _keys?: unknown, done?: () => void) =>
-      new ZergAgentOverlayComponent(tui, theme as UiThemeLike | undefined, done, options),
-    { overlay: true, overlayOptions: { title: 'zerg coding', anchor: 'center', width: '90%', maxHeight: '82%' } },
-  ));
+  let component: ZergAgentOverlayComponent | undefined;
+  try {
+    await Promise.resolve(context.ui.custom(
+      (tui?: StructuralPiTuiHandle, theme?: unknown, _keys?: unknown, done?: () => void) => {
+        component?.dispose();
+        return component = new ZergAgentOverlayComponent(tui, theme as UiThemeLike | undefined, done, options);
+      },
+      { overlay: true, overlayOptions: { title: 'zerg coding', anchor: 'center', width: '90%', maxHeight: '82%' } },
+    ));
+  } finally { component?.dispose(); }
 }
 
 /** Owns observer UI and explicit composer callbacks, never a runner or SDK session. */
@@ -128,7 +133,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
   private paste?: { text: string; tail: string; rejected: boolean };
   private continuation?: ZergContinuationReviewComponent;
   private displayedContinuation?: { source: ContinuationSource; proof: string };
-
+  private displayedChoice?: { index: number; key: NativeTranscriptKey };
   get focused(): boolean { return this._focused; }
   set focused(value: boolean) {
     this._focused = value;
@@ -153,7 +158,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
         this.refreshReferences();
         this.requestRender();
       });
-    } catch (error) { this.message = `Reference observer unavailable: ${String(error)}`; }
+    } catch (error) { this.message = `Reference observer unavailable: ${uiErrorText(error)}`; }
   }
 
   invalidate(): void { this.cache = undefined; this.editor?.invalidate(); this.continuation?.invalidate(); }
@@ -180,8 +185,13 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       : this.snapshot ? `${this.snapshot.source} · ${this.snapshot.status} · ${this.snapshot.source === 'captured' ? 'detached capture (not connected or proven saved)' : this.leafId ? 'branch inspection' : this.snapshot.defaultLeafBasis === 'live' ? 'live leaf' : 'last recorded entry (not proven active leaf)'} · ${this.follow ? 'follow tail' : 'scroll paused'}`
       : 'unavailable';
     let body: string[];
+    this.displayedChoice = undefined;
     if (this.mode === 'chooser') {
       const offset = Math.max(0, this.choice - Math.floor(this.viewport / 3));
+      const ref = this.references[this.choice];
+      if (ref && w >= 12 && this.choice - offset < bodyCapacity - (notice ? 1 : 0)) {
+        this.displayedChoice = { index: this.choice, key: { parentRunId: ref.parentRunId, memberRunId: ref.memberRunId, piSessionId: ref.piSessionId } };
+      }
       body = this.references.slice(offset, offset + this.viewport).map((ref, index) => {
         const short = (id: string) => id.length > 22 ? `${id.slice(0, 8)}…${id.slice(-12)}` : id;
         return `${offset + index === this.choice ? '›' : ' '} ${offset + index + 1} ${ref.agentDefinitionId} · member ${short(ref.memberRunId)} · run ${short(ref.parentRunId)} · Pi ${short(ref.piSessionId)} · ${ref.attachment}`;
@@ -328,14 +338,19 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     } catch (error) {
       this.references = [];
       if (this.key) { this.detach(); this.mode = this.options.initialKey ? 'transcript' : 'chooser'; }
-      this.message = `References unavailable: ${String(error)}`;
+      this.message = `References unavailable: ${uiErrorText(error)}`;
     }
   }
 
   private async openSelected(): Promise<void> {
-    const ref = this.references[this.choice];
-    if (!ref) return;
-    await this.openExact({ parentRunId: ref.parentRunId, memberRunId: ref.memberRunId, piSessionId: ref.piSessionId });
+    const displayed = this.displayedChoice;
+    const current = this.references[this.choice];
+    if (!displayed || displayed.index !== this.choice || !current || !sameKey(displayed.key, current)) {
+      this.message = 'Selected reference is stale or not yet displayed; render and choose an exact session again. No fallback.';
+      this.requestRender();
+      return;
+    }
+    await this.openExact({ ...displayed.key });
   }
 
   private async openExact(requestedKey: NativeTranscriptKey, explicitInitial = false): Promise<void> {
@@ -372,7 +387,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       this.detach();
       this.mode = 'transcript';
       this.key = key;
-      this.message = `Transcript unavailable: ${String(error)}`;
+      this.message = `Transcript unavailable: ${uiErrorText(error)}`;
     }
     this.requestRender();
   }
@@ -384,7 +399,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       this.snapshot = snapshot;
       if (snapshot?.source !== 'live') this.follow = false;
       this.message = '';
-    } catch (error) { this.snapshot = undefined; this.message = `Transcript unavailable: ${String(error)}`; }
+    } catch (error) { this.snapshot = undefined; this.message = `Transcript unavailable: ${uiErrorText(error)}`; }
     this.continuation?.sourceChanged();
     this.invalidate();
   }
@@ -394,6 +409,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     this.continuation?.dispose();
     this.continuation = undefined;
     this.displayedContinuation = undefined;
+    this.displayedChoice = undefined;
     this.abort?.abort();
     this.abort = undefined;
     cleanup(this.unsubscribeTranscript);
@@ -452,7 +468,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       });
       if (this.disposed || generation !== this.generation) cleanup(unsubscribe);
       else this.unsubscribeComposer = unsubscribe;
-    } catch (error) { this.composerWatchError = rowText(`Composer observer unavailable: ${String(error)}`).slice(0, 256); }
+    } catch (error) { this.composerWatchError = rowText(`Composer observer unavailable: ${uiErrorText(error)}`).slice(0, 256); }
   }
 
   private validReceipt(receipt: ZergComposerReceipt, key: NativeTranscriptKey, messageId?: string): boolean {
@@ -480,7 +496,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
           detail: rowText(receipt.detail).slice(0, 256), createdAt: receipt.createdAt?.slice(0, 64), updatedAt: receipt.updatedAt?.slice(0, 64), persistence: receipt.persistence })),
       };
       this.composerError = '';
-    } catch (error) { this.composerState = undefined; this.composerError = rowText(`Composer unavailable: ${String(error)}`).slice(0, 256); }
+    } catch (error) { this.composerState = undefined; this.composerError = rowText(`Composer unavailable: ${uiErrorText(error)}`).slice(0, 256); }
   }
 
   private composerDisabledReason(forSend = true): string {
@@ -551,7 +567,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       if (text !== previous) { this.editorInputs += 1; this.editRevision += 1; this.composerMessage = ''; }
     } catch (error) {
       this.editor = this.createEditor(previous);
-      this.composerMessage = rowText(`Draft editor unavailable: ${String(error)}`).slice(0, 256);
+      this.composerMessage = rowText(`Draft editor unavailable: ${uiErrorText(error)}`).slice(0, 256);
     }
   }
 
@@ -642,7 +658,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       this.readComposerState();
     } catch (error) {
       if (this.disposed || generation !== this.generation) return;
-      this.composerMessage = rowText(`Send failed or outcome unknown: ${String(error)}. Draft retained; no automatic retry.`).slice(0, 256);
+      this.composerMessage = rowText(`Send failed or outcome unknown: ${uiErrorText(error)}. Draft retained; no automatic retry.`).slice(0, 256);
     } finally {
       if (!this.disposed && generation === this.generation) { this.sending = false; this.requestRender(); }
     }

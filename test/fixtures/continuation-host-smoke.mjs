@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { assertAncestorIsolation, cleanHostEnvironment, guardSource, readFixtureBody, spawnOwnedController, settleOwnedController } from './host-fixture-safety.mjs';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Standalone AFTER parent applies/grants: node test/fixtures/continuation-host-smoke.mjs
@@ -18,34 +18,6 @@ const evidence = mkdtempSync(join(tmpdir(), 'zerg-continuation-pty-'));
 const body = '/never-expand q b c n\n  PTY_NEW_LITERAL_TASK: preserve indentation; !not-shell';
 const results = [], sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function guardSource(root, origin) {
-  return `import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import net from 'node:net';
-import tls from 'node:tls';
-const origin = ${JSON.stringify(origin)}, root = ${JSON.stringify(root)};
-function refuse(reason) {
-  const path = root + '/network-refused.txt';
-  if (!existsSync(path) || readFileSync(path).length < 4096) appendFileSync(path, String(reason).slice(0, 1024) + '\\n');
-  throw Error('Fixture refused network: ' + reason);
-}
-const original = globalThis.fetch;
-globalThis.fetch = (input, init) => {
-  const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-  const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-  if (url.origin !== origin || url.pathname !== '/v1/chat/completions' || url.search || url.hash || url.username || url.password || method !== 'POST') refuse(method + ' ' + url.origin + url.pathname);
-  return original(input, { ...init, redirect: 'error' });
-};
-const connect = net.Socket.prototype.connect;
-net.Socket.prototype.connect = function (...args) {
-  const first = Array.isArray(args[0]) ? args[0][0] : args[0];
-  const options = typeof first === 'object' ? first : { port: first, host: args[1] };
-  const allowed = new URL(origin);
-  if (options?.path || options?.host !== '127.0.0.1' || String(options?.port) !== allowed.port) refuse('socket ' + String(options?.host) + ':' + String(options?.port));
-  return connect.apply(this, args);
-};
-tls.connect = () => refuse('TLS forbidden');
-`;
-}
 function observerSource(root) {
   return `import { appendFileSync } from 'node:fs';
 const path = ${JSON.stringify(join(root, 'hooks.jsonl'))};
@@ -183,7 +155,7 @@ root, phase_dir, node, cli, mode, restarting = sys.argv[1:]
 master, slave = pty.openpty()
 def resize(cols, rows): fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 resize(120, 42)
-env = {'PATH': os.path.dirname(node) + ':/usr/local/bin:/usr/bin:/bin', 'HOME': root + '/home', 'TMPDIR': root + '/tmp', 'TERM': 'xterm-256color', 'LANG': 'C.UTF-8', 'PI_CODING_AGENT_DIR': root + '/agent', 'PI_OFFLINE': '1', 'PI_SKIP_VERSION_CHECK': '1', 'PI_TELEMETRY': '0'}
+env = dict(os.environ); env['TERM'] = 'xterm-256color'
 args = [node, '--import', root + '/guard.mjs', cli, '--offline', '--no-session', '--no-approve', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-tools', '--model', 'fixture/current', '--thinking', 'off', '--tui-mode', mode, '-e', phase_dir + '/smoke.ts']
 proc = subprocess.Popen(args, cwd=root + '/work', env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
 os.close(slave)
@@ -328,25 +300,14 @@ if not report['ok']: sys.exit(1)
 
 async function runMode(mode) {
   const root = join(evidence, mode);
-  for (const path of ['home', 'tmp', 'agent/extensions', 'agent/prompts', 'agent/skills/continuation', 'work/.pi', 'live', 'restart']) mkdirSync(join(root, path), { recursive: true });
-  for (let ancestor = dirname(root); ; ancestor = dirname(ancestor)) {
-    for (const leaf of ['.pi', 'AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD', 'SYSTEM.md', 'APPEND_SYSTEM.md']) assert(!existsSync(join(ancestor, leaf)), 'Unexpected ancestor resource: ' + join(ancestor, leaf));
-    if (ancestor === dirname(ancestor)) break;
-  }
-  writeFileSync(join(root, 'work/input.txt'), 'PTY_INHERITED_TOOL_RESULT\n');
-  writeFileSync(join(root, 'agent/auth.json'), '{}');
-  const settings = { defaultProvider: 'fixture', defaultModel: 'current', packages: [], extensions: ['-builtin:mcp', '-builtin:llama.cpp', '-builtin:codemode', '-builtin:tool-search'], skills: [], prompts: [], themes: [], noExtensions: false, noSkills: false, noPromptTemplates: false, noThemes: true, defaultProjectTrust: 'never', enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } };
-  writeFileSync(join(root, 'agent/settings.json'), JSON.stringify(settings)); writeFileSync(join(root, 'work/.pi/settings.json'), JSON.stringify(settings));
-  writeFileSync(join(root, 'agent/extensions/observer.ts'), observerSource(root));
-  writeFileSync(join(root, 'agent/prompts/never-expand.md'), '---\ndescription: forbidden dispatch\n---\nTEMPLATE_EXPANSION_FORBIDDEN\n');
-  writeFileSync(join(root, 'agent/skills/continuation/SKILL.md'), '---\nname: continuation\ndescription: CURRENT_SKILL_NORMAL_RESOURCE\n---\nTask-local read-only policy.\n');
   const requests = [], counts = { old: 0, current: 0 };
+  const budget = { hits: 0, max: 3 };
   let restarting = false, serverFailure, aborted = 0, controller, timer;
   const server = createServer(async (req, res) => {
     try {
+      const bytes = await readFixtureBody(req, budget);
       assert(!restarting, 'Fresh inspection host must make ZERO model calls');
       assert.equal(req.method, 'POST'); assert.equal(req.url, '/v1/chat/completions'); assert.equal(req.headers.authorization, 'Bearer dummy-continuation-only');
-      let bytes = ''; for await (const chunk of req) { bytes += chunk; assert(bytes.length <= 524288); }
       const input = JSON.parse(bytes); assert(['old', 'current'].includes(input.model)); assert.equal(input.stream, true);
       const turn = ++counts[input.model]; assert(turn <= (input.model === 'old' ? 2 : 1)); requests.push({ model: input.model, turn }); assert(requests.length <= 3);
       assert.deepEqual((input.tools ?? []).map(tool => tool.function.name), ['read']);
@@ -387,7 +348,7 @@ async function runMode(mode) {
   async function host(restart) {
     const phaseDir = join(root, restart ? 'restart' : 'live');
     writeFileSync(join(phaseDir, 'smoke.ts'), extensionSource(root, phaseDir, restart)); writeFileSync(join(phaseDir, 'pty-controller.py'), pythonSource);
-    controller = spawn('python3', [join(phaseDir, 'pty-controller.py'), root, phaseDir, process.execPath, cli, mode, restart ? '1' : '0'], { env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    controller = spawnOwnedController('/usr/bin/python3', [join(phaseDir, 'pty-controller.py'), root, phaseDir, process.execPath, cli, mode, restart ? '1' : '0'], root, 105000);
     let diagnostics = '';
     for (const stream of [controller.stdout, controller.stderr]) stream.on('data', chunk => { diagnostics = (diagnostics + chunk).slice(-16000); });
     const exit = await new Promise((resolve, reject) => {
@@ -399,9 +360,19 @@ async function runMode(mode) {
     const pty = load('pty-result.json'), host = load('result.json'); writeFileSync(join(phaseDir, 'diagnostics.txt'), diagnostics);
     assert.equal(exit.code, 0, JSON.stringify({ exit, pty, host, serverFailure, diagnostics })); assert.equal(pty.ok, true); assert.equal(host.ok, true, JSON.stringify(host));
     assert(!existsSync(join(root, 'network-refused.txt'))); assert(!serverFailure, serverFailure); assert.equal(aborted, 0);
+    await settleOwnedController(controller);
     return { ...host, hostPid: pty.hostPid, terminalBytes: pty.bytes, sizes: pty.sizes, hostExit: pty.hostExit };
   }
   try {
+    assertAncestorIsolation(root); cleanHostEnvironment(root);
+    for (const path of ['agent/extensions', 'agent/prompts', 'agent/skills/continuation', 'work/.pi', 'live', 'restart']) mkdirSync(join(root, path), { recursive: true });
+    writeFileSync(join(root, 'work/input.txt'), 'PTY_INHERITED_TOOL_RESULT\n');
+    writeFileSync(join(root, 'agent/auth.json'), '{}');
+    const settings = { defaultProvider: 'fixture', defaultModel: 'current', packages: [], extensions: ['-builtin:mcp', '-builtin:llama.cpp', '-builtin:codemode', '-builtin:tool-search'], skills: [], prompts: [], themes: [], noExtensions: false, noSkills: false, noPromptTemplates: false, noThemes: true, defaultProjectTrust: 'never', enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } };
+    writeFileSync(join(root, 'agent/settings.json'), JSON.stringify(settings)); writeFileSync(join(root, 'work/.pi/settings.json'), JSON.stringify(settings));
+    writeFileSync(join(root, 'agent/extensions/observer.ts'), observerSource(root));
+    writeFileSync(join(root, 'agent/prompts/never-expand.md'), '---\ndescription: forbidden dispatch\n---\nTEMPLATE_EXPANSION_FORBIDDEN\n');
+    writeFileSync(join(root, 'agent/skills/continuation/SKILL.md'), '---\nname: continuation\ndescription: CURRENT_SKILL_NORMAL_RESOURCE\n---\nTask-local read-only policy.\n');
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const origin = 'http://127.0.0.1:' + server.address().port;
     writeFileSync(join(root, 'agent/models.json'), JSON.stringify({ providers: { fixture: { api: 'openai-completions', baseUrl: origin + '/v1', apiKey: 'dummy-continuation-only', models: ['old', 'current'].map(id => ({ id, reasoning: false, input: ['text'], contextWindow: 32768, maxTokens: 256 })) } } }));
@@ -409,22 +380,20 @@ async function runMode(mode) {
     const live = await host(false); assert.deepEqual(counts, { old: 2, current: 1 });
     restarting = true;
     const before = requests.length, restart = await host(true); assert.equal(requests.length, before, 'Genuinely fresh restart inspection makes ZERO model requests');
+    assert.equal(budget.hits, 3);
     assert.notEqual(live.hostPid, restart.hostPid); assert.deepEqual(live.exactKey, restart.exactKey);
     const result = { mode, localhostRequests: requests.length, restartRequests: 0, aborted, live, restart };
     results.push(result); writeFileSync(join(root, 'checks.json'), JSON.stringify(result, null, 2));
     console.log('PASS actual Pi ' + mode + ' continuation/restart PTYs: explicit review/cancel/confirm, one fresh selected run, literal task/current resources, lineage, original bytes; zero restart calls');
   } finally {
     clearTimeout(timer);
-    if (controller && controller.exitCode === null && controller.signalCode === null) {
-      controller.kill('SIGTERM');
-      await new Promise(resolve => { const end = setTimeout(() => { controller.kill('SIGKILL'); resolve(); }, 5000); controller.once('close', () => { clearTimeout(end); resolve(); }); });
-    }
-    server.closeAllConnections(); if (server.listening) await new Promise(resolve => server.close(resolve));
+    try { await settleOwnedController(controller); }
+    finally { server.closeAllConnections(); if (server.listening) await new Promise(resolve => server.close(resolve)); }
     // Preserve bounded dummy terminal/check diagnostics, not credentials/history/code.
-    const keep = new Set(['live', 'restart', 'checks.json', 'server-error.txt', 'network-refused.txt']);
-    for (const leaf of readdirSync(root)) if (!keep.has(leaf)) rmSync(join(root, leaf), { recursive: true, force: true });
+    const keep = new Set(['live', 'restart', 'checks.json', 'server-error.txt', 'network-refused.txt', 'supervisor-result.json']);
+    for (const leaf of existsSync(root) ? readdirSync(root) : []) if (!keep.has(leaf)) rmSync(join(root, leaf), { recursive: true, force: true });
     const hostKeep = new Set(['terminal.ansi', 'terminal.txt', 'pty-result.json', 'result.json', 'diagnostics.txt', 'observation-error.json']);
-    for (const name of ['live', 'restart']) for (const leaf of readdirSync(join(root, name))) if (!hostKeep.has(leaf)) rmSync(join(root, name, leaf), { recursive: true, force: true });
+    for (const name of ['live', 'restart']) for (const leaf of existsSync(join(root, name)) ? readdirSync(join(root, name)) : []) if (!hostKeep.has(leaf)) rmSync(join(root, name, leaf), { recursive: true, force: true });
   }
 }
 try {

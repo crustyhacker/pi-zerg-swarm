@@ -1,5 +1,5 @@
 import type { ZergManagementTargetKind, ZergManagementUiState, ZergState } from '../types.js';
-import { fitRawLine, renderPane, statusGlyph, styleText, type UiThemeLike, visibleSlice } from './components.js';
+import { fitRawLine, renderPane, sanitizeUiText, statusGlyph, styleText, type UiThemeLike, visibleSlice } from './components.js';
 import { isExpanded, setExpanded, setSelectedTarget, toggleExpanded } from './state.js';
 
 export interface ManagementTreeRow {
@@ -139,7 +139,7 @@ export function renderTreePane(state: ZergState, uiState: ZergManagementUiState,
     const mark = confirmed ? styleText(theme, 'success', '●') : ' ';
     const glyph = styleText(theme, statusColor(row.status), statusGlyph(row.status));
     const prefix = `${cursor} ${depthMarker}${branch} ${mark}${glyph}`;
-    return fitRawLine(`${prefix} ${row.label}`, width - 4);
+    return fitRawLine(`${prefix} ${sanitizeUiText(row.label)}`, width - 4);
   });
   if (rows.length === 0) {
     rendered.push('No agents, teams, or tasks.');

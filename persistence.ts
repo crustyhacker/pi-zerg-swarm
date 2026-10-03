@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { recoverSessionMessages } from './session-messages.js';
 import {
   appendZergLogRecord,
@@ -25,6 +26,8 @@ import {
 
 const DEFAULT_PERSISTENCE_RELATIVE_PATH = '.pi/zerg-swarm/v1/state.json';
 const ZERG_CONTROL_EXTENSION_KEY = 'zergControl';
+const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const SNAPSHOT_SIZE_ERROR = 'Zerg persistence snapshot exceeds the 64 MiB UTF-8 byte limit.';
 const ZERG_PERSISTENCE_EXTENSION_KEY = 'zergPersistence';
 
 interface ZergPersistenceEnvelope {
@@ -81,16 +84,51 @@ function hydrateZergState(
   now: (() => Date) | undefined,
 ): { state?: ZergState; info: ZergPersistenceInfo } {
   const baseInfo: ZergPersistenceInfo = { enabled: true, snapshotFile, writerSessionId };
-  if (!existsSync(snapshotFile)) {
-    return { info: baseInfo };
-  }
-
   try {
-    const envelope = JSON.parse(readFileSync(snapshotFile, 'utf8')) as Partial<ZergPersistenceEnvelope>;
+    // Follow legitimate final symlinks, including normal missing/dangling behavior.
+    // This is file admission, not ancestor confinement or a filesystem sandbox.
+    const expected = statSync(snapshotFile, { throwIfNoEntry: false });
+    if (!expected) return { info: baseInfo };
+    if (!expected.isFile()) throw new Error('Zerg persistence snapshot must be a regular file.');
+    if (expected.size > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_SIZE_ERROR);
+    // Nonblocking admission prevents a file/target swapped for a FIFO from hanging open.
+    const descriptor = openSync(snapshotFile, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    let envelope: Partial<ZergPersistenceEnvelope>;
+    try {
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || opened.dev !== expected.dev || opened.ino !== expected.ino) {
+        throw new Error('Zerg persistence snapshot changed before reading.');
+      }
+      if (opened.size > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_SIZE_ERROR);
+      // Size admission alone cannot bound a file that grows during reading.
+      // Decode incrementally with one fixed buffer, reading at most limit + 1.
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      const decoder = new StringDecoder('utf8');
+      const text: string[] = [];
+      let bytes = 0;
+      for (;;) {
+        const count = readSync(descriptor, chunk, 0, Math.min(chunk.length, MAX_SNAPSHOT_BYTES - bytes + 1), null);
+        if (count === 0) break;
+        bytes += count;
+        if (bytes > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_SIZE_ERROR);
+        text.push(decoder.write(chunk.subarray(0, count)));
+      }
+      const finished = fstatSync(descriptor);
+      if (!finished.isFile() || finished.dev !== opened.dev || finished.ino !== opened.ino) {
+        throw new Error('Zerg persistence snapshot changed while reading.');
+      }
+      if (finished.size > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_SIZE_ERROR);
+      text.push(decoder.end());
+      envelope = JSON.parse(text.join('')) as Partial<ZergPersistenceEnvelope>;
+    } finally {
+      closeSync(descriptor);
+    }
     if (envelope.version !== 1 || !isPlainRecord(envelope.state)) {
       return { info: { ...baseInfo, lastLoadError: 'Unsupported zerg persistence snapshot format.' } };
     }
     const loaded = createZergState(envelope.state as Partial<ZergState>);
+    // Recovery may retain saved readOnly, but must never revoke current authority.
+    if (current.mode.readOnly === true) loaded.mode.readOnly = true;
     const recovered = recoverZergStateAfterRestart(loaded, {
       now,
       previousWriterSessionId: typeof envelope.writerSessionId === 'string' ? envelope.writerSessionId : undefined,
@@ -125,10 +163,29 @@ function saveZergStateSnapshot(
     savedAt,
     state: sanitizeJsonValue(stateToSave) as ZergState,
   };
+  const serialized = `${JSON.stringify(envelope, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_SIZE_ERROR);
   mkdirSync(dirname(snapshotFile), { recursive: true });
   const tempFile = `${snapshotFile}.${process.pid}.${Date.now().toString(36)}.tmp`;
-  writeFileSync(tempFile, `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
-  renameSync(tempFile, snapshotFile);
+  // Exclusive creation refuses pre-existing files/symlinks. Do not clean up a
+  // collision: only a successful open gives this save ownership of the temp.
+  let descriptor: number | undefined = openSync(tempFile, 'wx', 0o600);
+  try {
+    writeFileSync(descriptor, serialized, 'utf8');
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(tempFile, snapshotFile);
+  } catch (error) {
+    const failures: unknown[] = [error];
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch (cleanupError) { failures.push(cleanupError); }
+    }
+    try { unlinkSync(tempFile); } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException)?.code !== 'ENOENT') failures.push(cleanupError);
+    }
+    if (failures.length > 1) throw new AggregateError(failures, 'Zerg snapshot save failed and temporary-file cleanup failed.');
+    throw error;
+  }
   return info;
 }
 

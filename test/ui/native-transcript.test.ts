@@ -52,19 +52,29 @@ test('finalized tool cards retire beyond 64 sequential calls and persisted redac
   source.append(message('user', null, 'user', 'tools'));
   const release = service.register(reference, source.facade); const view = await service.open(reference);
   let parent = 'user';
-  for (let i = 0; i < 70; i++) {
+  for (let i = 0; i < 140; i++) {
     const id = `call-${i}`, callEntry = `a-${i}`, resultEntry = `r-${i}`;
-    source.append(message(callEntry, parent, 'assistant', [{ type: 'toolCall', id, name: 'read', arguments: { path: '/fixture' } }]));
+    const call = { role: 'assistant', content: [{ type: 'toolCall', id, name: 'read', arguments: { path: '/fixture' } }] };
+    source.emit({ type: 'message_start', message: call });
+    source.emit({ type: 'message_end', message: call });
+    source.append({ type: 'message', id: callEntry, parentId: parent, message: call });
     source.emit({ type: 'tool_execution_start', toolCallId: id, toolName: 'read', args: { path: '/fixture' } });
     source.emit({ type: 'tool_execution_end', toolCallId: id, toolName: 'read', result: { content: [{ type: 'text', text: 'UNREDACTED' }] } });
     source.append(message(resultEntry, callEntry, 'toolResult', [{ type: 'text', text: `redacted-${i}` }], { toolCallId: id, toolName: 'read' }));
     source.emit({ type: 'entry_appended' }); await Promise.resolve(); parent = resultEntry;
     source.emit({ type: 'tool_execution_update', toolCallId: id, toolName: 'read', partialResult: { content: [{ type: 'text', text: 'UNREDACTED_LATE' }] } });
   }
+  assert(!view.getSnapshot().blocks.some((block) => block.toolCallId === 'call-0'), 'first call aged out of retained history');
+  const reads = source.reads();
+  for (const type of ['tool_execution_start', 'tool_execution_update', 'tool_execution_end']) {
+    source.emit({ type, toolCallId: 'call-0', toolName: 'read', partialResult: { content: 'UNREDACTED_RETIRED' }, result: { content: 'UNREDACTED_RETIRED' } });
+    assert(!view.getSnapshot().blocks.some((block) => block.toolCallId === 'call-0'));
+  }
+  assert.equal(source.reads(), reads, 'delayed callbacks do not scan arbitrary SDK history');
   const snapshot = view.getSnapshot();
-  assert(snapshot.blocks.some((block) => block.toolCallId === 'call-69' && block.resultText === 'redacted-69'));
+  assert(snapshot.blocks.some((block) => block.toolCallId === 'call-139' && block.resultText === 'redacted-139'));
   assert.doesNotMatch(JSON.stringify(snapshot), /UNREDACTED/);
-  assert.equal(snapshot.blocks.filter((block) => block.toolCallId === 'call-69').length, 1);
+  assert.equal(snapshot.blocks.filter((block) => block.toolCallId === 'call-139').length, 1);
   release(); view.dispose(); service.shutdown();
 });
 
@@ -86,7 +96,8 @@ test('oversized entries preserve default leaf stubs and bounded final/partial/to
   const release = service.register(reference, source.facade); const view = await service.open(reference);
   let snapshot = view.getSnapshot(); assert.equal(snapshot.inspectedLeafId, 'huge'); assert(snapshot.blocks.length > 0); assert(snapshot.truncated);
   assert(JSON.stringify(snapshot).length * 2 < 256 * 1024);
-  for (let i = 0; i < 80; i++) source.emit({ type: 'tool_execution_start', toolCallId: `${i}`, parentToolCallId: 'parent', toolName: 'tool', args: { huge: 'x'.repeat(100000) } });
+  source.emit({ type: 'message_start', message: { role: 'assistant', content: Array.from({ length: 80 }, (_, i) => ({ type: 'toolCall', id: `${i}`, name: 'tool', arguments: {} })) } });
+  for (let i = 0; i < 80; i++) source.emit({ type: 'tool_execution_start', toolCallId: `${i}`, toolName: 'tool', args: { huge: 'x'.repeat(100000) } });
   source.emit({ type: 'message_update', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(1000000) }] } });
   snapshot = view.getSnapshot(); assert(snapshot.blocks.length <= 200); assert(JSON.stringify(snapshot).length * 2 < 256 * 1024); assert(snapshot.truncated);
   release(); view.dispose(); service.shutdown();
@@ -205,6 +216,7 @@ test('already-aborted opens consume no viewer slots; closed services return iner
 
 test('transient tool clipping is explicit rather than silently displaying a complete result', async () => {
   const reference = ref(), source = fake(), service = createNativeTranscriptService({ getReferences: () => [reference] });
+  source.append(message('long-call', null, 'assistant', [{ type: 'toolCall', id: 'long', name: 'read', arguments: { path: 'a'.repeat(500) } }]));
   const release = service.register(reference, source.facade), view = await service.open(reference);
   source.emit({ type: 'tool_execution_update', toolCallId: 'long', toolName: 'read', args: { path: 'a'.repeat(500) }, partialResult: { content: [{ type: 'text', text: 'x'.repeat(1024) }] } });
   const snapshot = view.getSnapshot();
@@ -216,3 +228,76 @@ test('transient tool clipping is explicit rather than silently displaying a comp
   assert.equal(view.getSnapshot().truncated, true);
   release(); view.dispose(); service.shutdown();
 });
+
+
+test('saved opens reserve viewer capacity before await and disposal releases exactly one slot', async () => savedFixture(async ({ ref, service }) => {
+  const held = [];
+  for (let i = 0; i < 31; i++) held.push(await service.open({ ...ref, memberRunId: `missing-${i}` }));
+  const first = service.open(ref), second = service.open(ref);
+  const rejected = await second;
+  assert.match(rejected.getSnapshot().diagnostic!, /handle limit/);
+  const admitted = await first;
+  assert.equal(admitted.getSnapshot().source, 'saved');
+  rejected.dispose();
+  const stillFull = await service.open(ref);
+  assert.match(stillFull.getSnapshot().diagnostic!, /handle limit/, 'inert rejection did not free an admitted slot');
+  admitted.dispose(); admitted.dispose();
+  const replacement = await service.open(ref); assert.equal(replacement.getSnapshot().source, 'saved'); replacement.dispose();
+  for (const view of held) view.dispose();
+}));
+
+test('pending saved reservation is cleaned on abort/shutdown and failed loads remain disposable', async () => savedFixture(async ({ ref, service }) => {
+  const controller = new AbortController();
+  const pending = service.open(ref, { signal: controller.signal }); controller.abort();
+  const aborted = await pending; assert.equal(aborted.getSnapshot().source, 'unavailable');
+  const held = [];
+  for (let i = 0; i < 32; i++) held.push(await service.open({ ...ref, memberRunId: `missing-${i}` }));
+  assert(held.every((view) => /Exact native/.test(view.getSnapshot().diagnostic!)), 'abort freed reserved slot');
+  for (const view of held) view.dispose();
+  await rm(ref.sessionFile);
+  const failed = await service.open(ref); assert.equal(failed.getSnapshot().source, 'unavailable'); failed.dispose();
+  const source = fake(); service.register(ref, source.facade);
+  const live = await service.open(ref); assert.equal(live.getSnapshot().source, 'live'); live.dispose();
+  service.shutdown(); assert.equal(source.listeners.size, 0);
+}));
+
+test('shutdown during saved load cannot attach a completed viewer', async () => savedFixture(async ({ ref, service }) => {
+  const pending = service.open(ref); service.shutdown();
+  const view = await pending; assert.equal(view.getSnapshot().source, 'unavailable');
+  view.subscribe(() => assert.fail('shutdown callback'))(); view.dispose();
+}));
+
+test('current pending calls admit late-attach updates, live ends and nested starts without admitting unknown callbacks', async () => {
+  const reference = ref(), source = fake();
+  source.append(message('call', null, 'assistant', [{ type: 'toolCall', id: 'current', name: 'read', arguments: { path: '/fixture' } }]));
+  const service = createNativeTranscriptService({ getReferences: () => [reference] });
+  const release = service.register(reference, source.facade), view = await service.open(reference);
+  source.emit({ type: 'tool_execution_update', toolCallId: 'unknown', partialResult: { content: 'UNKNOWN' } });
+  source.emit({ type: 'tool_execution_update', toolCallId: 'current', toolName: 'read', partialResult: { content: 'GENUINE' } });
+  assert.equal(view.getSnapshot().blocks.find((block) => block.toolCallId === 'current')?.resultText, 'GENUINE');
+  source.emit({ type: 'tool_execution_start', toolCallId: 'child', parentToolCallId: 'current', toolName: 'nested' });
+  source.emit({ type: 'tool_execution_update', toolCallId: 'child', partialResult: { content: 'CHILD' } });
+  assert.equal(view.getSnapshot().blocks.find((block) => block.toolCallId === 'child')?.parentToolCallId, 'current');
+  source.emit({ type: 'tool_execution_end', toolCallId: 'child', result: { content: 'CHILD_FINAL' } });
+  source.emit({ type: 'tool_execution_end', toolCallId: 'current', result: { content: 'FINAL' } });
+  source.emit({ type: 'tool_execution_update', toolCallId: 'current', partialResult: { content: 'STALE' } });
+  assert.equal(view.getSnapshot().blocks.find((block) => block.toolCallId === 'current')?.resultText, 'FINAL');
+  assert.doesNotMatch(JSON.stringify(view.getSnapshot()), /UNKNOWN|STALE/);
+  source.append(message('result', 'call', 'toolResult', 'REDACTED', { toolCallId: 'current', toolName: 'read' }));
+  source.emit({ type: 'entry_appended' }); await Promise.resolve();
+  assert.equal(view.getSnapshot().blocks.find((block) => block.toolCallId === 'current')?.resultText, 'REDACTED');
+  assert.equal(view.getSnapshot({ leafId: 'call' }).blocks.find((block) => block.toolCallId === 'current')?.status, 'pending');
+  release(); view.dispose(); service.shutdown();
+});
+
+
+test('saved load reference drift releases its disposable reservation without exposing history', async () => savedFixture(async ({ ref, service }) => {
+  const pending = service.open(ref); ref.sessionFile += '.changed';
+  const view = await pending;
+  assert.equal(view.getSnapshot().source, 'unavailable'); assert.match(view.getSnapshot().diagnostic!, /reference changed/);
+  view.dispose(); view.dispose();
+  const held = [];
+  for (let i = 0; i < 32; i++) held.push(await service.open({ ...ref, memberRunId: `missing-${i}` }));
+  assert(held.every((handle) => /Exact native/.test(handle.getSnapshot().diagnostic!)));
+  for (const handle of held) handle.dispose();
+}));

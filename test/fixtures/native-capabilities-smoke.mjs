@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Dedicated subprocess: guard/empty environment installed before SDK resources.
+installFixtureSafety({ name: 'capabilities', maxRequests: 16 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -45,6 +48,7 @@ mkdirSync(join(dir, '.pi', 'extensions'), { recursive: true });
 writeFileSync(join(dir, '.pi', 'extensions', 'count-session-start.js'), "export default function(pi) { globalThis.__zergCapabilityFactories = (globalThis.__zergCapabilityFactories || 0) + 1; pi.on('session_start', () => { globalThis.__zergCapabilitySessionStarts = (globalThis.__zergCapabilitySessionStarts || 0) + 1; }); }");
 
 const deadline = setTimeout(() => { console.error('Global capabilities smoke timeout'); process.exit(1); }, 60_000);
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(await import('@earendil-works/pi-coding-agent'));
 const zerg = await import(new URL('../../index.ts', import.meta.url).href);
 const controls = [];
 let registration;

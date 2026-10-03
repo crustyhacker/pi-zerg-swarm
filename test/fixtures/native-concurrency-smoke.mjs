@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Dedicated subprocess: guard/empty environment installed before SDK resources.
+installFixtureSafety({ name: 'concurrency', maxRequests: 64 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -69,6 +72,7 @@ function eventBus() {
   };
 }
 const deadline = setTimeout(() => { console.error('Global concurrency smoke timeout'); process.exit(1); }, 60000);
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(await import('@earendil-works/pi-coding-agent'));
 const zerg = await import(new URL('../../index.ts', import.meta.url).href);
 const control = zerg.createZergControl();
 

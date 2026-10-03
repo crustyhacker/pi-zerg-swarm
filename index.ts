@@ -35,7 +35,7 @@ export interface ZergCommandHandlerOptions {
   nativeContinuationService?: NativeContinuationService;
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager };
+type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -120,8 +120,33 @@ type PiNativeActiveRun = {
 
 type PiNativeActiveRunRegistry = Map<string, PiNativeActiveRun>;
 const nativeContinuationAdmissions = new WeakMap<ZergSubagentLaunchRequest, NativeContinuationAdmission>();
+// Private per-call authority survives the bridge acknowledgement delay without
+// changing the public launch contract or retaining completed requests globally.
+const launchAuthorities = new WeakMap<ZergSubagentLaunchRequest, { signal?: AbortSignal; isOwnerDisposed?: () => boolean }>();
 
+function publishedLaunchBlock(container: ZergStateContainer, request: ZergSubagentLaunchRequest, disposed = false): string | undefined {
+  const authority = launchAuthorities.get(request);
+  if (disposed || authority?.isOwnerDisposed?.()) return 'adapter launch blocked: owner disposed';
+  if (authority?.signal?.aborted) return 'adapter launch cancelled: caller signal aborted';
+  const state = container.read();
+  if (state.mode.readOnly || state.lifecycle === 'disposed') return 'adapter launch blocked by current read-only or disposed authority';
+  const run = request.runId ? getSubagentRunSnapshot(state, request.runId) : undefined;
+  const task = request.taskId ? state.tasks[request.taskId] : undefined;
+  if ((request.runId && (!run || isTerminalRunSnapshot(run) || run.substate === 'cancelling')) || (request.taskId && (!task || task.status === 'cancelled' || task.substate === 'cancelling'))) return 'adapter launch cancelled or no longer current after publication';
+  return undefined;
+}
 
+function rejectDelayedNativeLaunch(container: ZergStateContainer, options: RuntimeCommandOptions, request: ZergSubagentLaunchRequest, reason: string): void {
+  const state = container.read();
+  const run = request.runId ? getSubagentRunSnapshot(state, request.runId) : undefined;
+  if (!run || isTerminalRunSnapshot(run)) return;
+  const cancelled = launchAuthorities.get(request)?.signal?.aborted || run.substate === 'cancelling' || state.tasks[request.taskId ?? '']?.status === 'cancelled';
+  const status = cancelled ? 'cancelled' : 'failed';
+  const now = (options.now ?? (() => new Date()))().toISOString();
+  const rejected = applyRuntimeTransition(state, { entity: 'agent', action: 'fail', id: run.runId, kind: 'subagent', status, substate: status, substateReason: reason, activity: reason }, { now: () => new Date(now) });
+  container.replace(updateRunTaskLifecycle(rejected, request.taskId, status, status, reason, now));
+  options.persistenceManager?.save(container.read(), options.now);
+}
 interface NormalizedZergCommandInput {
   topic: string;
   payload: string;
@@ -175,13 +200,15 @@ export function registerZergSwarmExtension(
     read: () => stateContainer.read(),
     snapshot: () => stateContainer.snapshot(),
     replace: (nextState) => {
-      const snapshot = stateContainer.replace(nextState);
+      stateContainer.replace(nextState);
+      const snapshot = stateContainer.snapshot();
       syncSharedStateFromContainer();
       persistenceManager?.save(snapshot, options.now);
       return snapshot;
     },
     update: (nextState, patchOptions) => {
-      const snapshot = stateContainer.update(nextState, patchOptions);
+      stateContainer.update(nextState, patchOptions);
+      const snapshot = stateContainer.snapshot();
       syncSharedStateFromContainer();
       persistenceManager?.save(snapshot, options.now);
       return snapshot;
@@ -192,13 +219,13 @@ export function registerZergSwarmExtension(
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(syncedStateContainer, persistenceManager, options.now);
   const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
-  if (typeof context.on === 'function') {
-    const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownSessionMessages(sessionMessageService); shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
-    if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
-  }
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
 
   try {
+    if (typeof context.on === 'function') {
+      const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownSessionMessages(sessionMessageService); shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
+      if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
+    }
     const installedPatch = installInternalPatch(context, syncedStateContainer);
     patch = installedPatch;
     const handler = createPiZergCommandHandler(syncedStateContainer, { ...runtimeOptions, subagentAdapter } as RuntimeCommandOptions);
@@ -245,6 +272,11 @@ export function registerZergSwarmExtension(
     }
     shutdownSessionMessages(sessionMessageService);
     shutdownNativeTranscript(nativeTranscriptService);
+    try {
+      subagentAdapter.dispose?.();
+    } catch {
+      // Preserve the original startup error, even if adapter rollback fails.
+    }
     throw error;
   }
 
@@ -365,12 +397,14 @@ export function createZergControl(
       read: () => baseContainer.read(),
       snapshot: () => baseContainer.snapshot(),
       replace: (nextState) => {
-        const snapshot = baseContainer.replace(nextState);
+        baseContainer.replace(nextState);
+        const snapshot = baseContainer.snapshot();
         persistenceManager.save(snapshot, options.now);
         return snapshot;
       },
       update: (nextState, patchOptions) => {
-        const snapshot = baseContainer.update(nextState, patchOptions);
+        baseContainer.update(nextState, patchOptions);
+        const snapshot = baseContainer.snapshot();
         persistenceManager.save(snapshot, options.now);
         return snapshot;
       },
@@ -379,7 +413,8 @@ export function createZergControl(
     : baseContainer;
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(container) });
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(container, persistenceManager, options.now);
-  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
+  let disposed = false;
+  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService, isOwnerDisposed: () => disposed } as RuntimeCommandOptions;
   const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
   runtimeOptions.subagentAdapter = adapter;
 
@@ -391,6 +426,8 @@ export function createZergControl(
       return container.snapshot();
     },
     dispose() {
+      if (disposed) return;
+      disposed = true;
       if (!options.sessionMessageService) shutdownSessionMessages(sessionMessageService);
       if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService);
       if (!options.subagentAdapter) {
@@ -503,7 +540,7 @@ async function executeZergControlAction(
         if (!action.agent || !action.task) return controlError(action.action, 'invalid_request', 'run requires agent and task.', container.snapshot().revision);
         const parsedConcurrency = action.concurrency === undefined ? undefined : parsePositiveSafeIntegerOption(action.concurrency, 'concurrency');
         if (parsedConcurrency && !parsedConcurrency.ok) return controlError(action.action, 'invalid_request', parsedConcurrency.output, container.snapshot().revision, { agentId: action.agent });
-        if (!action.background && signal?.aborted) return controlError(action.action, 'run_cancelled', 'run cancelled before launch.', container.snapshot().revision, { agentId: action.agent });
+        if (signal?.aborted) return controlError(action.action, 'run_cancelled', 'run cancelled before launch.', container.snapshot().revision, { agentId: action.agent });
         const result = dispatchRunRequest(container, {
           agent: action.agent,
           task: action.task,
@@ -514,7 +551,7 @@ async function executeZergControlAction(
           ...(action.model ? { model: action.model } : {}),
           ...(action.fallbackModels?.length ? { fallbackModels: action.fallbackModels } : {}),
           ...(action.maxTurns ? { maxTurns: action.maxTurns } : {}),
-        }, options);
+        }, options, signal);
         if (!result.ok) return controlError(action.action, 'launch_failed', result.output, container.snapshot().revision, { runId: result.runId, taskId: result.taskId });
         let abortListener: (() => void) | undefined;
         if (result.runId && !action.background && signal) {
@@ -618,6 +655,8 @@ async function executeZergControlAction(
         const snapshot = container.snapshot();
         if (!action.targetId || !action.body?.trim()) return controlError(action.action, 'invalid_request', 'message requires targetId and body.', snapshot.revision, { runId: action.runId });
         if (action.mode !== undefined && !isZergOperatorMessageMode(action.mode)) return controlError(action.action, 'invalid_request', `Invalid message mode: ${String(action.mode)}. Expected steer or followUp.`, snapshot.revision, { runId: action.runId, agentId: action.targetId });
+        if (container.read().mode.readOnly) return controlError(action.action, 'read_only', 'Read-only control blocks messaging.', container.read().revision, { runId: action.runId, agentId: action.targetId });
+        if (signal?.aborted) return controlError(action.action, 'request_cancelled', 'Message request cancelled before transport.', container.read().revision, { runId: action.runId, agentId: action.targetId });
         const result = await options.subagentAdapter?.sendMessage?.(action.targetId, action.body, action.runId, action.mode ?? 'steer');
         if (!result) return controlError(action.action, 'transport_unavailable', 'Current adapter does not support delivered message transport.', snapshot.revision, { runId: action.runId, agentId: action.targetId });
         const nextSnapshot = container.snapshot();
@@ -1440,6 +1479,7 @@ function dispatchRunRequest(
   stateOrReader: ZergStateSource,
   requestInput: ZergSubagentLaunchRequest,
   options: RuntimeCommandOptions,
+  signal?: AbortSignal,
 ): ZergCommandResult {
   const container = getWritableStateContainer(stateOrReader);
   if (!container) {
@@ -1612,12 +1652,21 @@ function dispatchRunRequest(
     data: { launchMode, background: requestInput.background, concurrency: resolvedConcurrency, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
   });
 
-  const launchReadyState = container.replace(withLaunchLog);
+  launchAuthorities.set(request, { signal, isOwnerDisposed: options.isOwnerDisposed });
+  container.replace(withLaunchLog);
   if (options.syncSharedState) {
-    replaceSharedZergState(launchReadyState);
+    replaceSharedZergState(container.snapshot());
   }
 
-  const result = adapter.launch(request);
+  const launchBlocked = publishedLaunchBlock(container, request);
+  let launchThrew = false;
+  let result: ReturnType<ZergSubagentControlAdapter['launch']>;
+  try {
+    result = launchBlocked ? { ok: false, message: launchBlocked } : adapter.launch(request);
+  } catch (error) {
+    launchThrew = true;
+    result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
 
   if (result.ok) {
     const successMessage = result.message || `adapter launch accepted ${runId}`;
@@ -1643,36 +1692,43 @@ function dispatchRunRequest(
     };
   }
 
-  const withFailure = upsertTask(
-    applyRuntimeTransition(container.read(), {
+  const latest = container.read();
+  const latestRun = getSubagentRunSnapshot(latest, runId);
+  const cancelled = latestRun?.status === 'cancelled' || latestRun?.substate === 'cancelling' || latestRun?.substate === 'cancelled' || latest.tasks[taskId]?.status === 'cancelled' || latest.tasks[taskId]?.substate === 'cancelling' || signal?.aborted;
+  const failureStatus = cancelled ? 'cancelled' : launchThrew ? 'needs-attention' : 'failed';
+  const failureSubstate = launchThrew && !cancelled ? 'waiting-input' : cancelled ? 'cancelled' : 'failed';
+  const failureReason = launchThrew ? `Adapter launch threw; execution may have started. Manual inspection required; no automatic retry: ${result.message}` : result.message || 'adapter launch failed';
+  const withFailure = latestRun && isTerminalRunSnapshot(latestRun) ? latest : upsertTask(
+    applyRuntimeTransition(latest, {
       entity: 'agent',
-      action: 'fail',
+      action: launchThrew && !cancelled ? 'progress' : 'fail',
       id: runId,
       label: resolvedAgentLabel,
       kind: 'subagent',
-      activity: result.message || 'adapter launch failed',
-      substate: 'failed',
-      substateReason: result.message || 'adapter launch failed',
+      status: failureStatus,
+      activity: failureReason,
+      substate: failureSubstate,
+      substateReason: failureReason,
     }, { now: () => new Date(nowTimestamp) }),
     {
       id: taskId,
       title: requestInput.task,
-      status: 'failed',
+      status: failureStatus,
       ownerAgentId: runId,
       teamId: resolvedTeam?.id,
       updatedAt: nowTimestamp,
-      substate: 'failed',
-      substateReason: result.message || 'adapter launch failed',
+      substate: failureSubstate,
+      substateReason: failureReason,
       substateUpdatedAt: nowTimestamp,
       metadata: launchMetadata,
     },
   );
 
-  const failedState = container.replace(appendLogToState(withFailure, options, {
+  container.replace(appendLogToState(withFailure, options, {
     source: 'adapter',
     level: 'error',
     kind: 'error',
-    message: result.message || 'adapter launch failed',
+    message: failureReason,
     runId,
     agentId: resolvedAgentId,
     teamId: resolvedTeam?.id,
@@ -1680,14 +1736,14 @@ function dispatchRunRequest(
     data: { launchMode, concurrency: resolvedConcurrency, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
   }));
   if (options.syncSharedState) {
-    replaceSharedZergState(failedState);
+    replaceSharedZergState(container.snapshot());
   }
 
   return {
     ok: false,
     runId,
     taskId,
-    output: appendSpawnIdentifiers(appendSpawnLaunchMode(result.message, launchMode), runId, taskId),
+    output: appendSpawnIdentifiers(appendSpawnLaunchMode(failureReason, launchMode), runId, taskId),
   };
 }
 
@@ -2896,16 +2952,23 @@ function requestPiNativeAbort(runId: string, activeRuns: PiNativeActiveRunRegist
   }
   activeRun.cancelRequested = true;
   let abortCount = 0;
+  let abortFaultCount = 0;
   for (const session of activeRun.sessions) {
     if (typeof session.abort === 'function') {
-      abortCount += 1;
-      void Promise.resolve(session.abort()).catch(() => undefined);
+      try {
+        const aborted = session.abort();
+        abortCount += 1;
+        void Promise.resolve(aborted).catch(() => undefined);
+      } catch {
+        // A faulty session must not prevent cancellation of its siblings.
+        abortFaultCount += 1;
+      }
     }
   }
 
   return {
     ok: true,
-    message: abortCount > 0 ? `interrupt requested for ${runId}; abort signalled to ${abortCount} native session(s)` : `interrupt requested for ${runId}; native session is still starting`,
+    message: (abortCount > 0 ? `interrupt requested for ${runId}; abort signalled to ${abortCount} native session(s)` : `interrupt requested for ${runId}; native session is still starting`) + (abortFaultCount ? `; ${abortFaultCount} native abort callback(s) threw` : ''),
     activeRun,
   };
 }
@@ -3351,7 +3414,8 @@ function createPiSlashBridgeAdapter(
           });
         }
       }
-
+      let blocked = publishedLaunchBlock(container, request, disposed);
+      if (blocked) return { ok: false, runId: requestId, taskId, message: blocked };
       appendLogToContainer(container, options, {
         source: 'adapter',
         level: 'info',
@@ -3362,7 +3426,8 @@ function createPiSlashBridgeAdapter(
         taskId,
         data: { launchMode, background: request.background === true, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
       });
-
+      blocked = publishedLaunchBlock(container, request, disposed);
+      if (blocked) return { ok: false, runId: requestId, taskId, message: blocked };
       events.emit!(SLASH_SUBAGENT_REQUEST_EVENT, {
         requestId,
         params: {
@@ -3394,6 +3459,14 @@ function createPiSlashBridgeAdapter(
             settle();
             return;
           }
+          const rejectIfBlocked = () => {
+            const reason = publishedLaunchBlock(container, request, disposed);
+            if (!reason) return false;
+            rejectDelayedNativeLaunch(container, options, request, reason);
+            settle();
+            return true;
+          };
+          if (rejectIfBlocked()) return;
           run.started = true;
           run.launched = true;
           nativeOwnedRequestIds.add(requestId);
@@ -3409,6 +3482,7 @@ function createPiSlashBridgeAdapter(
             substateReason: 'pi native runner started',
           }, { now: options.now ?? (() => new Date()) });
           container.replace(updateRunTaskLifecycle(started, taskId, 'running', 'starting', 'pi native runner started', resolveTimestamp()));
+          if (rejectIfBlocked()) return;
           appendLogToContainer(container, options, {
             source: 'adapter',
             level: 'info',
@@ -3419,6 +3493,7 @@ function createPiSlashBridgeAdapter(
             taskId,
             data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
           });
+          if (rejectIfBlocked()) return;
           const activeRun = createPiNativeActiveRun(requestId);
           activeRuns.set(requestId, activeRun);
           activeRun.promise = runPiNativeZergRequest(context, container, options, request, requestId, taskId, launchMode, activeRun)
@@ -3522,13 +3597,17 @@ function createPiSlashBridgeAdapter(
         markRunTerminal(runId, 'cancelled', 'adapter disposed');
       }
       for (const activeRun of activeRuns.values()) activeRun.disposed = true;
+      let firstError: unknown;
       if (!listenersDisposed) {
         listenersDisposed = true;
-        for (const dispose of disposers.splice(0)) dispose();
+        for (const dispose of disposers.splice(0)) {
+          try { dispose(); } catch (error) { firstError ??= error; }
+        }
       }
       activeRuns.clear();
       fallbackLaunches.clear();
       runsById.clear();
+      if (firstError) throw firstError;
     },
   };
 }
@@ -3619,43 +3698,57 @@ function createPiNativeAdapter(
       const now = (runtimeOptions.now ?? (() => new Date()))().toISOString();
       const definition = getAgentDefinition(container.read(), request.agent);
       const label = definition?.label ?? request.agent;
-      updateZergControlState(container, { activeRunId: requestId }, `launched ${request.agent}`, runtimeOptions);
-      const started = applyRuntimeTransition(container.read(), {
-        entity: 'agent',
-        action: 'start',
-        id: requestId,
-        label,
-        kind: 'subagent',
-        activity: request.task,
-        substate: 'starting',
-        substateReason: 'pi native runner started',
-        metadata: {
-          ...(taskId ? { taskId } : {}),
-          launchMode,
-          ...(request.agentDefinitionId ? { agentDefinitionId: request.agentDefinitionId } : {}),
-          ...(request.model ? { model: request.model } : {}),
-          ...(request.fallbackModels?.length ? { fallbackModels: request.fallbackModels } : {}),
-          ...(request.maxTurns ? { maxTurns: request.maxTurns } : {}),
-        },
-      }, { now: () => new Date(now) });
-      container.replace(updateRunTaskLifecycle(started, taskId, 'running', 'starting', 'pi native runner started', now));
-      persistenceManager?.save(container.read(), runtimeOptions.now);
-      appendLogToContainer(container, runtimeOptions, {
-        source: 'adapter',
-        level: 'info',
-        kind: 'text',
-        message: `pi native launch started ${requestId}`,
-        runId: requestId,
-        agentId: request.agent,
-        taskId,
-        data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
-      });
+      // Own the empty cancellation handle before any observable publication.
       const activeRun = createPiNativeActiveRun(requestId);
       activeRuns.set(requestId, activeRun);
-      activeRun.promise = runPiNativeZergRequest(context, container, runtimeOptions, request, requestId, taskId, launchMode, activeRun)
-        .finally(() => activeRuns.delete(requestId));
-      void activeRun.promise;
-      return { ok: true, runId: requestId, taskId, message: `zerg launched ${request.agent} as ${requestId} (${launchMode})` };
+      const blockedAfterPublication = () => activeRun.cancelRequested
+        ? 'adapter launch cancelled: interrupt requested'
+        : publishedLaunchBlock(container, request, disposed || activeRun.disposed);
+      try {
+        updateZergControlState(container, { activeRunId: requestId }, `launched ${request.agent}`, runtimeOptions);
+        let blocked = blockedAfterPublication();
+        if (blocked) return { ok: false, runId: requestId, taskId, message: blocked };
+        const started = applyRuntimeTransition(container.read(), {
+          entity: 'agent',
+          action: 'start',
+          id: requestId,
+          label,
+          kind: 'subagent',
+          activity: request.task,
+          substate: 'starting',
+          substateReason: 'pi native runner started',
+          metadata: {
+            ...(taskId ? { taskId } : {}),
+            launchMode,
+            ...(request.agentDefinitionId ? { agentDefinitionId: request.agentDefinitionId } : {}),
+            ...(request.model ? { model: request.model } : {}),
+            ...(request.fallbackModels?.length ? { fallbackModels: request.fallbackModels } : {}),
+            ...(request.maxTurns ? { maxTurns: request.maxTurns } : {}),
+          },
+        }, { now: () => new Date(now) });
+        container.replace(updateRunTaskLifecycle(started, taskId, 'running', 'starting', 'pi native runner started', now));
+        blocked = blockedAfterPublication();
+        if (blocked) return { ok: false, runId: requestId, taskId, message: blocked };
+        persistenceManager?.save(container.read(), runtimeOptions.now);
+        appendLogToContainer(container, runtimeOptions, {
+          source: 'adapter',
+          level: 'info',
+          kind: 'text',
+          message: `pi native launch started ${requestId}`,
+          runId: requestId,
+          agentId: request.agent,
+          taskId,
+          data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
+        });
+        blocked = blockedAfterPublication();
+        if (blocked) return { ok: false, runId: requestId, taskId, message: blocked };
+        activeRun.promise = runPiNativeZergRequest(context, container, runtimeOptions, request, requestId, taskId, launchMode, activeRun)
+          .finally(() => activeRuns.delete(requestId));
+        void activeRun.promise;
+        return { ok: true, runId: requestId, taskId, message: `zerg launched ${request.agent} as ${requestId} (${launchMode})` };
+      } finally {
+        if (!activeRun.promise) activeRuns.delete(requestId);
+      }
     },
     async sendMessage(targetId, body, runId, mode = 'steer'): Promise<ZergOperatorMessageResult> {
       const resolved = resolvePiNativeMessageTarget(activeRuns, targetId, runId);

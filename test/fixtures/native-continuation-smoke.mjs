@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Local guards wrap this retained guard, never the ambient transports.
+installFixtureSafety({ name: 'continuation', maxRequests: 16, maxRequestBytes: 524288 });
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -92,6 +95,7 @@ export default function(pi) {
   writeFileSync(join(root, 'agent/skills/continuation/SKILL.md'), '---\nname: continuation\ndescription: CURRENT_SKILL_NORMAL_RESOURCE\n---\nRead-only fixture guidance.\n');
   writeFileSync(join(root, 'AGENTS.md'), 'OLD_CONTEXT_RESOURCE: original-source instructions only.\n');
   sdk = await import('@earendil-works/pi-coding-agent');
+  globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(sdk);
   const zerg = await import(new URL('../../index.ts', import.meta.url).href);
   state = await import(new URL('../../state.ts', import.meta.url).href);
   const persistence = await import(new URL('../../persistence.ts', import.meta.url).href);

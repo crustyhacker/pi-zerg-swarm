@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.14] - 2026-10-03
+
+### Fixed
+
+- Recheck canonical read-only, cancellation, caller-signal, and owner state after observable launch publication, including bridge fallback; own native cancellation handles before publishing startup. Persist canonical state after reentrant listeners.
+- Preserve observed terminal outcomes and original identities when an adapter rejects or throws. Uncertain thrown launches require manual inspection rather than automatic retry; legacy messaging respects read-only and pre-aborted requests.
+- Isolate abort and unsubscribe failures so sibling cleanup still runs; clean up adapters after registration failure.
+- Reserve viewer capacity before asynchronous saved-history loading and admit tool updates only with bounded current-call evidence, preventing retired tool cards from returning.
+- Require last-rendered identity proof for chooser actions; harden UI cleanup, untrusted text/error formatting, terminal-control stripping before trusted theme styling, and narrow-width rendering.
+- Bound snapshots to 64 MiB of serialized UTF-8, including growth during reads; reject nonregular files without FIFO hangs. Use exclusive temporary creation and owned-file cleanup on failed saves, preserving existing snapshots on size refusal.
+- Preserve an already-enabled read-only setting during recovery. Keep valid regular-target snapshot symlink loads compatible; saving still replaces the configured link rather than its target.
+
+### Added
+
+- Focused lifecycle, history, UI, persistence, and fixture-safety regressions; credential-free bounded SDK/PTY fixtures with owned-process cleanup checks.
+- A deterministic coding journey using genuine SDK read/edit/test tools, independent review and verification, exact messaging, explicitly approved fresh continuation, cancellation, and fresh-process recovery without replay. Scripted responses are integration evidence, not model-quality or manual visual certification.
+
 ## [1.1.13] - 2026-10-03
 
 ### Added

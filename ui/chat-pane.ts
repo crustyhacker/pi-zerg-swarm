@@ -1,5 +1,5 @@
 import type { ZergManagementTargetKind, ZergManagementUiState, ZergOperatorMessageDeliveryStatus, ZergState } from '../types.js';
-import { renderPane, styleText, type UiThemeLike } from './components.js';
+import { renderPane, sanitizeUiText, styleText, type UiThemeLike } from './components.js';
 import { addOperatorMessage, backspaceDraft, clearDraft } from './state.js';
 import { resolveSelectedTarget } from './detail-pane.js';
 
@@ -61,7 +61,7 @@ export function handleChatBackspace(uiState: ZergManagementUiState): void {
 
 export function renderChatPane(state: ZergState, uiState: ZergManagementUiState, width: number, height: number, composerLines?: readonly string[], theme?: UiThemeLike): string[] {
   const selected = resolveSelectedTarget(state, uiState);
-  const targetLabel = selected ? `${selected.kind} ${selected.id}` : 'none';
+  const targetLabel = selected ? `${sanitizeUiText(selected.kind)} ${sanitizeUiText(selected.id)}` : 'none';
   const lines = [
     `${styleText(theme, 'accent', 'Target')} ${targetLabel}`,
     styleText(theme, 'dim', 'Messages are recorded as operator interventions, not fake chat delivery.'),
@@ -72,17 +72,17 @@ export function renderChatPane(state: ZergState, uiState: ZergManagementUiState,
     lines.push('thread: no local operator messages for target');
   } else {
     for (const message of thread) {
-      const routed = message.routedTargetId ? ` -> ${message.routedTargetId}` : '';
-      lines.push(`${message.createdAt} ${message.targetKind}:${message.targetId}${routed}`);
-      lines.push(`  [${message.status}] ${message.body}`);
-      lines.push(`  ${message.statusDetail}`);
+      const routed = message.routedTargetId ? ` -> ${sanitizeUiText(message.routedTargetId)}` : '';
+      lines.push(`${sanitizeUiText(message.createdAt)} ${sanitizeUiText(message.targetKind)}:${sanitizeUiText(message.targetId)}${routed}`);
+      lines.push(`  [${sanitizeUiText(message.status)}] ${sanitizeUiText(message.body)}`);
+      lines.push(`  ${sanitizeUiText(message.statusDetail)}`);
     }
   }
   lines.push('');
   if (composerLines && composerLines.length > 0) {
     lines.push(...composerLines.map((line) => `draft: ${line}`));
   } else {
-    lines.push(`draft: ${uiState.chatDraft || '(empty)'}`);
+    lines.push(`draft: ${sanitizeUiText(uiState.chatDraft) || '(empty)'}`);
   }
   lines.push(styleText(theme, 'dim', 'Type here when focused. Enter sends. Ctrl+X clears.'));
   return renderPane(lines, { title: '3 Message', focused: uiState.focusedPane === 'chat', width, height, theme });

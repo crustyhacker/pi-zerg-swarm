@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { assertAncestorIsolation, cleanHostEnvironment, guardSource, readFixtureBody, spawnOwnedController, settleOwnedController } from './host-fixture-safety.mjs';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Standalone, AFTER materialization: node test/fixtures/team-timeline-host-smoke.mjs
@@ -190,7 +190,7 @@ master, slave = pty.openpty()
 def resize(cols, rows):
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 resize(120, 40)
-env = {'PATH': os.path.dirname(node) + ':/usr/local/bin:/usr/bin:/bin', 'HOME': root + '/home', 'TMPDIR': root + '/tmp', 'TERM': 'xterm-256color', 'LANG': 'C.UTF-8', 'PI_CODING_AGENT_DIR': root + '/agent', 'PI_OFFLINE': '1', 'PI_SKIP_VERSION_CHECK': '1', 'PI_TELEMETRY': '0'}
+env = dict(os.environ); env['TERM'] = 'xterm-256color'
 args = [node, '--import', root + '/guard.mjs', cli, '--offline', '--no-session', '--no-approve', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-tools', '--model', 'fixture/lead', '--thinking', 'off', '--tui-mode', mode, '-e', phase_dir + '/smoke.ts']
 proc = subprocess.Popen(args, cwd=root + '/work', env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
 os.close(slave)
@@ -221,7 +221,9 @@ def until(check, label):
         if check(): return
         if read('result.json').get('ok') is False: raise Exception('Host failure: ' + str(read('result.json')))
         if read('observation-error.json'): raise Exception('Observer failure: ' + str(read('observation-error.json')))
-        if proc.poll() is not None: raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
+        if proc.poll() is not None:
+            if check(): return
+            raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
     raise Exception('PTY timeout: ' + label + '\n' + text()[-5000:])
 def phase(name): return read('phase.json').get('name') == name
 def pause(seconds=0.2):
@@ -365,58 +367,17 @@ finally:
 if not report['ok']: sys.exit(1)
 `;
 
-function guardSource(root, origin) {
-  return `import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import net from 'node:net';
-import tls from 'node:tls';
-const origin = ${JSON.stringify(origin)}, root = ${JSON.stringify(root)};
-function refuse(reason) {
-  const path = root + '/network-refused.txt';
-  if (!existsSync(path) || readFileSync(path).length < 4096) appendFileSync(path, String(reason).slice(0, 1024) + '\\n');
-  throw Error('Fixture refused network: ' + reason);
-}
-const originalFetch = globalThis.fetch;
-globalThis.fetch = (input, init) => {
-  const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-  const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-  if (url.origin !== origin || url.pathname !== '/v1/chat/completions' || url.search || url.hash || url.username || url.password || method !== 'POST') refuse(method + ' ' + url.origin + url.pathname);
-  return originalFetch(input, { ...init, redirect: 'error' });
-};
-const connect = net.Socket.prototype.connect;
-net.Socket.prototype.connect = function (...args) {
-  // Undici may pass its normalized [options, callback] tuple to Socket.connect.
-  const first = Array.isArray(args[0]) ? args[0][0] : args[0];
-  const options = typeof first === 'object' ? first : { port: first, host: args[1] };
-  const allowed = new URL(origin);
-  if (options?.path || options?.host !== '127.0.0.1' || String(options?.port) !== allowed.port) refuse('socket ' + String(options?.host) + ':' + String(options?.port));
-  return connect.apply(this, args);
-};
-tls.connect = (...args) => refuse('TLS is never needed by isolated HTTP fixture');
-`;
-}
 
 async function runMode(mode) {
   const root = join(evidence, mode);
-  for (const leaf of ['home', 'tmp', 'agent', 'work/.pi', 'live', 'restart']) mkdirSync(join(root, leaf), { recursive: true });
-  // Fail closed if ancestor auto-discovery could import foreign project context.
-  for (let ancestor = dirname(root); ; ancestor = dirname(ancestor)) {
-    for (const leaf of ['.pi', 'AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD', 'SYSTEM.md', 'APPEND_SYSTEM.md']) assert(!existsSync(join(ancestor, leaf)), 'Unexpected ancestor resource: ' + join(ancestor, leaf));
-    if (ancestor === dirname(ancestor)) break;
-  }
-  writeFileSync(join(root, 'work/input.txt'), 'TOOL_FILE_CONTENT: isolated real read result\n');
-  writeFileSync(join(root, 'agent/auth.json'), '{}');
-  const settings = { defaultProvider: 'fixture', defaultModel: 'lead', packages: [], extensions: ['-builtin:mcp', '-builtin:llama.cpp', '-builtin:codemode', '-builtin:tool-search'], skills: [], prompts: [], themes: [], defaultProjectTrust: 'never', noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } };
-  writeFileSync(join(root, 'agent/settings.json'), JSON.stringify(settings));
-  writeFileSync(join(root, 'work/.pi/settings.json'), JSON.stringify(settings));
   const requests = [], counts = { a: 0, b: 0, lead: 0 };
+  const budget = { hits: 0, max: 6 };
   let aborted = 0, restarting = false, serverFailure, controller, timer;
   const server = createServer(async (req, res) => {
     try {
+      const body = await readFixtureBody(req, budget);
       assert(!restarting, 'Fresh inspection host must make ZERO model requests');
-      assert.equal(req.method, 'POST'); assert.equal(req.url, '/v1/chat/completions');
       assert.equal(req.headers.authorization, 'Bearer dummy-exact-loopback-only');
-      let body = '';
-      for await (const chunk of req) { body += chunk; assert(body.length <= 512 * 1024, 'Oversized model request'); }
       const input = JSON.parse(body);
       assert(['a', 'b', 'lead'].includes(input.model)); assert.equal(input.stream, true);
       const model = input.model, turn = ++counts[model];
@@ -469,7 +430,7 @@ async function runMode(mode) {
     const phaseDir = join(root, restart ? 'restart' : 'live');
     writeFileSync(join(phaseDir, 'smoke.ts'), extensionSource(root, phaseDir, restart));
     writeFileSync(join(phaseDir, 'pty-controller.py'), pythonSource);
-    controller = spawn('python3', [join(phaseDir, 'pty-controller.py'), root, phaseDir, process.execPath, cli, mode, restart ? '1' : '0'], { env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    controller = spawnOwnedController('/usr/bin/python3', [join(phaseDir, 'pty-controller.py'), root, phaseDir, process.execPath, cli, mode, restart ? '1' : '0'], root, 105000);
     let diagnostics = '';
     for (const stream of [controller.stdout, controller.stderr]) stream.on('data', chunk => { diagnostics = (diagnostics + chunk).slice(-16000); });
     const exit = await new Promise((resolve, reject) => {
@@ -484,9 +445,17 @@ async function runMode(mode) {
     assert.equal(pty.ok, true); assert.equal(host.ok, true, JSON.stringify(host));
     assert(!existsSync(join(root, 'network-refused.txt')), 'Guard rejected unexpected network');
     assert(!serverFailure, serverFailure); assert.equal(aborted, 0);
+    await settleOwnedController(controller);
     return { ...host, terminalBytes: pty.bytes, sizes: pty.sizes, hostPid: pty.hostPid, hostExit: pty.hostExit };
   }
   try {
+    assertAncestorIsolation(root); cleanHostEnvironment(root);
+    for (const leaf of ['work/.pi', 'live', 'restart']) mkdirSync(join(root, leaf), { recursive: true });
+    writeFileSync(join(root, 'work/input.txt'), 'TOOL_FILE_CONTENT: isolated real read result\n');
+    writeFileSync(join(root, 'agent/auth.json'), '{}');
+    const settings = { defaultProvider: 'fixture', defaultModel: 'lead', packages: [], extensions: ['-builtin:mcp', '-builtin:llama.cpp', '-builtin:codemode', '-builtin:tool-search'], skills: [], prompts: [], themes: [], defaultProjectTrust: 'never', noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } };
+    writeFileSync(join(root, 'agent/settings.json'), JSON.stringify(settings));
+    writeFileSync(join(root, 'work/.pi/settings.json'), JSON.stringify(settings));
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const origin = 'http://127.0.0.1:' + server.address().port;
     writeFileSync(join(root, 'agent/models.json'), JSON.stringify({ providers: { fixture: { api: 'openai-completions', baseUrl: origin + '/v1', apiKey: 'dummy-exact-loopback-only', models: ['a', 'b', 'lead'].map(id => ({ id, name: 'Isolated timeline ' + id, reasoning: false, input: ['text'], contextWindow: 32768, maxTokens: 256 })) } } }));
@@ -496,6 +465,7 @@ async function runMode(mode) {
     restarting = true;
     const before = requests.length, restart = await host(true);
     assert.equal(requests.length, before, 'Fresh restart performed zero prompts/model calls');
+    assert.equal(budget.hits, 6);
     assert.notEqual(live.hostPid, restart.hostPid, 'Genuinely fresh process, not rehydrating same owner');
     assert.deepEqual(restart.exactKey, live.exactKey); assert.equal(restart.rowId, live.rowId);
     const result = { mode, localhostRequests: requests.length, restartRequests: requests.length - before, aborted, live, restart };
@@ -503,21 +473,17 @@ async function runMode(mode) {
     console.log('PASS actual Pi ' + mode + ' timeline PTYs: concurrent exact workers/queued+consumed/filter/roundtrip/resize/close/saved/fresh restart (6 localhost requests; zero restart calls)');
   } finally {
     clearTimeout(timer);
-    if (controller && controller.exitCode === null && controller.signalCode === null) {
-      controller.kill('SIGTERM');
-      await new Promise(resolve => {
-        const deadline = setTimeout(() => { controller.kill('SIGKILL'); resolve(); }, 5000);
-        controller.once('close', () => { clearTimeout(deadline); resolve(); });
-      });
+    try { await settleOwnedController(controller); }
+    finally {
+      server.closeAllConnections();
+      if (server.listening) await new Promise(resolve => server.close(resolve));
     }
-    server.closeAllConnections();
-    if (server.listening) await new Promise(resolve => server.close(resolve));
     // Remove auth, native JSONL, model request context and all generated fixture
     // code. Keep only bounded terminal/check/error evidence (dummy content).
-    const rootEvidence = new Set(['live', 'restart', 'checks.json', 'server-error.txt', 'network-refused.txt']);
-    for (const leaf of readdirSync(root)) if (!rootEvidence.has(leaf)) rmSync(join(root, leaf), { recursive: true, force: true });
+    const rootEvidence = new Set(['live', 'restart', 'checks.json', 'server-error.txt', 'network-refused.txt', 'supervisor-result.json']);
+    for (const leaf of existsSync(root) ? readdirSync(root) : []) if (!rootEvidence.has(leaf)) rmSync(join(root, leaf), { recursive: true, force: true });
     const hostEvidence = new Set(['terminal.ansi', 'terminal.txt', 'pty-result.json', 'result.json', 'diagnostics.txt', 'observation-error.json']);
-    for (const name of ['live', 'restart']) for (const leaf of readdirSync(join(root, name))) if (!hostEvidence.has(leaf)) rmSync(join(root, name, leaf), { recursive: true, force: true });
+    for (const name of ['live', 'restart']) for (const leaf of existsSync(join(root, name)) ? readdirSync(join(root, name)) : []) if (!hostEvidence.has(leaf)) rmSync(join(root, name, leaf), { recursive: true, force: true });
   }
 }
 try {

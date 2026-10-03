@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.13 release status**
-> Adds explicitly reviewed continuation from one exact saved native entry into a **new task and Pi session** under current authority. Preparation is non-executing; confirmation authorizes normal Pi resources and hooks. Original history, live messaging, branch inspection, timeline, cancellation, and task-owned cleanup are preserved.
+> **v1.1.14 release status**
+> Hardens launch/cancellation admission, observer and UI cleanup, retained-text rendering, and snapshot recovery. Explicit reviewed continuation still creates a **new task and Pi session** under current authority; preparation remains non-executing and confirmation authorizes normal Pi resources and hooks.
 > Restart restores inspectable history and quarantines pending receipts; it never reconnects, automatically continues, or resends. Historical permissions remain unknown. Continuation is not in-place resume, workspace restoration, or a sandbox.
 
 ## Release status
 
-- Current release: **v1.1.13** (explicit reviewed continuation into a fresh native session).
+- Current release: **v1.1.14** (runtime, history, UI, and persistence hardening).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -47,6 +47,12 @@ const status = await control.execute({ action: 'runs.show', runId: run.runId! })
 `registerZergSwarmExtension(...)` also registers a Pi custom tool named `zerg_control` when the installed Pi extension API exposes `registerTool(...)`. The tool calls the same structured control core and returns JSON-compatible `details`; callers do not need to parse slash-command output. Slash commands remain the human-facing wrapper.
 
 Background jobs are inspectable through `/zerg runs`, `/zerg logs`, direct `runs.*`/`logs.list`, and `/zerg interrupt`/`{ action: 'interrupt' }` while the Pi process/session remains alive. v1.1.0 also supports opt-in durable snapshots under `.pi/zerg-swarm/v1/state.json` through `persistence: { enabled: true, rootDir }`, so restart can recover run/log history and mark previously active sessions as `needs-attention` instead of losing them.
+
+Snapshots have a **64 MiB serialized UTF-8 byte limit**. Loading uses a verified regular-file descriptor and bounded reads, including a growth check; oversized or invalid inputs report `lastLoadError` without modifying the file or replacing current state. Oversized saves are rejected before temporary-file creation, leaving the previous snapshot intact. Exclusive temporary files and failure cleanup protect against pre-existing temporary-file collisions. A currently enabled read-only setting remains enabled after recovery, even if the saved state was writable.
+
+Valid snapshot symlinks to regular files retain their existing load behavior; missing/dangling links behave as missing snapshots. Saving still atomically replaces the configured path itself, **not the symlink target**. This is not filesystem confinement, multi-writer coordination, or fsync/power-loss protection; use one owner per snapshot file. The separate native JSONL viewer limits remain unchanged.
+
+If an external adapter throws during launch, execution may already have started. Zerg preserves observed terminal state or reports `needs-attention` with the original run/task identities; inspect manually rather than automatically retrying. Admission checks do not revoke capabilities from an already-running external adapter.
 
 ## Native session reference foundation
 
@@ -312,8 +318,9 @@ npm run check:version
 - v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection
 - v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts
 - v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation
-- v1.1.13: patch release adding explicit reviewed continuation into a fresh native session (current release)
-- Next: further recovery controls and integrated workspace hardening
+- v1.1.13: patch release adding explicit reviewed continuation into a fresh native session
+- v1.1.14: patch release hardening runtime admission, history/UI lifetimes, terminal rendering, and bounded snapshot recovery (current release)
+- Further recovery and workspace features require separate scope.
 
 ## License
 

@@ -1,5 +1,5 @@
 import type { ZergManagementTargetKind, ZergManagementUiState, ZergPermissionRequest, ZergState } from '../types.js';
-import { fitLine, healthGlyph, renderPane, styleText, type UiThemeLike } from './components.js';
+import { fitRawLine, healthGlyph, renderPane, sanitizeUiText, styleText, type UiThemeLike } from './components.js';
 
 export function resolveSelectedTarget(state: ZergState, uiState: ZergManagementUiState): { id: string; kind: ZergManagementTargetKind } | undefined {
   if (uiState.selectedTargetId && uiState.selectedTargetKind) {
@@ -18,12 +18,14 @@ export function renderDetailPane(state: ZergState, uiState: ZergManagementUiStat
   const selected = resolveSelectedTarget(state, uiState);
   const lines: string[] = [];
   if (!selected) {
-    lines.push(styleText(theme, 'warning', 'No target selected yet. Use Select pane, then Enter.'));
+    lines.push('No target selected yet. Use Select pane, then Enter.');
     lines.push(`lifecycle: ${state.lifecycle}`);
     lines.push(`revision: ${state.revision}`);
     lines.push(`mode: ${state.mode.automation} | read-only: ${state.mode.readOnly ? 'on' : 'off'}`);
     lines.push(...latestGlobalSignals(state));
-    return renderPane(lines, { title: 'Details', focused: uiState.focusedPane === 'detail', width, height, theme });
+    const clean = lines.map(sanitizeUiText);
+    clean[0] = styleText(theme, 'warning', clean[0]!);
+    return renderPane(clean, { title: 'Details', focused: uiState.focusedPane === 'detail', width, height, theme });
   }
 
   if (selected.kind === 'agent') {
@@ -69,9 +71,10 @@ export function renderDetailPane(state: ZergState, uiState: ZergManagementUiStat
     }
   }
 
-  lines.push(styleText(theme, 'dim', 'view: t scoped team timeline · v read-only coding chooser'));
-  lines.push(styleText(theme, 'dim', 'action: i interrupts selected active run/agent'));
-  return renderPane(lines.map((line) => fitLine(line, width - 4)), { title: 'Details', focused: uiState.focusedPane === 'detail', width, height, theme });
+  const clean = lines.map(sanitizeUiText);
+  clean.push(styleText(theme, 'dim', 'view: t scoped team timeline · v read-only coding chooser'));
+  clean.push(styleText(theme, 'dim', 'action: i interrupts selected active run/agent'));
+  return renderPane(clean.map((line) => fitRawLine(line, width - 4)), { title: 'Details', focused: uiState.focusedPane === 'detail', width, height, theme });
 }
 
 function targetPermissionLines(state: ZergState, targetId: string): string[] {

@@ -160,7 +160,10 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
     catch { return []; }
   };
   function handle(snapshot: Collector['snapshot'], listeners = new Set<() => void>(), signal?: AbortSignal): NativeTranscriptReadHandle {
-    if (stopped) return inertHandle(snapshot);
+    if (stopped || signal?.aborted || handles.size >= LIMIT.owners) {
+      const key = snapshot().key, diagnostic = stopped || signal?.aborted ? 'Viewer closed or load aborted' : 'Viewer handle limit reached';
+      return inertHandle(() => unavailable(key, diagnostic));
+    }
     let disposed = false; const owned = new Set<() => void>();
     const dispose = () => { if (disposed) return; disposed = true; snapshot = () => unavailable({ parentRunId: '', memberRunId: '', piSessionId: '' }, 'Viewer handle disposed'); for (const fn of owned) listeners.delete(fn); owned.clear(); handles.delete(dispose); signal?.removeEventListener('abort', dispose); };
     handles.add(dispose); signal?.addEventListener('abort', dispose, { once: true });
@@ -184,6 +187,35 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
     let timer: ReturnType<typeof setTimeout> | undefined, pending = false, generation = 0, epoch = 0;
     let stream: NativeTranscriptBlock[] = [], finishedGeneration: number | undefined;
     const tools = new Map<string, NativeTranscriptBlock>();
+    // Positive admission is bounded to current calls, not all retired call IDs.
+    const currentCalls = new Set<string>(), scopeCalls = new Set<string>();
+    let callScope: string | undefined;
+    const admitCalls = (blocks: NativeTranscriptBlock[], scope: string) => {
+      if (scope !== callScope) { currentCalls.clear(); scopeCalls.clear(); callScope = scope; }
+      for (const block of blocks) {
+        const id = block.toolCallId;
+        if (!id || block.kind !== 'tool') continue;
+        if (block.resultText !== undefined || tools.get(id)?.status === 'done' || tools.get(id)?.status === 'error') currentCalls.delete(id);
+        else if (block.role === 'assistant' && !scopeCalls.has(id) && scopeCalls.size < LIMIT.tools) { scopeCalls.add(id); currentCalls.add(id); }
+      }
+    };
+    const refreshCalls = () => {
+      // Walk only the already bounded current branch, never arbitrary SDK history.
+      const byId = new Map(data.entries.map((entry) => [entry.id, entry]));
+      const results = new Set<string>();
+      let next = data.leaf, steps = 0;
+      while (next && steps++ < LIMIT.blocks) {
+        const entry = byId.get(next); if (!entry) break;
+        for (const block of entry.blocks) if (block.toolCallId && block.resultText !== undefined) results.add(block.toolCallId);
+        if (entry.blocks.some((block) => block.role === 'assistant')) {
+          admitCalls(entry.blocks, entry.id);
+          for (const id of results) currentCalls.delete(id);
+          return;
+        }
+        next = entry.parentId;
+      }
+      currentCalls.clear(); scopeCalls.clear(); callScope = undefined;
+    };
     const listeners = new Set<() => void>();
     const notify = () => {
       revision++;
@@ -199,7 +231,9 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
           const live = block.toolCallId ? tools.get(block.toolCallId) : undefined;
           if (live && block.kind === 'tool') { block.parentToolCallId = live.parentToolCallId; if (block.resultText !== undefined) tools.delete(block.toolCallId!); }
         }
+        refreshCalls();
         if (finishedGeneration === generation) stream = [];
+        else if (stream.some((block) => block.role === 'assistant')) admitCalls(stream, `stream:${generation}`);
         finishedGeneration = undefined;
         data.extra = boundExtra([...tools.values(), ...stream], data, tools);
       } catch { diagnostic = 'Live observer read failed'; }
@@ -221,7 +255,7 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
         ignoreFault(reconcile); active = false; epoch++; if (status !== 'settled') status = 'unavailable'; diagnostic = [diagnostic, 'Live observation detached; captured output is not a persistence claim'].filter(Boolean).join('; ');
         if (timer) clearTimeout(timer); timer = undefined;
         ignoreFault(() => unsubscribe?.()); unsubscribe = undefined; reader = undefined;
-        tools.clear(); stream = [];
+        tools.clear(); currentCalls.clear(); scopeCalls.clear(); stream = [];
         if (collectors.get(identity) === collector) collectors.delete(identity);
         for (const fn of listeners) ignoreFault(fn); listeners.clear();
       },
@@ -239,6 +273,8 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
           const message = event.message ?? partial;
           if (event.type === 'message_start') generation++;
           stream = messageBlocks(message, `stream:${generation}`);
+          if (record(message) && message.role === 'assistant') admitCalls(stream, `stream:${generation}`);
+          else if (event.type === 'message_start') { currentCalls.clear(); scopeCalls.clear(); callScope = undefined; }
           if (event.type === 'message_end') finishedGeneration = generation;
           data.extra = boundExtra([...tools.values(), ...stream], data, tools);
           // Retain only the bounded projection, not the unbounded incoming partial.
@@ -247,10 +283,18 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
         }
         if (typeof event.type === 'string' && event.type.startsWith('tool_execution_')) {
           const id = text(event.toolCallId, 256);
-          // A tardy update callback must not undo persisted tool-result edits.
+          if (!id || !['tool_execution_start', 'tool_execution_update', 'tool_execution_end'].includes(event.type)) return;
+          // Retained persisted results remain authoritative, including redaction.
           if (data.entries.some((entry) => entry.blocks.some((block) => block.kind === 'tool' && block.toolCallId === id && block.resultText !== undefined))) return;
+          const old = tools.get(id);
+          if (old?.status === 'done' || old?.status === 'error') return;
+          const parent = text(event.parentToolCallId, 256);
+          const nestedStart = event.type === 'tool_execution_start' && tools.get(parent)?.status === 'running';
+          // Unknown updates/end are valid only for proven current pending calls
+          // (late attachment). Delayed retired callbacks cannot recreate a card.
+          if (!old && !currentCalls.has(id) && !nestedStart) return;
+          if (event.type === 'tool_execution_end') currentCalls.delete(id);
           if (tools.size < LIMIT.tools || tools.has(id)) {
-            const old = tools.get(id);
             tools.set(id, { ...old, id: `tool:${id}`, kind: 'tool', toolCallId: id, parentToolCallId: text(event.parentToolCallId, 256) || old?.parentToolCallId,
               toolName: text(event.toolName, 256), text: '', argumentsText: event.args ? boundedArguments(event.args) : old?.argumentsText,
               resultText: contentText((event.result ?? event.partialResult)?.content) || old?.resultText,
@@ -284,18 +328,23 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
       const collector = collectors.get(keyOf(key));
       if (collector) return handle(collector.snapshot, collector.listeners, signal);
       if (loads >= 2) return handle(() => unavailable(key, 'Saved history load limit reached'), undefined, signal);
+      // Reserve a real viewer slot synchronously before the asynchronous read.
+      // Abort/shutdown dispose this same handle; completion never allocates another.
+      let savedSnapshot: Collector['snapshot'] = () => unavailable(key, 'Saved history loading');
+      const view = handle((selection) => savedSnapshot(selection), undefined, signal);
       loads++;
       try {
         const data = await readSaved(ref, options.agentDir, signal);
         if (stopped || signal?.aborted || !list().some((item) => keyOf(item) === keyOf(key) && item.sessionFile === ref.sessionFile)) throw new Error('Load aborted or reference changed');
-        return handle((selection) => {
+        savedSnapshot = (selection) => {
           const view = project(data, selection?.leafId);
           return { key: copyKey(key), revision: 0, source: 'saved', status: ref.attachment === 'disposed' ? 'closed' : 'unavailable', defaultLeafBasis: 'recorded-tip',
             inspectedLeafId: view.leaf, liveLeafId: null, branches: view.branches, blocks: view.blocks,
             diagnostic: [ref.attachment !== 'disposed' ? 'History only; no live observer connected (closure not confirmed)' : '', view.diagnostic ?? '', data.truncated ? 'Saved history truncated by display limits' : ''].filter(Boolean).join('; ') || undefined, truncated: data.truncated, droppedBlocks: data.dropped };
-        }, undefined, signal);
-      } catch (error) { return handle(() => unavailable(key, error instanceof Error ? error.message : 'Saved history unavailable'), undefined, signal); }
+        };
+      } catch (error) { savedSnapshot = () => unavailable(key, error instanceof Error ? error.message : 'Saved history unavailable'); }
       finally { loads--; }
+      return view;
     },
     shutdown() { if (stopped) return; stopped = true; for (const collector of [...collectors.values()]) collector.release(); for (const dispose of [...handles]) dispose(); },
   };

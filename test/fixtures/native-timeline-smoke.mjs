@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Its saved originalEnv/Cwd/transports are now dummy-only guarded values.
+installFixtureSafety({ name: 'timeline', maxRequests: 12, maxRequestBytes: 262144 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import net from 'node:net';
@@ -70,6 +73,7 @@ writeFileSync(join(root, 'agent', 'models.json'), JSON.stringify({ providers: { 
   models: ['worker', 'leader'].map((id) => ({ id, reasoning: false, input: ['text'], contextWindow: 32768, maxTokens: 128 })),
 } } }));
 sdk = await import('@earendil-works/pi-coding-agent');
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(sdk);
 const zerg = await import(new URL('../../index.ts', import.meta.url).href);
 state = await import(new URL('../../state.ts', import.meta.url).href);
 const persistence = await import(new URL('../../persistence.ts', import.meta.url).href);

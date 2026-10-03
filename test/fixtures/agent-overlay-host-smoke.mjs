@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { assertAncestorIsolation, cleanHostEnvironment, guardSource, readFixtureBody, spawnOwnedController, settleOwnedController } from './host-fixture-safety.mjs';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -58,7 +58,7 @@ export default function (pi) {
     started = true;
     // Do not await a modal inside startup event dispatch.
     setTimeout(() => void smoke(ctx).catch(error => {
-      writeFileSync(join(root, 'result.json'), JSON.stringify({ ok: false, error: String(error.stack ?? error) }));
+      writeFileSync(join(root, 'result.json'), JSON.stringify({ ok: false, error: String(error.stack ?? error).slice(-16000) }));
       try { cleanup(); } finally { ctx.shutdown(); }
     }), 0);
   });
@@ -115,7 +115,7 @@ master, slave = pty.openpty()
 def resize(cols, rows):
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 resize(120, 40)
-env = {'PATH': os.path.dirname(node) + ':/usr/local/bin:/usr/bin:/bin', 'HOME': root + '/home', 'TMPDIR': root + '/tmp', 'TERM': 'xterm-256color', 'LANG': 'C.UTF-8', 'PI_CODING_AGENT_DIR': root + '/agent', 'PI_OFFLINE': '1', 'PI_SKIP_VERSION_CHECK': '1', 'PI_TELEMETRY': '0'}
+env = dict(os.environ); env['TERM'] = 'xterm-256color'
 args = [node, '--import', guard, cli, '--offline', '--no-session', '--no-approve', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-tools', '--model', 'fixture/slow', '--thinking', 'off', '--tui-mode', mode, '-e', root + '/smoke.ts']
 proc = subprocess.Popen(args, cwd=root + '/work', env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
 os.close(slave)
@@ -130,7 +130,8 @@ def pump(wait=0.05):
             if e.errno == errno.EIO: return
             raise
         raw.extend(data)
-        if len(raw) > 4 * 1024 * 1024: raise Exception('Terminal evidence exceeds 4 MiB')
+        if len(raw) > 4 * 1024 * 1024:
+            del raw[4 * 1024 * 1024:]; raise Exception('Terminal evidence exceeds 4 MiB')
         # Real terminals answer these probes; this tiny controller only answers
         # startup capability queries, never drives slash commands.
         if b'\x1b[6n' in data: os.write(master, b'\x1b[1;1R')
@@ -141,7 +142,9 @@ def until(check, label):
     while time.monotonic() - start < 50:
         pump()
         if check(): return
-        if proc.poll() is not None: raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
+        if proc.poll() is not None:
+            if check(): return
+            raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
     raise Exception('PTY timeout: ' + label + '\n' + text()[-5000:])
 def phase(name):
     try:
@@ -209,23 +212,15 @@ if not report['ok']: sys.exit(1)
 
 async function runMode(mode) {
   const root = join(evidence, mode);
-  for (const leaf of ['home', 'tmp', 'agent', 'work']) mkdirSync(join(root, leaf), { recursive: true });
-  writeFileSync(join(root, 'work/input.txt'), 'TOOL_FILE_CONTENT: isolated read result\n');
-  writeFileSync(join(root, 'agent/auth.json'), '{}');
-  writeFileSync(join(root, 'agent/settings.json'), JSON.stringify({ defaultProvider: 'fixture', defaultModel: 'slow', packages: [], extensions: [], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, telemetry: { enabled: false } }));
   const requests = [];
+  const budget = { hits: 0, max: 2 };
   let aborted = 0;
   let controller;
   let timer;
   const server = createServer(async (req, res) => {
     try {
-      assert.equal(req.url, '/v1/chat/completions');
-      assert.equal(req.method, 'POST');
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk;
-        assert(body.length <= 512 * 1024, 'Model request oversized');
-      }
+      const body = await readFixtureBody(req, budget);
+      assert.equal(req.headers.authorization, 'Bearer dummy-loopback-only');
       const input = JSON.parse(body);
       assert.equal(input.model, 'slow');
       requests.push(input);
@@ -260,24 +255,24 @@ async function runMode(mode) {
       }
       res.end('data: [DONE]\n\n');
     } catch (error) {
-      writeFileSync(join(root, 'server-error.txt'), String(error.stack ?? error));
+      writeFileSync(join(root, 'server-error.txt'), String(error.stack ?? error).slice(-16000));
       res.destroy(error);
     }
   });
   try {
+    assertAncestorIsolation(root); cleanHostEnvironment(root);
+    mkdirSync(join(root, 'work'), { recursive: true });
+    writeFileSync(join(root, 'work/input.txt'), 'TOOL_FILE_CONTENT: isolated read result\n');
+    writeFileSync(join(root, 'agent/auth.json'), '{}');
+    writeFileSync(join(root, 'agent/settings.json'), JSON.stringify({ defaultProvider: 'fixture', defaultModel: 'slow', packages: [], extensions: [], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } }));
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const origin = `http://127.0.0.1:${server.address().port}`;
     writeFileSync(join(root, 'agent/models.json'), JSON.stringify({ providers: { fixture: { api: 'openai-completions', baseUrl: origin + '/v1', apiKey: 'dummy-loopback-only', models: [{ id: 'slow', name: 'PTY fixture', reasoning: false, input: ['text'], contextWindow: 32768, maxTokens: 256 }] } } }));
     // Imported by Node before CLI bootstrap, including model/resource loading.
-    writeFileSync(join(root, 'guard.mjs'), `const original = globalThis.fetch;
-globalThis.fetch = (input, init) => {
-  const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-  if (url.origin !== ${JSON.stringify(origin)}) throw Error('Fixture refused external fetch: ' + url.origin);
-  return original(input, { ...init, redirect: 'error' });
-};\n`);
+    writeFileSync(join(root, 'guard.mjs'), guardSource(root, origin));
     writeFileSync(join(root, 'smoke.ts'), extensionSource(root));
     writeFileSync(join(root, 'pty-controller.py'), pythonSource);
-    controller = spawn('python3', [join(root, 'pty-controller.py'), root, process.execPath, join(root, 'guard.mjs'), cli, mode], { stdio: ['ignore', 'pipe', 'pipe'] });
+    controller = spawnOwnedController('/usr/bin/python3', [join(root, 'pty-controller.py'), root, process.execPath, join(root, 'guard.mjs'), cli, mode], root, 55000);
     let diagnostics = '';
     for (const stream of [controller.stdout, controller.stderr]) stream.on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-16000); });
     const exit = await new Promise((resolve, reject) => {
@@ -294,22 +289,20 @@ globalThis.fetch = (input, init) => {
     assert.equal(requests.length, 2);
     assert.equal(aborted, 0);
     assert(!existsSync(join(root, 'server-error.txt')));
+    assert(!existsSync(join(root, 'network-refused.txt')));
+    assert.equal(budget.hits, 2);
     const result = { mode, localhostRequests: requests.length, aborted, ...hostReport, terminalBytes: ptyReport.bytes, sizes: ptyReport.sizes, hostExit: ptyReport.hostExit };
     results.push(result);
     console.log(`PASS actual Pi ${mode} PTY: exact session/live delta/read tool/resize/close without abort/saved history (${requests.length} localhost requests)`);
   } finally {
     clearTimeout(timer);
-    if (controller && controller.exitCode === null && controller.signalCode === null) {
-      controller.kill('SIGTERM');
-      await new Promise((resolve) => {
-        const deadline = setTimeout(() => { controller.kill('SIGKILL'); resolve(); }, 5000);
-        controller.once('close', () => { clearTimeout(deadline); resolve(); });
-      });
+    try { await settleOwnedController(controller); }
+    finally {
+      server.closeAllConnections();
+      if (server.listening) await new Promise((resolve) => server.close(resolve));
     }
-    server.closeAllConnections();
-    await new Promise((resolve) => server.close(resolve));
     // Retain only bounded terminal/result evidence, never auth or session state.
-    for (const leaf of ['home', 'tmp', 'agent', 'work', 'smoke.ts', 'guard.mjs', 'pty-controller.py', '__pycache__', 'streaming', 'release', 'viewer-attached', 'phase.json']) rmSync(join(root, leaf), { recursive: true, force: true });
+    for (const leaf of ['home', 'tmp', 'agent', 'xdg', 'work', 'smoke.ts', 'guard.mjs', 'pty-controller.py', 'host-supervisor.py', '__pycache__', 'streaming', 'release', 'viewer-attached', 'phase.json']) rmSync(join(root, leaf), { recursive: true, force: true });
   }
 }
 try {

@@ -1,3 +1,6 @@
+import { installFixtureSafety } from './fixture-safety.mjs';
+// Dedicated subprocess: guard/empty environment installed before SDK resources.
+installFixtureSafety({ name: 'control', maxRequests: 64 });
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -31,6 +34,7 @@ await new Promise(r=>server.listen(0,'127.0.0.1',r));
 writeFileSync(join(agentDir,'models.json'),JSON.stringify({providers:{fixture:{api:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,apiKey:'dummy-local-only',models:['ok','error','length','a','b','lead','slowA','slowB','slowCancel'].map(id=>({id,reasoning:false,input:['text'],contextWindow:32768,maxTokens:128}))}}}));
 writeFileSync(join(agentDir,'settings.json'),JSON.stringify({defaultProvider:'fixture',defaultModel:'ok',packages:[]}));
 const deadline=setTimeout(()=>{console.error('Global smoke timeout');process.exit(1);},60000);
+globalThis[Symbol.for('zerg/fixture-safety')].watchSDK(await import('@earendil-works/pi-coding-agent'));
 const zerg=await import(new URL('../../index.ts', import.meta.url).href);
 const control=zerg.createZergControl();
 let registration;let registeredTool;

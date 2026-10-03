@@ -32,6 +32,7 @@ function fixture(refs = [reference()]) {
     },
   };
   const component = new ZergAgentOverlayComponent({ requestRender: () => { renders += 1; } }, undefined, () => { done += 1; }, options);
+  component.render(180, 30); // A chooser action requires an actually displayed selection.
   return { component, options, opened, handles, get renders() { return renders; }, get done() { return done; }, get referenceUnsubscribes() { return referenceUnsubscribes; }, setReferences: (refs: ZergNativeSessionReference[]) => { references = refs; referenceListener(); }, referenceListener: () => referenceListener() };
 }
 
@@ -42,6 +43,7 @@ test('coding chooser never implicitly chooses a leader; concurrent definitions u
   assert.match(f.component.render(180, 20).join('\n'), /team-b/);
   f.component.handleInput('down');
   f.component.handleInput('down');
+  f.component.render(180, 20);
   f.component.handleInput('enter');
   await tick();
   assert.deepEqual(f.opened, [{ parentRunId: 'team-b', memberRunId: 'worker', piSessionId: 'pi-team-b-worker' }]);
@@ -57,6 +59,7 @@ test('empty, removed and stale references are explicit and do not fall back', as
   assert.equal(f.opened.length, 0);
   assert.match(f.component.render(100, 20).join('\n'), /No native sessions/);
   f.setReferences([reference()]);
+  f.component.render(100, 20);
   f.component.handleInput('enter');
   await tick();
   f.setReferences([reference('other')]);
@@ -66,6 +69,7 @@ test('empty, removed and stale references are explicit and do not fall back', as
   f.component.dispose();
   let refs = [reference()];
   const stale = new ZergAgentOverlayComponent(undefined, undefined, undefined, { getReferences: () => refs, subscribeReferences: () => () => undefined, open: async () => { throw new Error('must not open stale'); } });
+  stale.render(100, 20);
   refs = [];
   stale.handleInput('enter');
   await tick();
@@ -122,9 +126,11 @@ test('switch and close abort only viewer loads; late handles disposed and callba
     subscribeReferences: (listener) => { referenceListener = listener; return () => undefined; },
     open: (key, options) => new Promise((resolve) => { pending.push({ key, signal: options?.signal, resolve }); }),
   });
+  component.render(180, 30);
   component.handleInput('enter');
   component.handleInput('s');
   component.handleInput('down');
+  component.render(180, 30);
   component.handleInput('enter');
   assert.equal(pending[0]!.signal?.aborted, true);
   pending[0]!.resolve({ getSnapshot: () => snapshot(pending[0]!.key), subscribe: () => { subscriptions += 1; return () => undefined; }, dispose: () => { disposals[0]! += 1; } });
@@ -151,6 +157,7 @@ test('close removes both watchers once and never receives a runner API', async (
   f.component.handleInput('s');
   assert.equal(f.handles[0]!.unsubscribeCount, 1);
   assert.equal(f.handles[0]!.disposeCount, 1);
+  f.component.render(180, 30);
   f.component.handleInput('enter');
   await tick();
   f.component.dispose();
@@ -175,6 +182,7 @@ test('failed open, identity mismatch and throwing observers cannot leak handles'
         return { getSnapshot: () => { if (fault === 'snapshot') throw new Error('corrupt history'); return snapshot(fault === 'identity' ? reference('wrong') : key); }, subscribe: () => { if (fault === 'subscribe') throw new Error('observer unavailable'); return () => { throw new Error('unsubscribe'); }; }, dispose: () => { disposed += 1; throw new Error('cleanup'); } };
       },
     });
+    component.render(180, 30);
     component.handleInput('enter');
     await tick();
     assert.match(component.render(120, 20).join('\n'), /unavailable/i, fault);
@@ -245,6 +253,7 @@ test('formatted cache is single-width, bounded and invalidated for theme/revisio
   let color = '31';
   let styles = 0;
   const component = new ZergAgentOverlayComponent(undefined, { fg: (_token, text) => { styles += 1; return `\x1b[${color}m${text}\x1b[0m`; } }, undefined, f.options);
+  component.render(180, 30);
   component.handleInput('enter');
   await tick();
   component.handleInput('home');
@@ -328,12 +337,14 @@ test('throwing redraw callbacks are contained across async open, updates and clo
   const f = fixture();
   let done = 0;
   const component = new ZergAgentOverlayComponent({ requestRender: () => { throw new Error('host redraw'); } }, undefined, () => { done += 1; }, f.options);
+  component.render(180, 30);
   assert.doesNotThrow(() => component.handleInput('enter'));
   await tick(); // An unhandled rejection here fails the Node test runner.
   const h = f.handles[0]!;
   assert.doesNotThrow(() => h.listener());
   assert.match(component.render(100, 30).join('\n'), /Viewer redraw unavailable/);
   assert.doesNotThrow(() => component.handleInput('s'));
+  component.render(180, 30);
   component.handleInput('enter');
   await tick();
   assert.doesNotThrow(() => component.handleInput('q'));
@@ -405,6 +416,7 @@ function composerFixture() {
   };
   const component = new ZergAgentOverlayComponent({ terminal: { rows: 32 }, requestRender: () => undefined }, undefined, undefined, { ...f.options, composer });
   component.focused = true;
+  component.render(180, 30);
   return { ...f, component, composer, calls, watchers, receipt, get state() { return state; }, setState(patch: Partial<Omit<ZergComposerState, 'key'>>) { state = { ...state, ...patch }; watchers.at(-1)?.listener(); },
     close() { component.dispose(); f.component.dispose(); } };
 }
@@ -501,6 +513,7 @@ test('in-flight sends are not duplicated and successful completion never clears 
   f.component.handleInput('s');
   f.component.handleInput('down');
   f.component.handleInput('down');
+  f.component.render(180, 30);
   f.component.handleInput('enter');
   await tick();
   f.component.handleInput('c');
@@ -989,6 +1002,7 @@ test('service-present live viewer preserves b inspection and c send; typed n rem
     },
   });
   component.focused = true;
+  component.render(180, 40);
   component.handleInput('enter'); await tick();
   component.render(180, 40); component.handleInput('n');
   assert.match(component.render(180, 40).join('\n'), /NEW continuation disabled/);
@@ -1030,5 +1044,79 @@ test('captured and recovered displays preserve confirmed disposed closure withou
     assert.equal(f.prepares[0]?.body, `NEW ${kind} task`, kind);
     assert.equal(f.starts.length, 0, kind);
     f.component.dispose();
+  }
+});
+
+
+test('chooser only opens the last rendered selected tuple, never an unseen replacement or navigation', async () => {
+  const f = fixture([reference('a'), reference('b')]);
+  f.setReferences([reference('replacement'), reference('b')]);
+  f.component.handleInput('ignored-key');
+  f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 0);
+  assert.match(f.component.render(180, 30).join('\n'), /stale or not yet displayed/);
+  f.component.handleInput('down');
+  f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 0, 'moving a cursor does not prove a new selected frame');
+  f.component.render(180, 30);
+  f.setReferences([reference('b'), reference('replacement')]);
+  f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 0, 'reordered selected index requires a new frame');
+  f.component.render(180, 2);
+  f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 0, 'clipped-away choice is not displayed');
+  f.component.render(180, 30);
+  f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 1);
+  assert.equal(f.opened[0]?.memberRunId, 'b');
+  f.component.dispose();
+});
+
+test('noncoercible reference/open/snapshot/composer failures are contained and readable', async () => {
+  const faults: unknown[] = [Object.create(null), { toString() { throw new Error('coercion forbidden'); } },
+    Object.defineProperty(new Error(), 'message', { get() { throw new Error('message forbidden'); } })];
+  for (const error of faults) {
+    for (const fault of ['references', 'referenceSubscribe', 'open', 'snapshot']) {
+      let done = 0;
+      const c = new ZergAgentOverlayComponent(undefined, undefined, () => { done++; }, {
+        getReferences: () => { if (fault === 'references') throw error; return [reference()]; },
+        subscribeReferences: () => { if (fault === 'referenceSubscribe') throw error; return () => undefined; },
+        open: async (key) => { if (fault === 'open') throw error; return { getSnapshot: () => { throw error; }, subscribe: () => () => undefined, dispose: () => undefined }; },
+      });
+      assert.doesNotThrow(() => c.render(180, 30));
+      if (fault === 'open' || fault === 'snapshot') { c.handleInput('enter'); await tick(); }
+      assert.match(c.render(180, 30).join('\n'), /Unknown failure/);
+      c.dispose(); assert.equal(done, 1);
+    }
+    for (const fault of ['state', 'subscribe', 'send']) {
+      const f = composerFixture();
+      if (fault === 'state') f.composer.getState = () => { throw error; };
+      if (fault === 'subscribe') f.composer.subscribe = () => { throw error; };
+      if (fault === 'send') f.composer.send = async () => { throw error; };
+      await compose(f);
+      f.component.handleInput('retained body'); f.component.handleInput('\x13'); await tick();
+      assert.match(f.component.render(240, 30).join('\n'), /Unknown failure/);
+      f.close();
+    }
+  }
+});
+
+test('coding custom host sync throw and async rejection release watchers and finish even if cleanup throws', async () => {
+  for (const sync of [true, false]) {
+    let watchers = 0; let done = 0; let unsubs = 0; let renders = 0;
+    let listener: () => void = () => undefined;
+    const error = Object.create(null);
+    const promise = openZergAgentOverlay({ ui: { custom(factory) {
+      (factory as (tui: { requestRender(): void }, theme: undefined, keys: undefined, done: () => void) => ZergAgentOverlayComponent)(
+        { requestRender: () => { renders++; } }, undefined, undefined, () => { done++; throw error; });
+      if (sync) throw error;
+      return Promise.reject(error);
+    } } }, {
+      getReferences: () => [reference()], subscribeReferences: (next) => { watchers++; listener = next; return () => { watchers--; unsubs++; throw error; }; },
+      open: async () => { throw new Error('must not open'); },
+    });
+    await assert.rejects(promise);
+    const before = renders; listener();
+    assert.equal(watchers, 0); assert.equal(unsubs, 1); assert.equal(done, 1); assert.equal(renders, before);
   }
 });
