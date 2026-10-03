@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.10' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.11' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -173,6 +173,31 @@ export interface ZergSubagentMemberProgress {
 }
 
 /** Pi-assigned locator and attachment state, not a transcript durability claim. */
+export type ZergSessionMessageKey = Pick<ZergNativeSessionReference, 'parentRunId' | 'memberRunId' | 'piSessionId'>;
+export interface ZergSessionMessageReceipt {
+  schemaVersion: 1;
+  messageId: string;
+  key: ZergSessionMessageKey;
+  body: string;
+  mode: ZergOperatorMessageMode;
+  status: 'recorded' | 'queued' | 'delivered' | 'failed' | 'needs-attention';
+  detail: string;
+  createdAt: string;
+  updatedAt: string;
+  persistence: 'memory' | 'saved' | 'failed';
+}
+export interface ZergSessionMessageInput {
+  key: ZergSessionMessageKey;
+  messageId: string;
+  body: string;
+  mode: ZergOperatorMessageMode;
+}
+export interface ZergSessionMessageResult {
+  ok: boolean;
+  message: string;
+  receipt?: ZergSessionMessageReceipt;
+}
+
 export interface ZergNativeSessionReference {
   schemaVersion: 1;
   parentRunId: string;
@@ -280,6 +305,8 @@ export type ZergControlAction =
   | { action: 'run'; agent: string; task: string; background?: boolean; launchMode?: ZergSubagentLaunchMode; concurrency?: number; model?: string; fallbackModels?: string[]; maxTurns?: number }
   | { action: 'runs.list' }
   | { action: 'runs.show'; runId: string }
+  | ({ action: 'session.message.send'; messageId: string; body: string; mode: ZergOperatorMessageMode } & ZergSessionMessageKey)
+  | ({ action: 'session.messages.list'; limit?: number } & ZergSessionMessageKey)
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }
   | { action: 'message'; targetId: string; body: string; runId?: string; mode?: ZergOperatorMessageMode }
   | { action: 'interrupt'; runId?: string };

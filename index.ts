@@ -7,6 +7,7 @@ import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
+import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
 import { openZergAgentOverlay } from './ui/agent-overlay.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
 import { renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
@@ -25,6 +26,8 @@ export interface ZergCommandHandlerOptions {
   persistence?: ZergPersistenceOptions;
   /** Explicit owner-scoped observer sharing; closing a viewer never disposes a runner. */
   nativeTranscriptService?: NativeTranscriptService;
+  /** Exact owner capability; independent of the strictly read-only observer. */
+  sessionMessageService?: SessionMessageService;
 }
 
 type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager };
@@ -180,10 +183,11 @@ export function registerZergSwarmExtension(
     subscribe: (listener) => stateContainer.subscribe?.(listener) ?? (() => undefined),
   };
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(syncedStateContainer) });
-  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService } as RuntimeCommandOptions;
+  const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(syncedStateContainer, persistenceManager, options.now);
+  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   if (typeof context.on === 'function') {
-    const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
+    const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownSessionMessages(sessionMessageService); shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
     if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
   }
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
@@ -233,6 +237,7 @@ export function registerZergSwarmExtension(
         // Preserve startup failure.
       }
     }
+    shutdownSessionMessages(sessionMessageService);
     shutdownNativeTranscript(nativeTranscriptService);
     throw error;
   }
@@ -253,6 +258,7 @@ export function registerZergSwarmExtension(
       }
 
       disposed = true;
+      shutdownSessionMessages(sessionMessageService);
       shutdownNativeTranscript(nativeTranscriptService);
       let firstError: unknown;
 
@@ -335,6 +341,10 @@ export interface ZergControlOptions extends ZergCommandHandlerOptions {
   syncSharedState?: boolean;
 }
 
+function createOwnedMessageService(container: ZergStateContainer, persistenceManager: ZergPersistenceManager | undefined, now?: () => Date): SessionMessageService {
+  return createSessionMessageService({ container, now, readOnly: () => container.read().mode.readOnly === true,
+    ...(persistenceManager ? { save: (state: ZergState) => persistenceManager.save(state, now) } : {}) });
+}
 export function createZergControl(
   stateOrContainer: ZergStateContainer | Partial<ZergState> = createZergStateContainer(),
   options: ZergControlOptions = {},
@@ -362,7 +372,8 @@ export function createZergControl(
     }
     : baseContainer;
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(container) });
-  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService } as RuntimeCommandOptions;
+  const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(container, persistenceManager, options.now);
+  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
   const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
   runtimeOptions.subagentAdapter = adapter;
 
@@ -374,6 +385,7 @@ export function createZergControl(
       return container.snapshot();
     },
     dispose() {
+      if (!options.sessionMessageService) shutdownSessionMessages(sessionMessageService);
       if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService);
       if (!options.subagentAdapter) {
         adapter.dispose?.();
@@ -540,6 +552,24 @@ async function executeZergControlAction(
         const records = getZergLogs(snapshot, { runId: action.runId, level: action.level, limit: action.limit });
         return controlOk(action.action, { records }, renderZergLogList(records, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision, { runId: action.runId });
       }
+      case 'session.message.send': {
+        const key = { parentRunId: action.parentRunId, memberRunId: action.memberRunId, piSessionId: action.piSessionId };
+        const input = { key, messageId: action.messageId, body: action.body, mode: action.mode };
+        if (!validateSessionMessageInput(input)) return controlError(action.action, 'invalid_request', 'Valid exact session IDs, messageId, mode and literal body are required.', container.read().revision);
+        if (container.read().mode.readOnly) return controlError(action.action, 'read_only', 'Read-only control blocks exact-session messaging.', container.read().revision);
+        if (signal?.aborted) return controlError(action.action, 'request_cancelled', 'Message request cancelled before enqueue.', container.read().revision);
+        const result = await options.sessionMessageService?.send(input, signal);
+        if (!result) return controlError(action.action, 'transport_unavailable', 'Exact session messaging is unavailable.', container.read().revision);
+        return result.ok ? controlOk(action.action, result, result.message, container.read().revision, { runId: key.parentRunId })
+          : { ...controlError(action.action, 'message_not_confirmed', result.message, container.read().revision, { runId: key.parentRunId }), data: result };
+      }
+      case 'session.messages.list': {
+        const key = { parentRunId: action.parentRunId, memberRunId: action.memberRunId, piSessionId: action.piSessionId };
+        if (!validateSessionMessageKey(key) || (action.limit !== undefined && (!Number.isSafeInteger(action.limit) || action.limit < 1 || action.limit > 128))) return controlError(action.action, 'invalid_request', 'Exact session IDs and limit 1..128 are required.', container.read().revision);
+        if (!options.sessionMessageService) return controlError(action.action, 'transport_unavailable', 'Exact receipt ledger unavailable.', container.read().revision);
+        const receipts = options.sessionMessageService.list(key, action.limit);
+        return controlOk(action.action, { key, receipts }, receipts.map((receipt) => `${receipt.messageId}: ${receipt.status} (${receipt.persistence}) ${receipt.detail}`).join('\n') || 'No exact-session message receipts.', container.read().revision, { runId: key.parentRunId });
+      }
       case 'message': {
         const snapshot = container.snapshot();
         if (!action.targetId || !action.body?.trim()) return controlError(action.action, 'invalid_request', 'message requires targetId and body.', snapshot.revision, { runId: action.runId });
@@ -605,8 +635,13 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
         targetId: { type: 'string' },
         body: { type: 'string' },
         runId: { type: 'string' },
-        mode: { type: 'string', enum: ['steer', 'followUp'], default: 'steer' },
+        mode: { type: 'string', enum: ['steer', 'followUp'], description: 'Required explicitly for session.message.send. Legacy message defaults to steer when omitted.' },
         concurrency: { type: 'integer', minimum: 1, description: 'Positive safe integer per-run native team worker concurrency for run actions; defaults to 8.' },
+        parentRunId: { type: 'string' },
+        memberRunId: { type: 'string' },
+        piSessionId: { type: 'string' },
+        messageId: { type: 'string' },
+        limit: { type: 'number', description: 'session.messages.list requires a safe integer 1..128; logs.list retains its existing limit semantics.' },
       },
       required: ['action'],
     },
@@ -660,12 +695,14 @@ function isZergControlActionName(value: string): value is ZergControlAction['act
     || value === 'runs.list'
     || value === 'runs.show'
     || value === 'logs.list'
+    || value === 'session.message.send'
+    || value === 'session.messages.list'
     || value === 'message'
     || value === 'interrupt';
 }
 
 export { createZergPersistenceManager, recoverZergStateAfterRestart } from './persistence.js';
-export type { ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot } from './types.js';
+export type { ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot, ZergSessionMessageKey, ZergSessionMessageInput, ZergSessionMessageReceipt, ZergSessionMessageResult } from './types.js';
 
 export function createZergCommandHandler(
   stateOrReader: ZergStateSource,
@@ -3355,6 +3392,7 @@ function createPiSlashBridgeAdapter(
       if (!active && (pending?.completed || (stateRun && isTerminalRunSnapshot(stateRun)))) {
         return { ok: false, runId: target, message: `Zerg run is already terminal: ${target}` };
       }
+      closeSessionMessagesParent(options.sessionMessageService, target);
       events.emit!(SLASH_SUBAGENT_CANCEL_EVENT, { requestId: target });
       const abortResult = active ? requestPiNativeAbort(target, activeRuns) : { ok: false, message: 'bridge interrupt requested before native start' };
       const now = resolveTimestamp();
@@ -3386,6 +3424,7 @@ function createPiSlashBridgeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      shutdownSessionMessages(options.sessionMessageService);
       shutdownNativeTranscript(options.nativeTranscriptService);
       for (const [runId] of fallbackLaunches) {
         settleFallbackLaunch(runId);
@@ -3510,6 +3549,7 @@ function createPiNativeAdapter(
       if (existingRun && isTerminalRunSnapshot(existingRun)) {
         return { ok: false, runId: target, message: `Zerg run is already terminal: ${target}` };
       }
+      closeSessionMessagesParent(runtimeOptions.sessionMessageService, target);
       const abortResult = requestPiNativeAbort(target, activeRuns);
       if (!abortResult.ok) {
         return { ok: false, runId: target, message: abortResult.message };
@@ -3538,6 +3578,7 @@ function createPiNativeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      shutdownSessionMessages(runtimeOptions.sessionMessageService);
       shutdownNativeTranscript(runtimeOptions.nativeTranscriptService);
       for (const runId of activeRuns.keys()) {
         const now = (runtimeOptions.now ?? (() => new Date()))().toISOString();
@@ -3817,6 +3858,7 @@ async function runSinglePiNativeAgent(
   let reference: ZergNativeSessionReference | undefined;
   let releaseTranscript: (() => void) | undefined;
   let unsubscribe: (() => void) | undefined;
+  let releaseMessages: (() => void) | undefined;
   let capturedResponse: string | undefined;
   let assistantOutcome: PiNativeAssistantOutcome | undefined;
   const captureResponse = (value: unknown) => {
@@ -3890,6 +3932,15 @@ async function runSinglePiNativeAgent(
       return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before prompt' };
     }
     updateMemberProgress(run, definition.id, 'running', { handoffPath: run.handoffPath });
+    try {
+      const exact = { parentRunId: reference.parentRunId, memberRunId: reference.memberRunId, piSessionId: reference.piSessionId };
+      releaseMessages = run.options.sessionMessageService?.register(exact, {
+        accepting: () => !run.activeRun?.cancelRequested && !run.activeRun?.disposed && session.sessionId === exact.piSessionId && session.isStreaming && !session.isCompacting,
+        subscribe: (listener) => session.subscribe(listener),
+        enqueue: (input) => session.sendCustomMessage({ customType: OPERATOR_CUSTOM_TYPE, content: input.body, display: true,
+          details: { schemaVersion: 1, ...input.key, messageId: input.messageId, mode: input.mode, agentDefinitionId: definition.id } }, { deliverAs: input.mode }),
+      });
+    } catch { /* Receipt integration cannot own task execution. */ }
     const promptResult = await session.prompt(run.task, { source: 'extension' as never });
     captureResponse(promptResult);
     const finalMessages = sessionHandle.messages;
@@ -3955,6 +4006,7 @@ async function runSinglePiNativeAgent(
     updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
     return { agentId: definition.id, status, message };
   } finally {
+    try { releaseMessages?.(); } catch { /* Messaging cleanup never owns SDK disposal. */ }
     try { releaseTranscript?.(); } catch { /* Observer cleanup never owns SDK disposal. */ }
     try {
       try {
@@ -4984,9 +5036,18 @@ export function createPiZergCommandHandler(
     getReferences: () => { const refs = transcript.list(); return select ? select(refs) : refs; },
     subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
     open: (key, openOptions) => transcript.open(key, openOptions),
+    composer: options.sessionMessageService,
   });
 
   return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
+    const routed = stripOptionalZergInvocation(input.trimStart());
+    if (/^sessions\s+(send|messages)(?:\s|$)/i.test(routed)) {
+      const container = getWritableStateContainer(stateOrReader);
+      const parsed = parseSessionMessagingCommand(routed);
+      if (!container || !parsed) { context.ui?.notify?.('Usage: /zerg sessions send <parent> <member> <pi-id> <message-id> <steer|followUp> -- <literal body>; sessions messages <parent> <member> <pi-id> [limit]', 'error'); return; }
+      const response = await executeZergControlAction(container, parsed, runtimeOptions);
+      context.ui?.notify?.(response.output ?? response.error?.message ?? 'Message outcome unavailable.', response.ok ? 'info' : 'error'); return;
+    }
     const normalized = normalizeZergCommandInput(input);
     const result = await scaffoldHandler(input);
     const output = typeof result === 'string' ? result : result.output;
@@ -5467,4 +5528,22 @@ function dispatchSessionsCommand(state: ZergStateSource, payload: string): ZergC
 
 function shutdownNativeTranscript(service: NativeTranscriptService | undefined): void {
   try { service?.shutdown(); } catch { /* An observer cannot prevent runner cancellation/disposal. */ }
+}
+
+function parseSessionMessagingCommand(input: string): ZergControlAction | undefined {
+  const send = input.match(/^sessions\s+send\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(steer|followUp)\s+-- ([\s\S]*)$/i);
+  if (send) {
+    const [, parentRunId, memberRunId, piSessionId, messageId, mode, body] = send;
+    return { action: 'session.message.send', parentRunId, memberRunId, piSessionId, messageId, mode: mode.toLowerCase() === 'steer' ? 'steer' : 'followUp', body };
+  }
+  const list = input.match(/^sessions\s+messages\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+(\d+))?\s*$/i);
+  if (list) return { action: 'session.messages.list', parentRunId: list[1]!, memberRunId: list[2]!, piSessionId: list[3]!, ...(list[4] ? { limit: Number(list[4]) } : {}) };
+  return undefined;
+}
+
+function shutdownSessionMessages(service: SessionMessageService | undefined): void {
+  try { service?.shutdown(); } catch { /* Receipt faults cannot block SDK disposal. */ }
+}
+function closeSessionMessagesParent(service: SessionMessageService | undefined, parentRunId: string): void {
+  try { service?.closeParent(parentRunId); } catch { /* Receipt faults cannot block cancellation. */ }
 }

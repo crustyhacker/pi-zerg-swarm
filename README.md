@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.10 release status**
-> Adds a read-only coding overlay for exact native agent sessions: live responses/tool activity, saved raw history, and local branch inspection. Closing the viewer never stops a run. This is not yet long-lived agents, a conversation composer, or resume controls. Existing bounded concurrency, truthful outcomes, fail-closed native capability checks, structured control, and opt-in restart snapshots are preserved.
-> Restart recovery restores inspectable run/log state and marks previously active native sessions as needing attention; it does not reconnect to a pre-restart live LLM session.
+> **v1.1.11 release status**
+> Adds an explicit composer for exact live native sessions, with literal steer/follow-up messages, stable IDs, and honest receipt/durability states. History and branch inspection remain read-only; closing the viewer never stops a run. Existing bounded concurrency, truthful outcomes, fail-closed capability checks, and opt-in snapshots are preserved.
+> Restart restores inspectable history and quarantines pending receipts; it never reconnects, resumes, or automatically resends. Long-lived agents, a team timeline, and resume controls are not included.
 
 ## Release status
 
-- Current release: **v1.1.10** (read-only native coding overlay and safe history inspection).
+- Current release: **v1.1.11** (exact live messaging, an agent composer, and no-replay receipts).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -29,7 +29,7 @@ Pi supplies its SDK and TUI libraries to installed extensions. They are declared
 At v1.1.0 these commands display help, status, expanded tree visibility, deterministic thinking-step parser output, Claude Code-style runtime agent-definition configuration, native Pi SDK-backed run execution, task-first subagent spawn state, explicit fresh/fork launch-mode metadata, command-host permission queue state, fine-grained lifecycle substate hints, bounded structured log/output inspection, restart-durable run/log recovery snapshots, process-lifetime background run status/interrupt/message support, and a componentized Pi-native interactive management TUI for live tree/detail/settings/chat/footer management views through snapshot-safe shared-state-backed Pi command handlers.
 Command-host control grammar is available via `/zerg mode status|manual|assisted|automatic|revert [reason]`, `/zerg intervene agent|subagent|leader ...`, `/zerg agents list|show|create|update|delete` with per-agent `--model`, `--fallback-models`, `--max-turns`, tools, and permission settings, `/zerg agent`/`/zerg team` lifecycle configuration flags for team leaders/members/model metadata, `/zerg runs list|show <run-id>`, `/zerg permission status|list|request|approve|deny|cancel`, `/zerg logs status|list|show|json`, `/zerg config`, and `/zerg run <agent-or-team> <task> [--bg] [--fresh|--fork] [--model <model>]`; `/zerg run` does not require `pi-subagents` and uses the native Pi SDK runner when no slash bridge responds.
 
-`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane to open the separate read-only coding viewer. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
+`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane to open the separate coding overlay; its explicit live composer is distinct from the management intervention history. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
 
 ## Direct automation API
 
@@ -58,15 +58,53 @@ Sessions still dispose after each task. `disposed` means confirmed SDK cleanup, 
 
 Session runtimes still end after their tasks. Reference inspection and hydration do not read, create, repair, or scan transcript files. Explicit viewing is separate and validates the known location, Pi header, immutable provenance, and entry graph; it never resumes execution or changes the active branch.
 
-## Read-only agent coding overlay
+## Agent coding overlay
 
 - `/zerg sessions [parent-run-id]` opens an **exact-session chooser** in an interactive Pi TUI. No leader or operator conversation is selected implicitly. `/zerg sessions list [parent-run-id]` prints bounded references and also works without a terminal UI; command aliases are preserved.
-- Select a row and press **Enter** to inspect live text, available thinking text, and tool arguments/results. **Home** exposes full parent/member/Pi IDs. **Up/Down**, **PageUp/PageDown**, and **Home** pause tail following; **End** follows the live default leaf again. **s** returns to sessions, **b** chooses a raw branch locally, and **q/Esc** closes.
+- Select a row and press **Enter** to inspect live text, available thinking text, and tool arguments/results. **Home** exposes full parent/member/Pi IDs. **Up/Down**, **PageUp/PageDown**, and **Home** pause tail following; **End** follows the tail on the live default branch. **s** returns to sessions, **b** chooses a raw branch locally (choose **Default** to return), and **q/Esc** closes when not composing.
 - `live` means an observer is connected to this owner's native runtime. An already-open viewer becomes `captured` when observation ends: its bounded final display remains, without claiming a durable file or reconnection. Reopening reads `saved` history when validation succeeds; `unavailable` explains missing, unsupported, unsafe, or disconnected state. A saved history from an unconfirmed attachment is explicitly history-only, not a live or confirmed-closed session.
 - This is **raw branch history, not effective model context**. Compaction/context-edit records are notices, not reconstructed model context. Saved history defaults to the last recorded entry, which is not proof of the active leaf. Branch selection never navigates or mutates the native session.
 - Pi JSONL is the sole transcript store. Reads are limited to known, regular, non-symlink v3 files under the configured Pi agent session directory, with matching header and provenance. Missing/corrupt/partial/oversized files are not repaired or opened through `SessionManager.open`; no directories are created or transcripts scanned. Moving a file or changing the agent directory can make its reference unavailable.
 - Views are bounded: saved inputs allow up to 8 MiB, 256 KiB per line, and 10,000 entries; normalized display retains up to 200 blocks with aggregate and per-field limits. Live tool previews can be shorter than finalized results. UI line/text limits and omission notices are explicit. Images, opaque payloads, and thinking signatures are omitted; terminal controls are stripped.
-- Closing/switching a viewer unsubscribes only that viewer. Runs, native persistence, concurrency slots, cancellation, and task-final SDK disposal retain their existing ownership. There is no composer, transcript tool action, automatic prompt/replay/resume, active-branch mutation, or retained completed SDK session.
+- Closing/switching a viewer unsubscribes only that viewer. Runs, native persistence, concurrency slots, cancellation, and task-final SDK disposal retain their existing ownership. There is no transcript tool action, automatic prompt/replay/resume, active-branch mutation, or retained completed SDK session.
+
+### Explicit live messages and receipts
+
+On an exact, accepting **live default branch**, press **c** to compose. **Enter** inserts a newline; **Ctrl+S** explicitly sends; **Alt+M** selects `followUp` (default) or `steer`. **Esc** leaves composition while retaining the draft; another Esc closes the viewer. Pi's public editor handles text editing and normalizes pasted newlines/tabs. Drafts are bounded to 16,384 UTF-16 code units; unsafe/oversized paste packets are rejected visibly. Composition is disabled below 12 columns or 10 rows. Saved, captured, disconnected, completed, read-only, and explicitly selected historical branches cannot send.
+
+Messages target the exact `{parentRunId, memberRunId, piSessionId}` in this owner, never a guessed leader or another run of the same definition. `steer` enters at the next steering boundary; `followUp` waits for current tool/steering work to drain. Literal message content uses Pi's public custom-message queue, bypassing slash commands, templates, and input handlers. Receipt metadata stays outside model context. Closing the viewer does not cancel an already submitted message or the run.
+
+The additive control actions also work without a TUI:
+
+```ts
+const key = { parentRunId, memberRunId, piSessionId }; // exact chosen reference
+await control.execute({ action: 'session.message.send', ...key,
+  messageId: 'operator-unique-001', body: 'Check the failing test first.', mode: 'followUp' });
+await control.execute({ action: 'session.messages.list', ...key, limit: 32 });
+```
+
+Equivalent slash commands (aliases remain supported):
+
+```text
+/zerg sessions send <parent> <member> <pi-id> <message-id> <steer|followUp> -- <literal body>
+/zerg sessions messages <parent> <member> <pi-id> [limit]
+```
+
+Send mode is explicit in the new API/CLI. The body after the `-- ` separator is literal, including legal tabs, newlines, indentation, and trailing whitespace; shell-style quotes are not removed. Responses expose `data.receipt` or `data.receipts`. The existing `message` action and management intervention history are unchanged.
+
+| Receipt | Meaning |
+| --- | --- |
+| `recorded` | Local intent recorded; not native acceptance. |
+| `queued` | Native queue accepted it; consumption is not yet confirmed. |
+| `delivered` | ID-correlated native `message_start` consumption observed—not provider acknowledgement, understanding, completion, or transcript durability. |
+| `failed` | Rejected before native enqueue. |
+| `needs-attention` | Enqueue/consumption is uncertain, or a pending receipt survived detachment/restart. |
+
+A caller ID is unique across the retained ledger. Repeating the same ID with the same exact key/body/mode returns its receipt without sending again; conflicting reuse rejects. The composer keeps its attempt ID for an unchanged unconfirmed draft. **There are no automatic retries or restart replays.** A deliberately new ID is a new message, not a safe retry of an uncertain one.
+
+Receipt persistence is independently `memory`, `saved`, or `failed`. With existing opt-in snapshot persistence, a successful intent write is required before enqueue; a later save failure does not revoke known queued/delivered status. `saved` means a successful Zerg snapshot write—not fsync/power-loss protection or a durable native transcript. Recovery quarantines pending receipts as `needs-attention` without scanning history, reconnecting, or executing anything. Use one owner per snapshot file; this is not a cross-process mailbox.
+
+The ledger retains at most 128 receipts and 262,144 aggregate body UTF-16 code units, with at most 32 pending per exact session. Capacity exhaustion rejects new messages instead of silently evicting idempotency records; there is no automatic pruning. The overlay shows at most eight receipts; structured listing supports limits 1–128. Outgoing intent bodies are stored for inspection/idempotency, not as a second conversation transcript. Long-lived agents, automatic sibling push/wakeup, a team communication timeline, and explicit resume/fork controls remain separate work.
 
 ## Architecture
 
@@ -125,7 +163,8 @@ The TypeScript modules are intentionally small:
 - `render.ts` — width-aware text rendering
 - `persistence.ts` — restart-durable run/log snapshot save, load, and recovery helpers
 - `native-transcript.ts` — owner-scoped read-only live observers and validated native history loading
-- `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, and local branch inspection
+- `session-messages.ts` — exact live message admission, bounded receipts, persistence barriers, and no-replay recovery
+- `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, explicit composer, and local branch inspection
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
 
@@ -184,8 +223,9 @@ npm run check:version
 - v1.1.7: patch release bounding native team worker concurrency with configurable FIFO admission and cancellation-safe queuing
 - v1.1.8: patch release rejecting unsupported native fork, turn limits, and fallback models before session startup
 - v1.1.9: patch release mapping exact native session identities and immutable transcript provenance
-- v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection (current release)
-- Next: reliable two-way workspace messaging/composer, a team communication timeline, and explicit branch/resume/recovery controls
+- v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection
+- v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts (current release)
+- Next: a team communication timeline, explicit branch/resume/recovery controls, and integrated workspace hardening
 
 ## License
 
@@ -198,7 +238,7 @@ MIT © 2026 Marc Mironescu (@crustyhacker) <marcm@crustyhacker.dev>
 - `tools: []` means no tools. `disallowedTools`/denylist entries remove tools from an allowlist; this is not a sandbox boundary.
 - Native permission modes `manual` and `assisted` are not supported for Pi SDK runner launches; use inherited/default automatic behavior or reject before model execution.
 - Native Pi SDK execution fails closed for `--fork`/`launchMode: 'fork'`, nondefault `maxTurns`, and nonempty `fallbackModels`: the selected leader and every selected team member are checked before any SDK session starts. Clear those options for native runs, or use a supported external adapter/acknowledged slash bridge that implements them. This limitation is in the zerg native runner wiring; Pi's session runtime has fork support, but this runner does not wire parent history yet.
-- Operator messages require a live run/member route. Native delivery reports Pi `steer`/`followUp` acknowledgement as `queued` or `handled`; UI-local drafts may still use `queued-local` and are not delivery proof.
-- Structured `zerg_control` message mode accepts only `steer` or `followUp` (default `steer`); ambiguous live target routes require an explicit `runId`.
+- Legacy operator `message` calls require a live run/member route. Their Pi `steer`/`followUp` acknowledgement remains `queued` or `handled`; UI-local management drafts may use `queued-local` and are not delivery proof. The additive exact-session API has the separate receipt contract described above.
+- Legacy structured `zerg_control` `message` mode accepts only `steer` or `followUp` (default `steer`); ambiguous live target routes require an explicit `runId`. New `session.message.send` requires an explicit mode and all three session IDs.
 - Native team workers have a per-run concurrency limit (default **8**). Set it with `/zerg run <team> "<task>" --concurrency <n>` (also `--concurrency=<n>`) or a positive safe-integer number in structured `zerg_control` run `concurrency: n`. This is not a global/provider-wide limit, and external adapters are responsible for their own enforcement.
 - Workers are admitted FIFO; each slot covers session setup and execution. Worker failure releases its slot without blocking the remaining queue. The leader runs after all workers settle, unless the run is cancelled. Cancellation prevents queued workers from starting; skipped workers finish as cancelled without a start timestamp.

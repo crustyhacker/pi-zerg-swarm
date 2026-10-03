@@ -1,20 +1,54 @@
-import { Text, stripTerminalSequences, truncateToWidth } from '@earendil-works/pi-tui';
+import { randomUUID } from 'node:crypto';
+import { CURSOR_MARKER, Editor, getKeybindings, matchesKey as piMatchesKey, Text, stripTerminalSequences, truncateToWidth, type Focusable, type TUI } from '@earendil-works/pi-tui';
 import type { NativeTranscriptKey, NativeTranscriptReadHandle, NativeTranscriptSnapshot } from '../native-transcript.js';
 import type { StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergNativeSessionReference } from '../types.js';
 import { styleText, type UiThemeLike } from './components.js';
 import { matchesKey } from './state.js';
 
+export type ZergComposerMode = 'steer' | 'followUp';
+export type ZergReceiptPersistence = 'memory' | 'saved' | 'failed';
+export interface ZergComposerReceipt {
+  messageId: string;
+  key: NativeTranscriptKey;
+  status: 'recorded' | 'queued' | 'delivered' | 'failed' | 'needs-attention';
+  detail: string;
+  createdAt: string;
+  updatedAt: string;
+  persistence: ZergReceiptPersistence;
+}
+export interface ZergComposerState {
+  key: NativeTranscriptKey;
+  canSend: boolean;
+  reason?: string;
+  allowedModes: ZergComposerMode[];
+  persistence: ZergReceiptPersistence;
+  receipts: ZergComposerReceipt[];
+  droppedReceipts?: number;
+}
+export interface ZergOverlayComposer {
+  getState(key: NativeTranscriptKey): ZergComposerState;
+  subscribe(key: NativeTranscriptKey, listener: () => void): () => void;
+  send(request: { key: NativeTranscriptKey; messageId: string; body: string; mode: ZergComposerMode }): Promise<{ ok: boolean; message: string; receipt?: ZergComposerReceipt }>;
+}
 export interface ZergAgentOverlayOptions {
   getReferences(): ZergNativeSessionReference[];
   subscribeReferences(listener: () => void): () => void;
   open(key: NativeTranscriptKey, options?: { signal?: AbortSignal }): Promise<NativeTranscriptReadHandle>;
+  composer?: ZergOverlayComposer;
 }
 
 const MAX_CHOICES = 256;
 const MAX_LINES = 2048;
 const MAX_TEXT = 256 * 1024;
 const MAX_FIELD = 32 * 1024;
+const MAX_DRAFT = 16384;
+const MAX_RECEIPTS = 8;
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
+const UNSAFE_DRAFT = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/;
 
+function rowText(value: string): string { return sanitizeTranscriptText(value).replace(/\n/g, ' '); }
+function normalizedDraft(value: string): string { return value.replace(/\r\n?/g, '\n').replace(/\t/g, '    '); }
 /** Untrusted transcripts never supply terminal commands or hyperlinks. */
 export function sanitizeTranscriptText(value: string): string {
   return stripTerminalSequences(value.slice(0, MAX_FIELD)
@@ -46,8 +80,8 @@ export async function openZergAgentOverlay(context: StructuralPiCommandContext, 
   ));
 }
 
-/** A read-only observer: it owns no runner, SDK session or navigation API. */
-export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
+/** Owns observer UI and explicit composer callbacks, never a runner or SDK session. */
+export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, Focusable {
   private disposed = false;
   private mode: 'chooser' | 'transcript' | 'branches' = 'chooser';
   private references: ZergNativeSessionReference[] = [];
@@ -59,6 +93,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
   private handle?: NativeTranscriptReadHandle;
   private unsubscribeReferences?: () => void;
   private unsubscribeTranscript?: () => void;
+  private unsubscribeComposer?: () => void;
   private abort?: AbortController;
   private generation = 0;
   private message = '';
@@ -68,6 +103,26 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
   private scroll = 0;
   private viewport = 1;
   private cache?: { width: number; lines: string[]; limited: boolean };
+  private editor?: Editor;
+  private composing = false;
+  private _focused = false;
+  private composerState?: ZergComposerState;
+  private composerError = '';
+  private composerWatchError = '';
+  private composerMessage = '';
+  private composerMode: ZergComposerMode = 'followUp';
+  private layoutAvailable = true;
+  private sending = false;
+  private attempt?: { key: NativeTranscriptKey; messageId: string; body: string; mode: ZergComposerMode };
+  private editRevision = 0;
+  private editorInputs = 0;
+  private paste?: { text: string; tail: string; rejected: boolean };
+
+  get focused(): boolean { return this._focused; }
+  set focused(value: boolean) {
+    this._focused = value;
+    if (this.editor) this.editor.focused = value && this.composing && this.layoutAvailable;
+  }
 
   constructor(
     private readonly tui: StructuralPiTuiHandle | undefined,
@@ -85,19 +140,22 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
     } catch (error) { this.message = `Reference observer unavailable: ${String(error)}`; }
   }
 
-  invalidate(): void { this.cache = undefined; }
+  invalidate(): void { this.cache = undefined; this.editor?.invalidate(); }
 
   render(width = 100, requestedHeight?: number): string[] {
     const w = Math.max(1, Math.min(512, Math.floor(width) || 1));
     const h = Math.max(1, Math.min(128, Math.floor(requestedHeight ?? (this.tui?.terminal?.rows ?? 32) * 0.82) || 1));
+    this.layoutAvailable = w >= 12 && h >= 10;
+    if (this.editor) this.editor.focused = this._focused && this.composing && this.layoutAvailable;
+    const composerLines = this.mode === 'transcript' && this.options.composer ? this.renderComposer(w, h) : [];
     const layout = this.mode === 'transcript' ? this.formatted(w) : undefined;
     const notice = [
       this.message || (this.snapshot?.truncated ? `Transcript truncated · ${this.snapshot.droppedBlocks} dropped blocks` : ''),
       layout?.limited ? 'UI display truncated: text/line limit' : '',
     ].filter(Boolean).join(' · ');
-    const bodyCapacity = Math.max(0, h - 3);
+    const bodyCapacity = Math.max(0, h - 3 - composerLines.length);
     this.viewport = Math.max(1, bodyCapacity - (notice ? 1 : 0));
-    const title = styleText(this.theme, 'accent', 'zerg coding · read-only raw history');
+    const title = styleText(this.theme, 'accent', this.options.composer ? 'zerg coding · raw history + explicit composer' : 'zerg coding · read-only raw history');
     const status = this.mode === 'chooser' ? `Exact session chooser (${this.references.length})${this.referencesLimited ? ' · list truncated' : ''}`
       : this.loading ? 'Loading exact session…'
       : this.snapshot ? `${this.snapshot.source} · ${this.snapshot.status} · ${this.snapshot.source === 'captured' ? 'detached capture (not connected or proven saved)' : this.leafId ? 'branch inspection' : this.snapshot.defaultLeafBasis === 'live' ? 'live leaf' : 'last recorded entry (not proven active leaf)'} · ${this.follow ? 'follow tail' : 'scroll paused'}`
@@ -121,23 +179,27 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
       this.scroll = this.follow ? maxScroll : Math.max(0, Math.min(this.scroll, maxScroll));
       body = cache.lines.slice(this.scroll, this.scroll + this.viewport);
     }
-    if (this.mode !== 'transcript') body = body.map((line) => sanitizeTranscriptText(line).replace(/\n/g, ' '));
-    if (notice) body = [sanitizeTranscriptText(notice).replace(/\n/g, ' '), ...body];
+    if (this.mode !== 'transcript') body = body.map(rowText);
+    if (notice) body = [rowText(notice), ...body];
     body = body.slice(0, bodyCapacity);
     const footer = this.mode === 'chooser' ? '↑↓ select · Enter inspect · q/Esc close'
       : this.mode === 'branches' ? '↑↓ select · Enter inspect locally · s sessions · q/Esc close'
-      : 's sessions · b branches · ↑↓/PgUp/PgDn/Home scroll · End follow · q/Esc close';
-    return [title, status, ...body, styleText(this.theme, 'dim', footer)]
+      : this.composing ? 'Enter newline · Ctrl+s send · Alt+m mode · Esc back (draft retained)'
+      : `${this.options.composer ? 'c compose · ' : ''}s sessions · b branches · ↑↓/PgUp/PgDn/Home scroll · End follow · q/Esc close`;
+    // Reserve composer/receipt/footer rows before transcript slicing; never lose its tail.
+    return [title, rowText(status), ...body, ...composerLines, styleText(this.theme, 'dim', footer)]
       .slice(0, h).map((line) => truncateToWidth(line, w, '', true));
   }
 
   handleInput(data: string): void {
     if (this.disposed) return;
+    if (this.composing) { this.handleComposerInput(data); this.requestRender(); return; }
     if (matchesKey(data, 'escape') || data.toLowerCase() === 'q') { this.dispose(); return; }
     if (data.toLowerCase() === 's') {
+      const hadDraft = Boolean(this.editor?.getExpandedText());
       this.detach();
       this.mode = 'chooser';
-      this.message = '';
+      this.message = hadDraft ? 'Draft discarded when leaving the exact session.' : '';
       this.refreshReferences();
     } else if (data.toLowerCase() === 'b' && this.snapshot && this.mode !== 'chooser') {
       this.mode = 'branches';
@@ -157,7 +219,12 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
         this.readSnapshot();
       }
     } else {
-      if (matchesKey(data, 'end')) { this.follow = !this.leafId && this.snapshot?.source === 'live'; this.scroll = MAX_LINES; }
+      if (data.toLowerCase() === 'c' && this.options.composer) {
+        this.readComposerState();
+        const reason = this.composerDisabledReason(false);
+        if (reason) this.composerMessage = `Composer disabled: ${reason}`;
+        else { this.composing = true; this.editor ??= this.createEditor(); this.focused = this._focused; }
+      } else if (matchesKey(data, 'end')) { this.follow = !this.leafId && this.snapshot?.source === 'live'; this.scroll = MAX_LINES; }
       else if (matchesKey(data, 'home')) { this.follow = false; this.scroll = 0; }
       else if (matchesKey(data, 'up', 'pageup')) { this.follow = false; this.scroll = Math.max(0, this.scroll - (matchesKey(data, 'pageup') ? this.viewport : 1)); }
       else if (matchesKey(data, 'down', 'pagedown')) { this.follow = false; this.scroll += matchesKey(data, 'pagedown') ? this.viewport : 1; }
@@ -192,7 +259,11 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
         this.mode = 'chooser';
         this.message = 'Selected reference is no longer available. Choose an exact session again.';
       }
-    } catch (error) { this.references = []; this.message = `References unavailable: ${String(error)}`; }
+    } catch (error) {
+      this.references = [];
+      if (this.key) { this.detach(); this.mode = 'chooser'; }
+      this.message = `References unavailable: ${String(error)}`;
+    }
   }
 
   private async openSelected(): Promise<void> {
@@ -222,6 +293,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
         this.readSnapshot();
         this.requestRender();
       });
+      this.watchComposer(key, generation);
     } catch (error) {
       if (this.disposed || generation !== this.generation) return;
       this.detach();
@@ -249,6 +321,21 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
     this.abort = undefined;
     cleanup(this.unsubscribeTranscript);
     this.unsubscribeTranscript = undefined;
+    cleanup(this.unsubscribeComposer);
+    this.unsubscribeComposer = undefined;
+    this.composing = false;
+    if (this.editor) this.editor.focused = false;
+    this.editor = undefined;
+    this.paste = undefined;
+    this.composerState = undefined;
+    this.composerError = '';
+    this.composerWatchError = '';
+    this.composerMessage = '';
+    this.composerMode = 'followUp';
+    this.sending = false;
+    this.attempt = undefined;
+    this.editRevision += 1;
+    this.editorInputs = 0;
     const handle = this.handle;
     this.handle = undefined;
     cleanup(() => handle?.dispose());
@@ -257,6 +344,231 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent {
     this.leafId = undefined;
     this.loading = false;
     this.invalidate();
+  }
+
+  private createEditor(text = ''): Editor {
+    // Minimal public Editor geometry/redraw adapter; not a terminal renderer.
+    const owner = this;
+    const editorTui = {
+      terminal: { get rows() { return Math.max(10, Math.min(128, owner.tui?.terminal?.rows ?? 32)); } },
+      requestRender: () => this.requestRender(),
+    } as TUI;
+    const color = (token: string) => (value: string) => styleText(this.theme, token, value);
+    const editor = new Editor(editorTui, {
+      borderColor: color('accent'),
+      selectList: { selectedPrefix: color('accent'), selectedText: color('accent'), description: color('muted'), scrollInfo: color('dim'), noMatch: color('warning') },
+    });
+    editor.disableSubmit = true;
+    editor.setText(text);
+    editor.focused = this._focused && this.composing && this.layoutAvailable;
+    return editor;
+  }
+
+  private watchComposer(key: NativeTranscriptKey, generation: number): void {
+    if (!this.options.composer) return;
+    this.readComposerState();
+    try {
+      const unsubscribe = this.options.composer.subscribe({ ...key }, () => {
+        if (this.disposed || generation !== this.generation || !this.key || !sameKey(this.key, key)) return;
+        this.readComposerState();
+        this.requestRender();
+      });
+      if (this.disposed || generation !== this.generation) cleanup(unsubscribe);
+      else this.unsubscribeComposer = unsubscribe;
+    } catch (error) { this.composerWatchError = rowText(`Composer observer unavailable: ${String(error)}`).slice(0, 256); }
+  }
+
+  private validReceipt(receipt: ZergComposerReceipt, key: NativeTranscriptKey, messageId?: string): boolean {
+    return Boolean(receipt && receipt.key && sameKey(receipt.key, key) && typeof receipt.messageId === 'string'
+      && (messageId === undefined || receipt.messageId === messageId)
+      && ['recorded', 'queued', 'delivered', 'failed', 'needs-attention'].includes(receipt.status)
+      && ['memory', 'saved', 'failed'].includes(receipt.persistence) && typeof receipt.detail === 'string');
+  }
+
+  private readComposerState(): void {
+    if (!this.options.composer || !this.key) return;
+    try {
+      const state = this.options.composer.getState({ ...this.key });
+      if (!state?.key || !sameKey(state.key, this.key)) throw new Error('Composer identity mismatch.');
+      if (!Array.isArray(state.receipts) || !Array.isArray(state.allowedModes) || !['memory', 'saved', 'failed'].includes(state.persistence)) throw new Error('Invalid composer state.');
+      const receipts = state.receipts.slice(-MAX_RECEIPTS);
+      if (receipts.some((receipt) => !this.validReceipt(receipt, this.key!))) throw new Error('Receipt identity or status mismatch.');
+      this.composerState = {
+        key: { ...this.key }, canSend: state.canSend === true, reason: state.reason === undefined ? undefined : rowText(state.reason).slice(0, 256),
+        allowedModes: ['followUp', 'steer'].filter((mode) => state.allowedModes.includes(mode as ZergComposerMode)) as ZergComposerMode[],
+        persistence: state.persistence,
+        droppedReceipts: Math.max(0, Number.isSafeInteger(state.droppedReceipts) ? state.droppedReceipts! : 0) + Math.max(0, state.receipts.length - MAX_RECEIPTS),
+        // Never retain backend extra fields (especially message bodies) in the UI.
+        receipts: receipts.map((receipt) => ({ key: { ...this.key! }, messageId: receipt.messageId.slice(0, 128), status: receipt.status,
+          detail: rowText(receipt.detail).slice(0, 256), createdAt: receipt.createdAt?.slice(0, 64), updatedAt: receipt.updatedAt?.slice(0, 64), persistence: receipt.persistence })),
+      };
+      this.composerError = '';
+    } catch (error) { this.composerState = undefined; this.composerError = rowText(`Composer unavailable: ${String(error)}`).slice(0, 256); }
+  }
+
+  private composerDisabledReason(forSend = true): string {
+    if (!this.options.composer) return 'read-only viewer';
+    if (this.mode !== 'transcript' || !this.key || this.loading) return 'no exact live session loaded';
+    if (this.leafId !== undefined) return 'branch inspection is read-only; choose Default';
+    if (this.snapshot?.source !== 'live' || this.snapshot.status !== 'running' || this.snapshot.defaultLeafBasis !== 'live') return 'only the running live default branch accepts messages';
+    if (!this.layoutAvailable) return 'resize terminal (at least 12 columns / 10 rows)';
+    if (this.composerError || this.composerWatchError) return this.composerError || this.composerWatchError;
+    if (!this.composerState?.canSend || !this.composerState.allowedModes.length) return this.composerState?.reason || 'backend capability unavailable';
+    if (forSend && !this.composerState.allowedModes.includes(this.composerMode)) return `selected mode ${this.composerMode} unavailable; Alt+m selects an allowed mode`;
+    if (!sameKey(this.composerState.key, this.key)) return 'composer identity mismatch';
+    return '';
+  }
+
+  private renderComposer(width: number, height: number): string[] {
+    const capacity = Math.max(0, Math.min(13, height - 5));
+    if (!capacity) return [];
+    const reason = this.composerDisabledReason();
+    const lines = [rowText(`Composer ${this.composerMode} · ${this.sending ? 'sending (not delivered)' : reason ? `disabled: ${reason}` : this.composing ? 'editing' : 'c to edit'} · receipt persistence ${this.composerState?.persistence ?? 'unknown'}`)];
+    const editorRows = this.composing && this.editor && this.layoutAvailable ? Math.min(6, Math.max(1, capacity - 2)) : 0;
+    if (this.composerMessage && lines.length < capacity - editorRows) lines.push(rowText(this.composerMessage).slice(0, 256));
+    const receipts = this.composerState?.receipts ?? [];
+    const receiptRows = Math.max(0, capacity - lines.length - editorRows - (receipts.length ? 1 : 0));
+    const shown = receipts.slice(-receiptRows || receipts.length);
+    const omitted = (this.composerState?.droppedReceipts ?? 0) + receipts.length - shown.length;
+    if ((receipts.length || omitted) && lines.length < capacity - editorRows) lines.push(`Receipts: ${receipts.length} retained${omitted ? ` · ${omitted} omitted from view` : ''} · delivered = native consumed, not provider acknowledgement/completion`);
+    for (const receipt of shown) {
+      if (lines.length >= capacity - editorRows) break;
+      const persistence = receipt.persistence === 'saved' ? 'receipt snapshot saved (not native transcript/fsync)' : receipt.persistence === 'failed' ? 'receipt save failed' : 'receipt memory only';
+      lines.push(rowText(`${receipt.messageId} · ${receipt.status}${receipt.status === 'queued' || receipt.status === 'recorded' ? ' (not delivered)' : ''} · ${persistence} · ${receipt.detail}`));
+    }
+    if (editorRows && this.editor) {
+      const editorLines = this.editor.render(width).map((line) => truncateToWidth(line, width, '', true));
+      // Public Editor's trusted cursor marker locates the viewport; keep it, never sanitize it away.
+      const cursor = editorLines.findIndex((line) => line.includes(CURSOR_MARKER));
+      const start = Math.max(0, Math.min(editorLines.length - editorRows, cursor < 0 ? 0 : cursor - editorRows + 1));
+      lines.push(...editorLines.slice(start, start + editorRows));
+    }
+    return lines.slice(0, capacity);
+  }
+
+  private changeEditor(input: string, insert = false): void {
+    const editor = this.editor ??= this.createEditor();
+    const previous = editor.getExpandedText();
+    if (input.length > MAX_DRAFT) { this.composerMessage = 'Draft input rejected: 16384 character limit.'; return; }
+    // Bound public Editor history without silently relocating a cursor in the middle of code.
+    if (this.editorInputs >= 256) {
+      const cursor = editor.getCursor();
+      const draftLines = editor.getLines();
+      const atEnd = cursor.line === draftLines.length - 1 && cursor.col === draftLines.at(-1)!.length;
+      const navigation = ['tui.editor.cursorUp', 'tui.editor.cursorDown', 'tui.editor.cursorLeft', 'tui.editor.cursorRight', 'tui.editor.cursorWordLeft', 'tui.editor.cursorWordRight', 'tui.editor.cursorLineStart', 'tui.editor.cursorLineEnd', 'tui.editor.pageUp', 'tui.editor.pageDown'] as const;
+      if (!atEnd && !navigation.some((action) => getKeybindings().matches(input, action))) {
+        this.composerMessage = 'Editing history limit: move cursor to draft end before further edits.';
+        return;
+      }
+      if (atEnd && !navigation.some((action) => getKeybindings().matches(input, action))) { this.editor = this.createEditor(previous); this.editorInputs = 0; }
+    }
+    try {
+      if (insert) this.editor!.insertTextAtCursor(input);
+      else this.editor!.handleInput(input);
+      const text = this.editor!.getExpandedText();
+      if (text.length > MAX_DRAFT || UNSAFE_DRAFT.test(text)) {
+        this.editor = this.createEditor(previous);
+        this.composerMessage = text.length > MAX_DRAFT ? 'Draft input rejected: 16384 character limit.' : 'Draft input rejected: terminal/control sequences.';
+        return;
+      }
+      if (text !== previous) { this.editorInputs += 1; this.editRevision += 1; this.composerMessage = ''; }
+    } catch (error) {
+      this.editor = this.createEditor(previous);
+      this.composerMessage = rowText(`Draft editor unavailable: ${String(error)}`).slice(0, 256);
+    }
+  }
+
+  private handlePaste(data: string): void {
+    const paste = this.paste!;
+    const combined = paste.tail + data;
+    const end = combined.indexOf(PASTE_END);
+    const content = end < 0 ? combined.slice(0, Math.max(0, combined.length - PASTE_END.length + 1)) : combined.slice(0, end);
+    paste.tail = end < 0 ? combined.slice(content.length) : '';
+    if (!paste.rejected) {
+      if (content.length > MAX_DRAFT || UNSAFE_DRAFT.test(content) || normalizedDraft(paste.text + content).length + (this.editor?.getExpandedText().length ?? 0) > MAX_DRAFT) {
+        paste.rejected = true; paste.text = '';
+      } else paste.text += content;
+    }
+    if (end >= 0) {
+      this.paste = undefined;
+      if (paste.rejected) {
+        this.composerMessage = 'Paste rejected: mixed prefix, size limit or terminal/control sequences; whole packet discarded, draft retained.';
+        return;
+      }
+      this.changeEditor(normalizedDraft(paste.text), true);
+      // Trailing data belongs to this paste input packet, never to command shortcuts.
+      const trailing = combined.slice(end + PASTE_END.length);
+      if (trailing) this.changeEditor(trailing.length > MAX_DRAFT ? trailing : normalizedDraft(trailing), true);
+    }
+  }
+
+  private handleComposerInput(data: string): void {
+    if (this.paste) { this.handlePaste(data); return; }
+    const pasteStart = data.indexOf(PASTE_START);
+    if (pasteStart >= 0) {
+      // Mixed text/control prefixes cannot silently vanish or become command shortcuts.
+      this.paste = { text: '', tail: '', rejected: pasteStart > 0 };
+      this.handlePaste(data.slice(pasteStart + PASTE_START.length));
+      return;
+    }
+    if (matchesKey(data, 'escape')) { this.composing = false; this.focused = this._focused; return; }
+    if (!this.layoutAvailable) { this.composerMessage = 'Composer disabled: resize terminal; draft retained.'; return; }
+    if (piMatchesKey(data, 'ctrl+s')) { void this.sendDraft(); return; }
+    if (piMatchesKey(data, 'alt+m')) {
+      const modes = this.composerState?.allowedModes ?? [];
+      if (modes.length) {
+        this.composerMode = modes[(modes.indexOf(this.composerMode) + 1) % modes.length]!;
+        this.editRevision += 1;
+      }
+      return;
+    }
+    // Newlines are never submits, even when a terminal cannot distinguish modified Enter.
+    const keys = getKeybindings();
+    if (matchesKey(data, 'enter') || keys.matches(data, 'tui.input.submit') || keys.matches(data, 'tui.input.newLine')) this.changeEditor('\n', true);
+    else this.changeEditor(data);
+  }
+
+  private async sendDraft(): Promise<void> {
+    if (this.sending || this.paste || !this.key || !this.options.composer) return;
+    this.readComposerState();
+    const reason = this.composerDisabledReason();
+    if (reason) { this.composerMessage = `Send disabled: ${reason}`; return; }
+    const body = this.editor?.getExpandedText() ?? '';
+    if (!body.trim() || body.length > MAX_DRAFT || UNSAFE_DRAFT.test(body)) {
+      this.composerMessage = 'Send rejected: nonblank safe draft required (maximum 16384 characters).';
+      return;
+    }
+    const key = { ...this.key };
+    const mode = this.composerMode;
+    const generation = this.generation;
+    const revision = this.editRevision;
+    if (!this.attempt || !sameKey(this.attempt.key, key) || this.attempt.body !== body || this.attempt.mode !== mode) this.attempt = { key, messageId: randomUUID(), body, mode };
+    const request = this.attempt;
+    const messageId = request.messageId;
+    this.sending = true;
+    this.composerMessage = 'Sending request; delivery not yet known.';
+    this.requestRender();
+    try {
+      if (!this.options.getReferences().some((reference) => sameKey(reference, key))) throw new Error('Selected reference is stale.');
+      if (this.disposed || generation !== this.generation || !this.key || !sameKey(this.key, key)) throw new Error('Selected reference changed.');
+      const response = await this.options.composer.send({ ...request, key: { ...key } });
+      if (this.disposed || generation !== this.generation || !this.key || !sameKey(this.key, key)) return;
+      if (!response || typeof response.ok !== 'boolean' || typeof response.message !== 'string') throw new Error('Invalid send response; outcome unknown.');
+      if (response.receipt && !this.validReceipt(response.receipt, key, messageId)) throw new Error('Send receipt identity or status mismatch; outcome unknown.');
+      const accepted = response.ok && response.receipt && ['queued', 'delivered'].includes(response.receipt.status);
+      this.composerMessage = response.ok && !accepted ? `Send not confirmed (${response.receipt?.status ?? 'missing receipt'}); draft retained; no automatic retry.` : rowText(response.message).slice(0, 256);
+      if (accepted && revision === this.editRevision && this.editor?.getExpandedText() === body && this.composerMode === mode) {
+        this.editor = this.createEditor();
+        this.editRevision += 1;
+        this.attempt = undefined;
+      }
+      this.readComposerState();
+    } catch (error) {
+      if (this.disposed || generation !== this.generation) return;
+      this.composerMessage = rowText(`Send failed or outcome unknown: ${String(error)}. Draft retained; no automatic retry.`).slice(0, 256);
+    } finally {
+      if (!this.disposed && generation === this.generation) { this.sending = false; this.requestRender(); }
+    }
   }
 
   private formatted(width: number): { width: number; lines: string[]; limited: boolean } {

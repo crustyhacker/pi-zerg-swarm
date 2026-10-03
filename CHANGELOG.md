@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.11] - 2026-10-03
+
+### Added
+
+- Explicit live agent composer in the exact-session coding overlay: **c** to edit, Enter for newlines, **Ctrl+S** to send, **Alt+M** for follow-up/steering, and Escape to retain the draft before closing. Historical branches and saved, captured, completed, disconnected, or read-only sessions cannot send.
+- Additive `session.message.send` / `session.messages.list` structured actions and `/zerg sessions send` / `messages` commands. Literal custom-message content bypasses command/template/input expansion; exact parent/member/Pi IDs prevent fallback routing, and globally unique caller IDs prevent accidental resends or retargeting.
+- Bounded intent/receipt ledger with separate transport and persistence states, opt-in pre-enqueue snapshot barriers, and restart quarantine without replay. Native consumption is distinguished from queue acceptance, provider acknowledgement, completion, and transcript durability; save failures preserve observed transport status.
+- Admission rechecks for read-only/cancellation changes, isolated messaging cleanup, bounded/sanitized drafts and receipts, stale-response protection, and visible whole-packet paste rejection. Viewer close remains independent of runner cancellation and task-final SDK disposal.
+- Regression coverage plus isolated localhost public-SDK and actual regular/fullscreen Pi PTY messaging fixtures for literal multiline input, routing/deduplication, queue consumption, cancellation, history inspection, resize, and close-without-abort behavior.
+
+### Changed
+
+- Known operator-message content is visible in native raw history without exposing opaque custom metadata. Command help, package contents, and workspace guidance include the new composer and receipt controls; legacy messaging remains unchanged.
+
 ## [1.1.10] - 2026-10-02
 
 ### Added

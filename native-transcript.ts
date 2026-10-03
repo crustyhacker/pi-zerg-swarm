@@ -87,6 +87,11 @@ function messageBlocks(message: unknown, id: string, entryId?: string): NativeTr
 }
 function entryBlocks(entry: Record<string, any>): NativeTranscriptBlock[] {
   if (entry.type === 'message') return messageBlocks(entry.message, entry.id, entry.id);
+  if (entry.type === 'custom_message' && entry.customType === 'pi-zerg-swarm/operator/v1') {
+    // Whitelist content only. Details, signatures and opaque custom payloads
+    // remain omitted, including in validated saved history.
+    return messageBlocks({ role: 'custom', content: entry.content }, entry.id, entry.id);
+  }
   const base: NativeTranscriptBlock = { id: entry.id, entryId: entry.id, kind: 'event', text: '' };
   if (entry.type === 'compaction') base.text = `Compaction (raw history; not effective model context)\n${text(entry.summary)}`;
   else if (entry.type === 'context_edit') base.text = `Context edit of ${text(entry.targetId, 256)} (raw entry unchanged; replacement omitted)`;

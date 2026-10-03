@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
-
+import { recoverSessionMessages } from './session-messages.js';
 import {
   appendZergLogRecord,
   applyRuntimeTransition,
@@ -137,7 +137,7 @@ export function recoverZergStateAfterRestart(
   options: { now?: () => Date; previousWriterSessionId?: string } = {},
 ): { state: ZergState; recoveredRunIds: string[] } {
   const recoveredAt = (options.now ?? (() => new Date()))().toISOString();
-  let next = state;
+  let next = recoverSessionMessages(state, recoveredAt);
   const recoveredRunIds: string[] = [];
 
   for (const run of getSubagentRunSnapshots(state)) {

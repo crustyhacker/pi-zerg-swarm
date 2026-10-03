@@ -4684,3 +4684,116 @@ test('observer shutdown faults cannot block extension adapter cleanup', async ()
     nativeTranscriptService: { ...service, shutdown() { throw Error('observer shutdown failure'); } } });
   assert.doesNotThrow(() => registration.dispose()); assert.equal(adapterDisposed, 1); service.shutdown();
 });
+
+
+test('exact session structured send/list and slash aliases preserve literal body and leave legacy transport unchanged', async () => {
+  const { createSessionMessageService } = await import('../session-messages.js');
+  const container = createZergStateContainer();
+  const key = { parentRunId: 'parent', memberRunId: 'member', piSessionId: 'pi' };
+  const sent: string[] = [];
+  const service = createSessionMessageService({ container, readOnly: () => false });
+  service.register(key, { accepting: () => true, subscribe: () => () => undefined, enqueue: (input) => { sent.push(input.body); } });
+  let legacy = 0;
+  const adapter: ZergSubagentControlAdapter = { kind: 'fake', launch: () => ({ ok: false, message: 'unused' }), sendMessage: () => { legacy++; return { ok: true, status: 'queued', message: 'legacy' }; } };
+  const control = createZergControl(container, { sessionMessageService: service, subagentAdapter: adapter });
+  const body = '  /skill:literal\n\tconsole.log("unchanged")  \n';
+  assert.equal((await control.execute({ action: 'session.message.send', ...key, messageId: 'one', mode: 'steer', body })).ok, true);
+  assert.equal((await control.execute({ action: 'session.message.send', ...key, messageId: 'one', mode: 'steer', body })).ok, true);
+  assert.deepEqual(sent, [body]);
+  assert.equal((await control.execute({ action: 'session.message.send', ...key, messageId: 'one', mode: 'followUp', body })).ok, false);
+  assert.equal((await control.execute({ action: 'session.message.send', ...key, messageId: 'bad', mode: 'steer', body: '\x1bunsafe' })).error?.code, 'invalid_request');
+  const list = await control.execute({ action: 'session.messages.list', ...key });
+  assert.equal((list.data as { receipts: unknown[] }).receipts.length, 1);
+  assert.equal((await control.execute({ action: 'session.messages.list', ...key, limit: 129 })).ok, false);
+  const handler = createPiZergCommandHandler(container, { sessionMessageService: service, subagentAdapter: adapter });
+  const outputs: string[] = []; const ctx = { hasUI: false, ui: { notify: (text: string) => { outputs.push(text); } } };
+  await handler(`/swarm sessions send parent member pi two followUp -- ${body}`, ctx);
+  await handler('/zerg-swarm sessions messages parent member pi 2', ctx);
+  assert.deepEqual(sent, [body, body]); assert.match(outputs[0]!, /queued/); assert.match(outputs[1]!, /two: queued/);
+  await handler('sessions send parent member pi malformed steer', ctx); assert.match(outputs[2]!, /Usage/); assert.equal(sent.length, 2);
+  await control.execute({ action: 'message', targetId: 'definition', body: 'legacy' }); assert.equal(legacy, 1);
+  control.dispose(); service.shutdown();
+});
+
+test('new exact-session tool schema and parameter validation are additive', async () => {
+  const old = readSharedZergState(); replaceSharedZergState(createZergState());
+  let tool: import('../types.js').StructuralPiToolDefinition | undefined;
+  const registration = registerZergSwarmExtension({ registerCommand() {}, registerTool(definition) { tool = definition; } }, { subagentAdapter: { kind: 'fake', launch: () => ({ ok: false, message: 'unused' }) } });
+  try {
+    const properties = (tool!.parameters as { properties: Record<string, unknown> }).properties;
+    for (const name of ['messageId', 'parentRunId', 'memberRunId', 'piSessionId', 'mode']) assert(name in properties);
+    assert.equal((properties.mode as { default?: unknown }).default, undefined);
+    assert.equal((properties.limit as { maximum?: unknown }).maximum, undefined);
+    const result = await tool!.execute!('id', { action: 'session.message.send', parentRunId: 'p', memberRunId: 'm', piSessionId: 's', messageId: 'id', mode: 'nextTurn', body: 'literal' });
+    assert.equal(result.isError, true); assert.equal(registration.state.extensions.zergSessionMessages, undefined);
+    const list = await tool!.execute!('id', { action: 'session.messages.list', parentRunId: 'p', memberRunId: 'm', piSessionId: 's' }); assert.equal(list.isError, false);
+  } finally { registration.dispose(); replaceSharedZergState(old); }
+});
+
+
+test('messaging capability faults cannot block native/control or registered extension cleanup', () => {
+  const previous = readSharedZergState(); replaceSharedZergState(createZergState());
+  let faults = 0, adapterDisposed = 0;
+  const fault = { shutdown() { faults++; throw Error('receipt shutdown failure'); }, closeParent() { throw Error('receipt cancel failure'); } } as unknown as import('../session-messages.js').SessionMessageService;
+  const control = createZergControl(createZergStateContainer(), { sessionMessageService: fault });
+  assert.doesNotThrow(() => control.dispose()); assert(faults > 0);
+  const registration = registerZergSwarmExtension({ registerCommand() {}, registerTool() {} }, { sessionMessageService: fault, subagentAdapter: { kind: 'fake', launch: () => ({ ok: false, message: 'unused' }), dispose() { adapterDisposed++; } } });
+  assert.doesNotThrow(() => registration.dispose()); assert.equal(adapterDisposed, 1);
+  assert.throws(() => registerZergSwarmExtension({ registerCommand() { throw Error('original registration failure'); } }, { sessionMessageService: fault, subagentAdapter: { kind: 'fake', launch: () => ({ ok: false, message: 'unused' }) } }), /original registration failure/);
+  replaceSharedZergState(previous);
+});
+
+
+test('exact-session control enforces canonical mode.readOnly before intent and after publication', async () => {
+  const { createSessionMessageService } = await import('../session-messages.js');
+  const key = { parentRunId: 'readonly-parent', memberRunId: 'readonly-member', piSessionId: 'readonly-pi' };
+  const action = { action: 'session.message.send' as const, ...key, messageId: 'static', mode: 'steer' as const, body: 'literal readonly probe' };
+  const container = createZergStateContainer(); let calls = 0;
+  const injected = createSessionMessageService({ container, readOnly: () => false });
+  const release = injected.register(key, { accepting: () => true, subscribe: () => () => undefined, enqueue() { calls++; } });
+  const control = createZergControl(container, { sessionMessageService: injected });
+  container.replace({ ...container.read(), mode: { ...container.read().mode, readOnly: true } });
+  assert.equal((await control.execute(action)).error?.code, 'read_only'); assert.equal(calls, 0); assert.deepEqual(injected.list(key), []);
+  control.dispose(); release(); injected.shutdown();
+
+  container.replace({ ...container.read(), mode: { ...container.read().mode, readOnly: false } });
+  const canonical = createSessionMessageService({ container, readOnly: () => container.read().mode.readOnly === true });
+  const detach = canonical.register(key, { accepting: () => true, subscribe: () => () => undefined, enqueue() { calls++; } });
+  const guarded = createZergControl(container, { sessionMessageService: canonical }); let flipped = false;
+  const unsubscribe = container.subscribe?.(() => {
+    if (!flipped && canonical.list(key).some((receipt) => receipt.status === 'recorded')) {
+      flipped = true; container.replace({ ...container.read(), mode: { ...container.read().mode, readOnly: true } });
+    }
+  });
+  const rejected = await guarded.execute({ ...action, messageId: 'intent-flip' }); unsubscribe?.();
+  assert.equal(rejected.ok, false); assert.equal(flipped, true); assert.equal(calls, 0);
+  assert.equal(canonical.list(key)[0]?.status, 'failed'); assert.equal(canonical.getState(key).canSend, false);
+  guarded.dispose(); detach(); canonical.shutdown();
+});
+
+test('exact-session control threads request abort through intent guard without cancelling native owner', async () => {
+  const { createSessionMessageService } = await import('../session-messages.js');
+  const container = createZergStateContainer(); const key = { parentRunId: 'abort-parent', memberRunId: 'abort-member', piSessionId: 'abort-pi' };
+  const service = createSessionMessageService({ container, readOnly: () => container.read().mode.readOnly === true }); let calls = 0;
+  const after = new AbortController();
+  const release = service.register(key, { accepting: () => true, subscribe: () => () => undefined, enqueue(input) { calls++; if (input.messageId === 'after') after.abort(); } });
+  const control = createZergControl(container, { sessionMessageService: service });
+  const action = { action: 'session.message.send' as const, ...key, messageId: 'during', mode: 'followUp' as const, body: 'literal abort probe' };
+  const initial = new AbortController(); initial.abort();
+  assert.equal((await control.execute({ ...action, messageId: 'initial' }, initial.signal)).error?.code, 'request_cancelled'); assert.deepEqual(service.list(key), []);
+  const during = new AbortController();
+  const unsubscribe = container.subscribe?.(() => { if (service.list(key).some((receipt) => receipt.messageId === 'during' && receipt.status === 'recorded')) during.abort(); });
+  const rejected = await control.execute(action, during.signal); unsubscribe?.();
+  assert.equal(during.signal.aborted, true); assert.equal(rejected.ok, false); assert.equal(calls, 0); assert.equal(service.list(key)[0]?.status, 'failed');
+  assert.equal(service.getState(key).canSend, true, 'request abort must not close or cancel the native owner');
+  const queued = await control.execute({ ...action, messageId: 'after' }, after.signal);
+  assert.equal(after.signal.aborted, true); assert.equal(queued.ok, true); assert.equal(calls, 1);
+  assert.equal(service.list(key).find((receipt) => receipt.messageId === 'after')?.status, 'queued');
+  control.dispose(); release(); service.shutdown();
+});
+
+
+test('help advertises additive exact-session send and receipt grammar', () => {
+  const help = createZergCommandHandler(createZergStateContainer())('help').output;
+  assert(help.includes('/zerg sessions send')); assert(help.includes('/zerg sessions messages'));
+});
