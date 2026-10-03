@@ -4797,3 +4797,67 @@ test('help advertises additive exact-session send and receipt grammar', () => {
   const help = createZergCommandHandler(createZergStateContainer())('help').output;
   assert(help.includes('/zerg sessions send')); assert(help.includes('/zerg sessions messages'));
 });
+
+test('timeline.list is owner-state-only read-only inspection with strict action-local filters', async () => {
+  const container = createZergStateContainer(createZergState({ mode: { automation: 'manual', interventionEnabled: true, controller: 'operator', readOnly: true } }));
+  let transportCalls = 0;
+  const control = createZergControl(container, { subagentAdapter: { kind: 'fake', launch() { transportCalls++; return { ok: false, message: 'never launch' }; }, listRuns() { transportCalls++; return []; } } });
+  const before = JSON.stringify(container.read());
+  for (const filter of [{}, { teamId: 'unknown' }, { parentRunId: 'unknown', memberRunId: 'unknown', piSessionId: 'unknown' }]) {
+    const result = await control.execute({ action: 'timeline.list', ...filter });
+    assert(result.ok); assert.equal((result.data as { entries: unknown[] }).entries.length, 0);
+  }
+  for (const filter of [{ limit: 0 }, { limit: 257 }, { limit: '12' }, { parentRunId: 12 }, { memberRunId: 'bad id' }, { piSessionId: '\x1bunsafe' }, { runId: 'typo' }, { targetId: 'typo' }, { team: 'typo' }]) {
+    const result = await control.execute({ action: 'timeline.list', ...filter } as never);
+    assert.equal(result.ok, false); assert.equal(result.error?.code, 'invalid_request');
+  }
+  assert.equal(JSON.stringify(container.read()), before); assert.equal(transportCalls, 0);
+  control.dispose();
+});
+
+test('timeline CLI aliases share bounded read projection and strict duplicate/unknown flag rejection', async () => {
+  const container = createZergStateContainer();
+  const command = createZergCommandHandler(container);
+  const before = JSON.stringify(container.read());
+  for (const alias of ['/zerg', '/zerg-swarm', '/swarm']) {
+    const result = command(`${alias} timeline list --team unknown --run unknown --member unknown --session unknown --limit 1`);
+    assert(result.ok); assert.match(result.output, /No matching retained timeline rows/);
+  }
+  for (const payload of ['--run one --run two', '--run=one --run=two', '--unknown value', '--limit 0', '--limit 257', '--limit 2.5', '--team', 'show', '--team one unexpected']) {
+    assert.equal(command(`timeline list ${payload}`).ok, false, payload);
+  }
+  assert(command('timeline --limit=256').ok);
+  assert.equal(JSON.stringify(container.read()), before);
+  assert.match(command('help').output, /Timeline syntax/);
+});
+
+test('timeline command nonterminal fallback never opens UI or mutates state', async () => {
+  const container = createZergStateContainer();
+  const notices: string[] = [];
+  let customCalls = 0;
+  const handler = createPiZergCommandHandler(container);
+  const before = JSON.stringify(container.read());
+  const context: StructuralPiCommandContext = { hasUI: true, mode: 'rpc', ui: { custom() { customCalls++; throw Error('RPC cannot use custom'); }, notify(text) { notices.push(text); } } };
+  await handler('timeline --member unknown', context);
+  await handler('timeline list --run unknown', { ...context, mode: 'tui' });
+  await handler('timeline --run one --run two', context);
+  assert.equal(customCalls, 0); assert.match(notices[0]!, /No matching retained/); assert.match(notices[2]!, /Usage/);
+  assert.equal(JSON.stringify(container.read()), before);
+});
+
+test('structured tool accepts timeline.list and leaves legacy log limit semantics intact', async () => {
+  let tool: { execute?: (...args: unknown[]) => unknown } | undefined;
+  const registration = registerZergSwarmExtension({ registerTool(definition) { tool = definition as typeof tool; }, registerCommand() {} }, { subagentAdapter: { kind: 'fake', launch() { return { ok: false, message: 'not used' }; } } });
+  assert(tool?.execute);
+  const result = await tool.execute('timeline-read', { action: 'timeline.list', teamId: 'unknown', limit: 256 }) as { details: { ok: boolean; data: { entries: unknown[] } } };
+  assert(result.details.ok); assert.deepEqual(result.details.data.entries, []);
+  const invalid = await tool.execute('timeline-invalid', { action: 'timeline.list', limit: 257 }) as { details: { error: { code: string } } };
+  assert.equal(invalid.details.error.code, 'invalid_request');
+  for (const filter of [{ runId: 'typo' }, { targetId: 'typo' }, { team: 'typo' }]) {
+    const wrong = await tool.execute('timeline-wrong-scope', { action: 'timeline.list', ...filter }) as { details: { error: { code: string } } };
+    assert.equal(wrong.details.error.code, 'invalid_request');
+  }
+  const logs = await tool.execute('legacy-logs', { action: 'logs.list', limit: 1000 }) as { details: { ok: boolean } };
+  assert(logs.details.ok);
+  registration.dispose();
+});

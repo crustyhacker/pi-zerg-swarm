@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.12] - 2026-10-03
+
+### Added
+
+- Read-only team/run communication timeline through `/zerg timeline`, `timeline.list`, and management tree/detail **t**. Exact AND filters, stable row IDs, bounded previews, explicit omission notices, paused/follow scrolling, and full-identity details work without a terminal UI dependency for structured/text inspection.
+- Identity-checked **v** navigation from the last rendered selected timeline row to its exact coding view, with a fresh timeline instance on return. Missing/stale proof never selects another row or leader; viewer close leaves runner ownership and task-final SDK disposal unchanged.
+- Distinct current operator receipts, provenance-linked native output/handoffs, recorded events, and current run/member snapshots. Historical scope survives missing live references; output is not inferred to be an addressed reply, and current status is not invented transition history.
+- Focused projection/control/UI regressions, an isolated localhost public-SDK timeline fixture, and actual regular/fullscreen Pi PTY coverage for concurrent exact workers, literal filter paste, queue consumption, coding round trips, resize, saved history, and fresh restart without replay or native-file changes.
+
+### Changed
+
+- Command help, package contents, and workspace guidance include the timeline. Existing snapshot/native JSONL stores, exact messaging receipts, legacy chooser behavior, and lifecycle semantics remain unchanged; no transcript mirror, automatic sibling wakeup, reconnect, or resume is introduced.
+
 ## [1.1.11] - 2026-10-03
 
 ### Added

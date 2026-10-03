@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.11 release status**
-> Adds an explicit composer for exact live native sessions, with literal steer/follow-up messages, stable IDs, and honest receipt/durability states. History and branch inspection remain read-only; closing the viewer never stops a run. Existing bounded concurrency, truthful outcomes, fail-closed capability checks, and opt-in snapshots are preserved.
-> Restart restores inspectable history and quarantines pending receipts; it never reconnects, resumes, or automatically resends. Long-lived agents, a team timeline, and resume controls are not included.
+> **v1.1.12 release status**
+> Adds a bounded, read-only team/run communication timeline with exact filters and safe navigation to an agent's coding overlay. Operator receipt status, recorded native output, events, and current snapshots remain distinct—not invented replies or delivery history. Existing live messaging, bounded concurrency, truthful outcomes, and opt-in snapshots are preserved.
+> Restart restores inspectable history and quarantines pending receipts; it never reconnects, resumes, or automatically resends. Long-lived agents, automatic sibling wakeups, and explicit resume controls are not included.
 
 ## Release status
 
-- Current release: **v1.1.11** (exact live messaging, an agent composer, and no-replay receipts).
+- Current release: **v1.1.12** (team/run timeline, exact scope filters, and coding-view navigation).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -29,7 +29,7 @@ Pi supplies its SDK and TUI libraries to installed extensions. They are declared
 At v1.1.0 these commands display help, status, expanded tree visibility, deterministic thinking-step parser output, Claude Code-style runtime agent-definition configuration, native Pi SDK-backed run execution, task-first subagent spawn state, explicit fresh/fork launch-mode metadata, command-host permission queue state, fine-grained lifecycle substate hints, bounded structured log/output inspection, restart-durable run/log recovery snapshots, process-lifetime background run status/interrupt/message support, and a componentized Pi-native interactive management TUI for live tree/detail/settings/chat/footer management views through snapshot-safe shared-state-backed Pi command handlers.
 Command-host control grammar is available via `/zerg mode status|manual|assisted|automatic|revert [reason]`, `/zerg intervene agent|subagent|leader ...`, `/zerg agents list|show|create|update|delete` with per-agent `--model`, `--fallback-models`, `--max-turns`, tools, and permission settings, `/zerg agent`/`/zerg team` lifecycle configuration flags for team leaders/members/model metadata, `/zerg runs list|show <run-id>`, `/zerg permission status|list|request|approve|deny|cancel`, `/zerg logs status|list|show|json`, `/zerg config`, and `/zerg run <agent-or-team> <task> [--bg] [--fresh|--fork] [--model <model>]`; `/zerg run` does not require `pi-subagents` and uses the native Pi SDK runner when no slash bridge responds.
 
-`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane to open the separate coding overlay; its explicit live composer is distinct from the management intervention history. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
+`/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane for the separate coding overlay, or **t** on a team/run for its timeline. The explicit live composer is distinct from the management intervention history. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
 
 ## Direct automation API
 
@@ -104,7 +104,35 @@ A caller ID is unique across the retained ledger. Repeating the same ID with the
 
 Receipt persistence is independently `memory`, `saved`, or `failed`. With existing opt-in snapshot persistence, a successful intent write is required before enqueue; a later save failure does not revoke known queued/delivered status. `saved` means a successful Zerg snapshot write—not fsync/power-loss protection or a durable native transcript. Recovery quarantines pending receipts as `needs-attention` without scanning history, reconnecting, or executing anything. Use one owner per snapshot file; this is not a cross-process mailbox.
 
-The ledger retains at most 128 receipts and 262,144 aggregate body UTF-16 code units, with at most 32 pending per exact session. Capacity exhaustion rejects new messages instead of silently evicting idempotency records; there is no automatic pruning. The overlay shows at most eight receipts; structured listing supports limits 1–128. Outgoing intent bodies are stored for inspection/idempotency, not as a second conversation transcript. Long-lived agents, automatic sibling push/wakeup, a team communication timeline, and explicit resume/fork controls remain separate work.
+The ledger retains at most 128 receipts and 262,144 aggregate body UTF-16 code units, with at most 32 pending per exact session. Capacity exhaustion rejects new messages instead of silently evicting idempotency records; there is no automatic pruning. The overlay shows at most eight receipts; structured listing supports limits 1–128. Outgoing intent bodies are stored for inspection/idempotency, not as a second conversation transcript. Long-lived agents, automatic sibling push/wakeup, and explicit resume/fork controls remain separate work.
+
+## Team/run communication timeline
+
+Open `/zerg timeline`, or press **t** on a team/run in the management tree/detail pane. Unsupported or ambiguous selections do not silently open all runs or a leader. The timeline is read-only; send messages through the existing exact-session coding composer, not this view.
+
+```text
+/zerg timeline --team <team-id> --run <parent-run-id>
+/zerg timeline list --run <parent-run-id> --member <member-run-id> --session <pi-session-id> --limit 64
+```
+
+Structured control provides the same projection in `data`:
+
+```json
+{"action":"timeline.list","parentRunId":"zerg-run-id","limit":128}
+```
+
+Optional flat fields are `teamId`, `parentRunId`, `memberRunId`, `piSessionId`, and `limit`. Filters combine with exact **AND** semantics: valid unknown IDs return no matches; malformed values, unsupported fields, and duplicate/unknown command flags reject rather than broaden scope. IDs are bounded to 256 UTF-16 code units without whitespace/control characters. Default limit is 128; maximum is 256. `list`, or a noninteractive host, returns bounded text instead of opening the TUI.
+
+- **f** edits the four exact filters; Tab/Shift+Tab changes fields, Enter applies, and Escape cancels. Complete, bounded bracketed paste is literal inside a field; unsafe/mixed packets reject without executing suffix keys.
+- **Enter** opens row details with stable row/message IDs and full identities. Arrows/Home select rows and pause following; **End** follows the newest retained tail. Detail text scrolls with PgUp/PgDn.
+- **v** opens coding only when the last rendered selected row still has the same proven parent/member/Pi identity. Missing or changed proof rejects—never a chooser, another row, or an implicit leader. Closing coding restores a fresh timeline view with its plain selection/filter/scroll state.
+- **q/Escape** closes the timeline. Closing either view never aborts a run, holds a worker slot, retains a completed SDK session, or changes the active native branch. Abbreviated list labels are display-only, never routing keys.
+
+Rows distinguish **operator receipts**, **native output/handoffs**, **recorded events**, and **current run/member snapshots**. A receipt is one stable row ordered by creation time with its current status—not fabricated delivery-transition history. Native output is **not an addressed reply** to a nearby message. Snapshots are **not historical events**. Historical receipt/member scope remains visible even without a current exact coding link; legacy logs never guess Pi identities. Team attribution uses recorded metadata, not current team membership.
+
+This projects existing retained state/logs/receipts; it adds no transcript mirror, timeline file, SDK observer, replay, or reconnect. Native handoffs appear when the runner records them, not for every streamed token or assistant message; use coding view for live text/tools and saved raw history. Existing opt-in snapshot persistence and native JSONL remain the only stores.
+
+Previews are bounded (1,024 body and 256 summary UTF-16 code units; 65,536 aggregate preview units), with newest content preserved under projection/text-display budgets. Source windows and UI bounds can omit older content, and notices distinguish known omissions, unknown coverage, and clipping. Unscoped/team attribution examines the newest 512 stored run keys—not a complete timestamp-sorted history; an explicit parent filter can inspect an older retained run outside that window. No timestamp or reply relationship is synthesized to fill gaps.
 
 ## Architecture
 
@@ -164,7 +192,9 @@ The TypeScript modules are intentionally small:
 - `persistence.ts` — restart-durable run/log snapshot save, load, and recovery helpers
 - `native-transcript.ts` — owner-scoped read-only live observers and validated native history loading
 - `session-messages.ts` — exact live message admission, bounded receipts, persistence barriers, and no-replay recovery
+- `timeline.ts` — pure bounded projection of retained receipts, provenance-linked output, events, and current snapshots
 - `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, explicit composer, and local branch inspection
+- `ui/team-timeline.ts` — exact filters, bounded timeline/details, and identity-checked coding-view round trips
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
 
@@ -224,8 +254,9 @@ npm run check:version
 - v1.1.8: patch release rejecting unsupported native fork, turn limits, and fallback models before session startup
 - v1.1.9: patch release mapping exact native session identities and immutable transcript provenance
 - v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection
-- v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts (current release)
-- Next: a team communication timeline, explicit branch/resume/recovery controls, and integrated workspace hardening
+- v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts
+- v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation (current release)
+- Next: explicit branch/resume/recovery controls and integrated workspace hardening
 
 ## License
 

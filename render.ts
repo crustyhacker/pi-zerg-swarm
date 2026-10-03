@@ -1,4 +1,6 @@
-import { ZERG_COMMAND_INVOCATIONS, ZERG_EXTENSION_VERSION, type AgentIdentity, type HookLifecycleEvent, type TaskRecord, type TeamIdentity, type ZergNativeSessionReference, type ZergAgentDefinition, type ZergConfigOverlayTab, type ZergLogRecord, type ZergLogState, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergState, type ZergSubagentRunSnapshot, type ZergTreeNode } from './types.js';
+import { truncateToWidth } from '@earendil-works/pi-tui';
+import { sanitizeNativeTranscriptText } from './native-transcript.js';
+import { ZERG_COMMAND_INVOCATIONS, ZERG_EXTENSION_VERSION, type AgentIdentity, type HookLifecycleEvent, type TaskRecord, type TeamIdentity, type ZergTimelineSnapshot, type ZergNativeSessionReference, type ZergAgentDefinition, type ZergConfigOverlayTab, type ZergLogRecord, type ZergLogState, type ZergPermissionQueueState, type ZergPermissionRequest, type ZergState, type ZergSubagentRunSnapshot, type ZergTreeNode } from './types.js';
 
 export interface RenderOptions {
   width?: number;
@@ -541,6 +543,7 @@ export function renderHelp(state: ZergState, options: RenderOptions = {}): strin
     'Run syntax: /zerg run <agent> <task> [--bg] [--fresh|--fork] [--concurrency <n>] (fresh is default isolated launch; native team workers default to concurrency 8; native execution rejects unsupported fork/maxTurns/fallbackModels before SDK startup; use a supported external adapter/acknowledged bridge for those capabilities) | /zerg runs [list] | /zerg runs show <run-id> | /zerg interrupt [run-id]',
     'Sessions syntax: /zerg sessions [parent-run-id] opens exact coding history with an explicit live composer | /zerg sessions list [parent-run-id] prints exact references (no resume/branch mutation)',
     'Exact message syntax: /zerg sessions send <parent> <member> <pi-id> <message-id> <steer|followUp> -- <literal body> | /zerg sessions messages <parent> <member> <pi-id> [limit] (queued is not consumed; no automatic retry/replay)',
+    'Timeline syntax: /zerg timeline [list] [--team ID] [--run PARENT] [--member MEMBER] [--session PI] [--limit 1..256] (read-only retained state; receipts are not replies; no transcript scan/replay)',
     'Monitor syntax: /zerg monitor [readonly on|off|toggle|status]',
     'Intervention syntax: /zerg intervene agent <agent-id> <message> | /zerg intervene subagent <agent-id> <message> | /zerg intervene leader <team-id> <message>',
     'Available now: slash-free Pi command registration, aliases, lifecycle state updates, mode/intervention/monitor/control/config commands, runtime health/activity summaries, scaffold status/tree output, thinking-step parsing, text rendering, and Pi event-bus observation.',
@@ -1090,4 +1093,49 @@ export function renderNativeSessionReferences(references: ZergNativeSessionRefer
   if (!references.length) lines.push('No native session references available.');
   if (references.length > 40) lines.push(`${references.length - 40} additional references omitted.`);
   return lines.map((line) => fit(sanitizeRuntimeActivity(line), options.width ?? DEFAULT_WIDTH)).join('\n');
+}
+
+/** Width-bounded text fallback for the same typed read projection as the TUI. */
+export function renderZergTimeline(timeline: ZergTimelineSnapshot, options: RenderOptions = {}): string {
+  const width = Number.isFinite(options.width) ? Math.max(1, Math.min(512, Math.floor(options.width!))) : DEFAULT_WIDTH;
+  const clean = (value: string, maximum = 256) => sanitizeNativeTranscriptText(value.slice(0, maximum)).replace(/\s+/g, ' ').slice(0, maximum);
+  const abbreviation = (value: string | undefined, maximum = 18) => {
+    if (!value) return '-';
+    const safe = clean(value);
+    return safe.length <= maximum ? safe : `${safe.slice(0, Math.ceil((maximum - 1) / 2))}…${safe.slice(-Math.floor((maximum - 1) / 2))}`;
+  };
+  const header = [
+    `Team/run timeline: ${timeline.entries.length} rows; ${timeline.omittedEntries} known matching projection rows omitted; ${timeline.clippedEntries} clipped`,
+    'Actor/run/member/Pi abbreviations are display-only; exact identities remain in structured data/details.',
+  ];
+  const notices = timeline.limitations.slice(0, 8).map((text) => clean(text, 512));
+  const availableLines = MAX_RENDER_LINES - header.length - notices.length - 1;
+  const groups: string[][] = [];
+  let usedLines = 0;
+  let shownRows = 0;
+  // Select bounded complete row groups from the NEWEST tail, then restore the
+  // source's chronological ordering. Display omissions are not projection loss.
+  for (let index = timeline.entries.length - 1; index >= Math.max(0, timeline.entries.length - 256); index--) {
+    const entry = timeline.entries[index]!;
+    const type = entry.kind === 'operator-receipt' ? 'receipt' : entry.kind;
+    const actor = entry.kind === 'operator-receipt' ? `operator→${abbreviation(entry.agentDefinitionId, 16)}` : abbreviation(entry.agentDefinitionId, 20);
+    const label = entry.kind === 'native-output' ? 'native output/handoff (NOT addressed reply)'
+      : entry.kind === 'operator-receipt' ? `operator receipt/current status ${entry.status}/${entry.persistence}`
+      : entry.kind === 'recorded-event' ? 'recorded event' : `current snapshot (NOT historical event): ${entry.status}`;
+    const content = entry.bodyPreview || entry.summary;
+    const group = [
+      `[${type}] ${actor} run:${abbreviation(entry.parentRunId)} member:${abbreviation(entry.memberRunId)} Pi:${abbreviation(entry.piSessionId, 14)}${entry.exactKey ? '' : ' unlinked'}${entry.clipped ? ' [clipped]' : ''}`,
+      `content${content.length > 256 ? ' (display clipped)' : ''}: ${clean(content)}`,
+      `${entry.timestamp ?? 'unknown time'} (${entry.timestampMeaning}) | ${label}`,
+    ];
+    if (entry.kind === 'operator-receipt') group.push(`message ID: ${clean(entry.messageId)}; mode:${entry.mode}; updated:${entry.updatedAt || 'unknown time'}`);
+    if (usedLines + group.length > availableLines) break;
+    groups.push(group); usedLines += group.length; shownRows++;
+  }
+  const displayOmitted = timeline.entries.length - shownRows;
+  const lines = [...header, ...groups.reverse().flat()];
+  if (!timeline.entries.length) lines.push('No matching retained timeline rows (filters never fall back to all).');
+  else if (displayOmitted) lines.push(`Display omitted ${displayOmitted} older row(s); newest tail retained (separate from projection omissions).`);
+  lines.push(...notices);
+  return lines.map((line) => truncateToWidth(sanitizeNativeTranscriptText(line.slice(0, 4096)), width)).join('\n');
 }

@@ -35,6 +35,8 @@ export interface ZergAgentOverlayOptions {
   subscribeReferences(listener: () => void): () => void;
   open(key: NativeTranscriptKey, options?: { signal?: AbortSignal }): Promise<NativeTranscriptReadHandle>;
   composer?: ZergOverlayComposer;
+  /** Explicit exact drilldown; never defaults to a chooser/leader if stale. */
+  initialKey?: NativeTranscriptKey;
 }
 
 const MAX_CHOICES = 256;
@@ -59,6 +61,10 @@ export function sanitizeTranscriptText(value: string): string {
     .replace(/\x1b[ -/]*[@-~]/g, '')
     .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
     .replace(/\t/g, '    ');
+}
+
+function validExactKey(key: NativeTranscriptKey): boolean {
+  return Boolean(key && [key.parentRunId, key.memberRunId, key.piSessionId].every((value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f-\x9f]/u.test(value)));
 }
 
 function sameKey(a: NativeTranscriptKey, b: NativeTranscriptKey): boolean {
@@ -131,6 +137,10 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     private readonly options: ZergAgentOverlayOptions,
   ) {
     this.refreshReferences();
+    if (options.initialKey !== undefined) {
+      this.mode = 'transcript';
+      void this.openExact(options.initialKey, true);
+    }
     try {
       this.unsubscribeReferences = options.subscribeReferences(() => {
         if (this.disposed) return;
@@ -195,7 +205,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     if (this.disposed) return;
     if (this.composing) { this.handleComposerInput(data); this.requestRender(); return; }
     if (matchesKey(data, 'escape') || data.toLowerCase() === 'q') { this.dispose(); return; }
-    if (data.toLowerCase() === 's') {
+    if (data.toLowerCase() === 's' && !(this.options.initialKey && !this.handle)) {
       const hadDraft = Boolean(this.editor?.getExpandedText());
       this.detach();
       this.mode = 'chooser';
@@ -256,12 +266,12 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       this.choice = retained >= 0 ? retained : Math.min(this.choice, Math.max(0, this.references.length - 1));
       if (this.key && !refs.some((ref) => sameKey(ref, this.key!))) {
         this.detach();
-        this.mode = 'chooser';
+        this.mode = this.options.initialKey ? 'transcript' : 'chooser';
         this.message = 'Selected reference is no longer available. Choose an exact session again.';
       }
     } catch (error) {
       this.references = [];
-      if (this.key) { this.detach(); this.mode = 'chooser'; }
+      if (this.key) { this.detach(); this.mode = this.options.initialKey ? 'transcript' : 'chooser'; }
       this.message = `References unavailable: ${String(error)}`;
     }
   }
@@ -269,9 +279,15 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
   private async openSelected(): Promise<void> {
     const ref = this.references[this.choice];
     if (!ref) return;
+    await this.openExact({ parentRunId: ref.parentRunId, memberRunId: ref.memberRunId, piSessionId: ref.piSessionId });
+  }
+
+  private async openExact(requestedKey: NativeTranscriptKey, explicitInitial = false): Promise<void> {
     this.detach();
+    this.mode = 'transcript';
+    if (explicitInitial && !validExactKey(requestedKey)) { this.message = 'Invalid exact initial/session key; no fallback.'; this.requestRender(); return; }
     const generation = this.generation;
-    const key: NativeTranscriptKey = { parentRunId: ref.parentRunId, memberRunId: ref.memberRunId, piSessionId: ref.piSessionId };
+    const key: NativeTranscriptKey = { parentRunId: requestedKey.parentRunId, memberRunId: requestedKey.memberRunId, piSessionId: requestedKey.piSessionId };
     this.key = key;
     this.mode = 'transcript';
     this.loading = true;
@@ -281,19 +297,20 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     const abort = this.abort = new AbortController();
     let opened: NativeTranscriptReadHandle | undefined;
     try {
-      if (!this.options.getReferences().some((current) => sameKey(current, key))) throw new Error('Selected reference is stale.');
+      if (this.options.getReferences().filter((current) => sameKey(current, key)).length !== 1) throw new Error('Selected reference is stale or ambiguous; no fallback.');
       opened = await this.options.open(key, { signal: abort.signal });
       if (this.disposed || generation !== this.generation || abort.signal.aborted) { cleanup(() => opened?.dispose()); return; }
       this.handle = opened;
       this.loading = false;
       this.readSnapshot();
       this.follow = this.snapshot?.source === 'live';
-      this.unsubscribeTranscript = opened.subscribe(() => {
+      const unsubscribe = opened.subscribe(() => {
         if (this.disposed || generation !== this.generation) return;
         this.readSnapshot();
         this.requestRender();
       });
-      this.watchComposer(key, generation);
+      if (this.disposed || generation !== this.generation) cleanup(unsubscribe);
+      else { this.unsubscribeTranscript = unsubscribe; this.watchComposer(key, generation); }
     } catch (error) {
       if (this.disposed || generation !== this.generation) return;
       this.detach();

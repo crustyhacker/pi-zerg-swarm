@@ -9,10 +9,12 @@ import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
 import { openZergAgentOverlay } from './ui/agent-overlay.js';
+import { getZergTimeline, validateZergTimelineFilter } from './timeline.js';
+import { openZergTeamTimeline } from './ui/team-timeline.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
-import { renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
+import { renderZergTimeline, renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
 import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
-import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference } from './types.js';
+import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference, type ZergTimelineFilter, type ZergSessionMessageKey } from './types.js';
 
 type ZergIdFactory = {
   runId?: () => string;
@@ -47,7 +49,7 @@ export interface ZergExtensionRegistration {
   dispose(): void;
 }
 
-type ZergCommandTopic = 'help' | 'status' | 'tree' | 'steps' | 'agent' | 'team' | 'mode' | 'intervene' | 'monitor' | 'control' | 'config' | 'run' | 'interrupt' | 'agents' | 'runs' | 'permission' | 'logs' | 'sessions';
+type ZergCommandTopic = 'help' | 'status' | 'tree' | 'steps' | 'agent' | 'team' | 'mode' | 'intervene' | 'monitor' | 'control' | 'config' | 'run' | 'interrupt' | 'agents' | 'runs' | 'permission' | 'logs' | 'sessions' | 'timeline';
 type ZergCommandDispatcher = (payload: string) => ZergCommandResult;
 type RuntimeParseResult = { ok: false; output: string } | { ok: true; transition: ZergRuntimeTransition };
 type LogsParseResult = { ok: false; output: string } | { ok: true; filter: ZergLogFilter; json: boolean };
@@ -547,6 +549,21 @@ async function executeZergControlAction(
         if (!run) return controlError(action.action, 'not_found', `Unknown run: ${action.runId}`, snapshot.revision, { runId: action.runId });
         return controlOk(action.action, { run }, renderZergSubagentRunSummary(run, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision, { runId: action.runId, taskId: run.taskId, agentId: run.agentId });
       }
+      case 'timeline.list': {
+        const snapshot = container.read();
+        try {
+          const allowed = new Set(['action', 'teamId', 'parentRunId', 'memberRunId', 'piSessionId', 'limit']);
+          let fields = 0;
+          for (const field in action) {
+            if (!Object.hasOwn(action, field)) continue;
+            if (++fields > 16 || (!allowed.has(field) && (action as unknown as Record<string, unknown>)[field] !== undefined)) throw new Error('Unsupported timeline.list field. Use teamId, parentRunId, memberRunId, piSessionId and limit.');
+          }
+          const timeline = getZergTimeline(snapshot, { teamId: action.teamId, parentRunId: action.parentRunId, memberRunId: action.memberRunId, piSessionId: action.piSessionId, limit: action.limit });
+          return controlOk(action.action, timeline, renderZergTimeline(timeline, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision);
+        } catch (error) {
+          return controlError(action.action, 'invalid_request', error instanceof Error ? error.message : 'Invalid timeline filters.', snapshot.revision);
+        }
+      }
       case 'logs.list': {
         const snapshot = container.snapshot();
         const records = getZergLogs(snapshot, { runId: action.runId, level: action.level, limit: action.limit });
@@ -637,11 +654,12 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
         runId: { type: 'string' },
         mode: { type: 'string', enum: ['steer', 'followUp'], description: 'Required explicitly for session.message.send. Legacy message defaults to steer when omitted.' },
         concurrency: { type: 'integer', minimum: 1, description: 'Positive safe integer per-run native team worker concurrency for run actions; defaults to 8.' },
+        teamId: { type: 'string', description: 'timeline.list exact recorded team ID (no current membership inference).' },
         parentRunId: { type: 'string' },
         memberRunId: { type: 'string' },
         piSessionId: { type: 'string' },
         messageId: { type: 'string' },
-        limit: { type: 'number', description: 'session.messages.list requires a safe integer 1..128; logs.list retains its existing limit semantics.' },
+        limit: { type: 'number', description: 'timeline.list requires an integer 1..256; session.messages.list requires a safe integer 1..128; logs.list retains its existing limit semantics.' },
       },
       required: ['action'],
     },
@@ -694,6 +712,7 @@ function isZergControlActionName(value: string): value is ZergControlAction['act
     || value === 'run'
     || value === 'runs.list'
     || value === 'runs.show'
+    || value === 'timeline.list'
     || value === 'logs.list'
     || value === 'session.message.send'
     || value === 'session.messages.list'
@@ -732,6 +751,7 @@ export function createZergCommandHandler(
     run: (payload: string) => dispatchRunCommand(stateOrReader, payload, options),
     runs: (payload: string) => dispatchRunsCommand(stateOrReader, payload, options),
     sessions: (payload: string) => dispatchSessionsCommand(stateOrReader, payload),
+    timeline: (payload: string) => dispatchTimelineCommand(stateOrReader, payload),
     interrupt: (payload: string) => dispatchInterruptCommand(stateOrReader, payload, options),
   };
 
@@ -790,8 +810,39 @@ function isZergInvocationToken(value: string): value is ZergCommandName {
   return (ZERG_COMMANDS as readonly string[]).includes(value);
 }
 
+const TIMELINE_USAGE = 'Usage: /zerg timeline [list] [--team ID] [--run PARENT] [--member MEMBER] [--session PI] [--limit 1..256]';
+function parseTimelinePayload(payload: string): { filter: ZergTimelineFilter; list: boolean } {
+  if (payload.length > 8192) throw new Error(TIMELINE_USAGE);
+  const words = payload.trim() ? payload.trim().split(/\s+/) : [];
+  const list = words[0] === 'list';
+  if (list) words.shift();
+  const fields: Record<string, keyof ZergTimelineFilter> = { '--team': 'teamId', '--run': 'parentRunId', '--member': 'memberRunId', '--session': 'piSessionId', '--limit': 'limit' };
+  const values: Record<string, unknown> = {};
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index]!;
+    const equal = word.indexOf('=');
+    const flag = equal < 0 ? word : word.slice(0, equal);
+    const field = fields[flag];
+    if (!field || Object.hasOwn(values, field)) throw new Error(TIMELINE_USAGE);
+    const value = equal < 0 ? words[++index] : word.slice(equal + 1);
+    if (!value || value.startsWith('--')) throw new Error(TIMELINE_USAGE);
+    if (field === 'limit') {
+      if (!/^[0-9]+$/.test(value)) throw new Error(TIMELINE_USAGE);
+      values[field] = Number(value);
+    } else values[field] = value;
+  }
+  return { filter: validateZergTimelineFilter(values), list };
+}
+function readTimelineState(source: ZergStateSource): ZergState {
+  return isZergStateContainer(source) ? source.read() : typeof source === 'function' ? source() : source;
+}
+function dispatchTimelineCommand(source: ZergStateSource, payload: string): ZergCommandResult {
+  try { return { ok: true, output: renderZergTimeline(getZergTimeline(readTimelineState(source), parseTimelinePayload(payload).filter), { width: PI_COMMAND_OUTPUT_WIDTH }) }; }
+  catch (error) { return { ok: false, output: error instanceof Error ? error.message : TIMELINE_USAGE }; }
+}
+
 function isZergCommandTopic(value: string): value is ZergCommandTopic {
-  return value === 'help' || value === 'status' || value === 'tree' || value === 'steps' || value === 'agents' || value === 'agent' || value === 'team' || value === 'mode' || value === 'intervene' || value === 'monitor' || value === 'control' || value === 'permission' || value === 'logs' || value === 'config' || value === 'run' || value === 'runs' || value === 'interrupt' || value === 'sessions';
+  return value === 'help' || value === 'status' || value === 'tree' || value === 'steps' || value === 'agents' || value === 'agent' || value === 'team' || value === 'mode' || value === 'intervene' || value === 'monitor' || value === 'control' || value === 'permission' || value === 'logs' || value === 'config' || value === 'run' || value === 'runs' || value === 'interrupt' || value === 'sessions' || value === 'timeline';
 }
 
 function dispatchAgentDefinitionsCommand(
@@ -3856,6 +3907,10 @@ async function runSinglePiNativeAgent(
   const sessionHandle = session as PiNativeSessionHandle;
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
   let reference: ZergNativeSessionReference | undefined;
+  const timelineData = (kind: 'native-output' | 'recorded-event') => reference ? { nativeTimeline: {
+    schemaVersion: 1, kind, parentRunId: reference.parentRunId, memberRunId: reference.memberRunId,
+    piSessionId: reference.piSessionId, agentDefinitionId: reference.agentDefinitionId,
+  } } : {};
   let releaseTranscript: (() => void) | undefined;
   let unsubscribe: (() => void) | undefined;
   let releaseMessages: (() => void) | undefined;
@@ -3903,6 +3958,7 @@ async function runSinglePiNativeAgent(
           runId: run.parentRunId,
           agentId: definition.id,
           taskId: run.taskId,
+          data: timelineData('recorded-event'),
         });
       }
     });
@@ -3925,7 +3981,7 @@ async function runSinglePiNativeAgent(
       runId: run.parentRunId,
       agentId: definition.id,
       taskId: run.taskId,
-      data: { model: modelSpec, tools },
+      data: { model: modelSpec, tools, ...timelineData('recorded-event') },
     });
     if (run.activeRun?.cancelRequested) {
       updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancel requested before prompt' });
@@ -3960,6 +4016,7 @@ async function runSinglePiNativeAgent(
         runId: run.parentRunId,
         agentId: definition.id,
         taskId: run.taskId,
+        data: timelineData('recorded-event'),
       });
       updateMemberProgress(run, definition.id, 'failed', { completedAt: updateAt(), handoffPath: run.handoffPath, message });
       return { agentId: definition.id, status: 'failed', message };
@@ -3974,6 +4031,7 @@ async function runSinglePiNativeAgent(
         runId: run.parentRunId,
         agentId: definition.id,
         taskId: run.taskId,
+        data: timelineData('recorded-event'),
       });
       updateMemberProgress(run, definition.id, assistantOutcome.status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
       return { agentId: definition.id, status: assistantOutcome.status, message };
@@ -3987,7 +4045,7 @@ async function runSinglePiNativeAgent(
       runId: run.parentRunId,
       agentId: definition.id,
       taskId: run.taskId,
-      data: { completedAt: updateAt(), handoffPath: run.handoffPath, handoff: handoffMessage },
+      data: { completedAt: updateAt(), handoffPath: run.handoffPath, handoff: handoffMessage, ...timelineData('native-output') },
     });
     updateMemberProgress(run, definition.id, 'done', { completedAt: updateAt(), handoffPath: run.handoffPath, message: handoffMessage });
     return { agentId: definition.id, status: 'done', message: handoffMessage };
@@ -4001,6 +4059,7 @@ async function runSinglePiNativeAgent(
       runId: run.parentRunId,
       agentId: definition.id,
       taskId: run.taskId,
+      data: timelineData('recorded-event'),
     });
     const status = run.activeRun?.cancelRequested ? 'cancelled' : 'failed';
     updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
@@ -5039,6 +5098,19 @@ export function createPiZergCommandHandler(
     composer: options.sessionMessageService,
   });
 
+  const viewTimeline = (context: StructuralPiCommandContext, initialFilter: ZergTimelineFilter = {}) => openZergTeamTimeline(context, {
+    getSnapshot: (filter) => getZergTimeline(readTimelineState(stateOrReader), filter),
+    subscribe: (listener) => subscribeToZergState(stateOrReader, listener),
+    initialFilter,
+    viewCoding: (exactKey: ZergSessionMessageKey) => openZergAgentOverlay(context, {
+      getReferences: () => transcript.list(),
+      subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
+      open: (key, openOptions) => transcript.open(key, openOptions),
+      composer: options.sessionMessageService,
+      initialKey: { ...exactKey },
+    }),
+  });
+
   return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
     const routed = stripOptionalZergInvocation(input.trimStart());
     if (/^sessions\s+(send|messages)(?:\s|$)/i.test(routed)) {
@@ -5053,6 +5125,16 @@ export function createPiZergCommandHandler(
     const output = typeof result === 'string' ? result : result.output;
 
     const canUseTerminalUI = context.hasUI !== false && (context.mode === undefined || context.mode === 'tui');
+    if (normalized.topic === 'timeline') {
+      let parsed: ReturnType<typeof parseTimelinePayload>;
+      try { parsed = parseTimelinePayload(normalized.payload); }
+      catch { context.ui?.notify?.(output, 'error'); return; }
+      if (!parsed.list && canUseTerminalUI && context.ui?.custom) {
+        try { await viewTimeline(context, parsed.filter); return; }
+        catch { context.ui?.notify?.(`${output}\nTimeline viewer unavailable; bounded text fallback.`, 'warning'); return; }
+      }
+      context.ui?.notify?.(output, result.ok ? 'info' : 'error'); return;
+    }
     if (normalized.topic === 'sessions') {
       const parsed = parseSessionsPayload(normalized.payload);
       if (parsed && !parsed.list && canUseTerminalUI && context.ui?.custom) {
@@ -5070,6 +5152,14 @@ export function createPiZergCommandHandler(
             subscribe: (listener) => subscribeToZergState(stateOrReader, listener),
             adapterKind: runtimeOptions.subagentAdapter?.kind ?? 'unavailable',
             actions: createManagementOverlayActions(stateOrReader, runtimeOptions),
+            viewTimeline: async (target) => {
+              if (target?.kind === 'team') { await viewTimeline(context, { teamId: target.id }); return; }
+              const state = readTimelineState(stateOrReader);
+              if (target?.kind === 'agent' && target.id.startsWith(DEFAULT_RUN_ID_PREFIX) && state.agents[target.id]?.id === target.id) {
+                await viewTimeline(context, { parentRunId: target.id }); return;
+              }
+              context.ui?.notify?.('Timeline scope requires an explicit recorded team or parent run. Definition/task selections cannot safely infer historical membership.', 'warning');
+            },
             viewCoding: (target) => viewCoding(context, (refs) => {
               if (!target) return refs;
               // Refresh semantic selection once per list, never clone the whole

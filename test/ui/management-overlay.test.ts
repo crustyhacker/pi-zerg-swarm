@@ -182,7 +182,7 @@ test('M9 management overlay routes focus and chat keys through focused pane', ()
   assert.ok((component?.render(110) ?? []).length <= 32);
 });
 
-function codingManagementFixture(viewCoding?: (target: { id: string; kind: ZergManagementTargetKind } | undefined) => Promise<void>, onRender?: () => void) {
+function codingManagementFixture(viewCoding?: (target: { id: string; kind: ZergManagementTargetKind } | undefined) => Promise<void>, onRender?: () => void, viewTimeline?: (target: { id: string; kind: ZergManagementTargetKind } | undefined) => Promise<void>) {
   const container = createZergStateContainer({ agents: { worker: { id: 'worker', label: 'Worker', kind: 'subagent', status: 'running' } } });
   let mutations = 0;
   let renders = 0;
@@ -197,7 +197,7 @@ function codingManagementFixture(viewCoding?: (target: { id: string; kind: ZergM
     sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: 'unavailable' }),
   };
   const component = new ZergManagementOverlayComponent({ requestRender: () => { renders += 1; onRender?.(); } }, undefined, undefined, {
-    getSnapshot: () => container.snapshot(), subscribe: () => () => undefined, adapterKind: 'fake', actions, viewCoding,
+    getSnapshot: () => container.snapshot(), subscribe: () => () => undefined, adapterKind: 'fake', actions, viewCoding, viewTimeline,
   });
   component.render(110, 30);
   return { component, get mutations() { return mutations; }, get renders() { return renders; } };
@@ -297,4 +297,53 @@ test('nested coding management survives injected redraw throws without unhandled
   await codingTick();
   assert.equal(calls, 2);
   f.component.dispose();
+});
+
+test('timeline t is read-only tree/detail navigation, shares open guard, preserves draft and scoped target', async () => {
+  const targets: Array<{ id: string; kind: ZergManagementTargetKind } | undefined> = [];
+  let finish: () => void = () => undefined; let coding = 0;
+  const f = codingManagementFixture(async () => { coding++; }, undefined, (target) => { targets.push(target); return new Promise<void>((resolve) => { finish = resolve; }); });
+  f.component.handleInput('t'); f.component.handleInput('t'); f.component.handleInput('v');
+  await codingTick(); assert.deepEqual(targets, [{ id: 'worker', kind: 'agent' }]); assert.equal(coding, 0); assert.equal(f.mutations, 0);
+  finish(); await codingTick(); assert.match(f.component.getStateForTests().statusMessage ?? '', /timeline viewer closed/);
+  f.component.handleInput('tab'); f.component.handleInput('t'); await codingTick(); assert.equal(targets.length, 1);
+  f.component.handleInput('tab'); f.component.handleInput('t'); assert.equal(f.component.getStateForTests().chatDraft, 't');
+  f.component.handleInput('tab'); f.component.handleInput('t'); await codingTick(); assert.equal(targets.length, 2);
+  finish(); await codingTick(); assert.equal(f.component.getStateForTests().chatDraft, 't'); assert.equal(f.mutations, 0); f.component.dispose();
+});
+
+test('timeline callback faults/absence/disposal never launch a fallback coding viewer', async () => {
+  let coding = 0;
+  const absent = codingManagementFixture(async () => { coding++; }); absent.component.handleInput('t');
+  assert.match(absent.component.getStateForTests().statusMessage ?? '', /timeline viewer unavailable/); absent.component.dispose();
+  for (const sync of [true, false]) {
+    let calls = 0;
+    const f = codingManagementFixture(async () => { coding++; }, undefined, () => { calls++; if (sync) throw new Error('timeline host failed'); return Promise.reject(new Error('timeline host failed')); });
+    f.component.handleInput('t'); await codingTick(); assert.match(f.component.getStateForTests().statusMessage ?? '', /timeline viewer unavailable/);
+    f.component.handleInput('t'); await codingTick(); assert.equal(calls, 2); f.component.dispose();
+  }
+  let calls = 0;
+  const closed = codingManagementFixture(undefined, undefined, async () => { calls++; }); closed.component.handleInput('t'); closed.component.dispose();
+  await codingTick(); assert.equal(calls, 0); assert.equal(coding, 0);
+});
+
+test('shared viewer callbacks keep options receiver and contain noncoercible thrown values/redraw failures', async () => {
+  let coding = 0; let timeline = 0;
+  const container = createZergStateContainer({ agents: { worker: { id: 'worker', label: 'Worker', kind: 'subagent', status: 'running' } } });
+  const actions: ZergManagementOverlayActions = {
+    now: () => new Date('2026-10-03T00:00:00Z'), toggleReadOnly: () => '', setAutomation: () => '', setController: () => '', approvePermission: () => '', denyPermission: () => '', selectTarget: () => '', interruptSelected: () => '', sendOperatorMessage: () => ({ status: 'transport-unavailable', statusDetail: '' }),
+  };
+  const options = {
+    marker: 'options-receiver', getSnapshot: () => container.snapshot(), subscribe: () => () => undefined, adapterKind: 'fake', actions,
+    async viewCoding() { assert.equal(this.marker, 'options-receiver'); coding++; },
+    async viewTimeline() { assert.equal(this.marker, 'options-receiver'); timeline++; },
+  };
+  const c = new ZergManagementOverlayComponent(undefined, undefined, undefined, options); c.render(110, 30);
+  c.handleInput('v'); await codingTick(); c.handleInput('t'); await codingTick(); assert.equal(coding, 1); assert.equal(timeline, 1); c.dispose();
+  for (const synchronous of [true, false]) {
+    const nonText = Object.assign(Object.create(null), { toString: null });
+    const f = codingManagementFixture(undefined, () => { throw nonText; }, () => { if (synchronous) throw nonText; return Promise.reject(nonText); });
+    f.component.handleInput('t'); await codingTick(); assert.match(f.component.getStateForTests().statusMessage ?? '', /management redraw unavailable/); f.component.dispose();
+    const visible = codingManagementFixture(undefined, undefined, () => { throw nonText; }); visible.component.handleInput('t'); await codingTick(); assert.match(visible.component.getStateForTests().statusMessage ?? '', /Unknown failure/); visible.component.dispose();
+  }
 });

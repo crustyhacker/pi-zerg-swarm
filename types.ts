@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.11' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.12' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -212,6 +212,45 @@ export interface ZergNativeSessionReference {
   recoveredAt?: string;
 }
 
+export interface ZergTimelineFilter {
+  teamId?: string;
+  parentRunId?: string;
+  memberRunId?: string;
+  piSessionId?: string;
+  limit?: number;
+}
+export interface ZergTimelineEntryBase {
+  id: string;
+  timestamp?: string;
+  timestampMeaning: 'created' | 'recorded' | 'current-update';
+  summary: string;
+  bodyPreview: string;
+  clipped: boolean;
+  teamId?: string;
+  parentRunId?: string;
+  memberRunId?: string;
+  piSessionId?: string;
+  agentDefinitionId?: string;
+  /** Corroborated full tuple in this owner's current canonical reference ledger. */
+  exactKey?: ZergSessionMessageKey;
+}
+export type ZergTimelineEntry = ZergTimelineEntryBase & (
+  | { kind: 'operator-receipt'; messageId: string; mode: ZergOperatorMessageMode; status: ZergSessionMessageReceipt['status']; persistence: ZergSessionMessageReceipt['persistence']; updatedAt: string }
+  | { kind: 'native-output'; source: 'log'; sourceId: string }
+  | { kind: 'recorded-event'; source: 'log' | 'lifecycle'; sourceId: string; status?: string }
+  | { kind: 'run-snapshot' | 'member-snapshot'; status: string; attachment?: ZergNativeSessionReference['attachment'] }
+);
+export interface ZergTimelineSnapshot {
+  schemaVersion: 1;
+  revision: number;
+  filter: ZergTimelineFilter;
+  entries: ZergTimelineEntry[];
+  /** Known matching rows omitted within the inspected window, NOT outside it. */
+  omittedEntries: number;
+  clippedEntries: number;
+  limitations: string[];
+}
+
 export interface ZergSubagentRunSnapshot {
   runId: string;
   agentId: string;
@@ -307,6 +346,7 @@ export type ZergControlAction =
   | { action: 'runs.show'; runId: string }
   | ({ action: 'session.message.send'; messageId: string; body: string; mode: ZergOperatorMessageMode } & ZergSessionMessageKey)
   | ({ action: 'session.messages.list'; limit?: number } & ZergSessionMessageKey)
+  | ({ action: 'timeline.list' } & ZergTimelineFilter)
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }
   | { action: 'message'; targetId: string; body: string; runId?: string; mode?: ZergOperatorMessageMode }
   | { action: 'interrupt'; runId?: string };

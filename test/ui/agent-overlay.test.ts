@@ -765,3 +765,57 @@ test('rejected paste packets cannot erase rejection notices or insert their trai
     } finally { f.close(); }
   }
 });
+
+test('explicit initialKey resolves full exact tuple beyond bounded chooser, revalidates, never defaults', async () => {
+  const refs = Array.from({ length: 300 }, (_, index) => reference(`member-${index}`));
+  const wanted = refs[299]!;
+  const key = { parentRunId: wanted.parentRunId, memberRunId: wanted.memberRunId, piSessionId: wanted.piSessionId };
+  const opened: NativeTranscriptKey[] = [];
+  const component = new ZergAgentOverlayComponent(undefined, undefined, undefined, {
+    initialKey: key, getReferences: () => refs, subscribeReferences: () => () => undefined,
+    open: async (exact) => { opened.push(exact); return { getSnapshot: () => snapshot(exact), subscribe: () => () => undefined, dispose: () => undefined }; },
+  });
+  await tick();
+  assert.deepEqual(opened, [key]);
+  component.handleInput('home');
+  assert.match(component.render(140, 24).join('\n'), /member-299/);
+  component.dispose();
+  for (const initialKey of [{ ...key, piSessionId: 'other' }, { ...key, memberRunId: 'bad\x1b[31m' }, { ...key, parentRunId: 'a'.repeat(257) }]) {
+    const invalid = new ZergAgentOverlayComponent(undefined, undefined, undefined, {
+      initialKey, getReferences: () => refs, subscribeReferences: () => () => undefined,
+      open: async () => { throw new Error('must not open'); },
+    });
+    await tick(); invalid.handleInput('enter'); invalid.handleInput('s'); invalid.handleInput('enter');
+    const text = invalid.render(140, 24).join('\n');
+    assert.doesNotMatch(text, /Exact session chooser/);
+    assert.match(text, /stale|Invalid exact/);
+    invalid.dispose();
+  }
+  let reads = 0;
+  const stale = new ZergAgentOverlayComponent(undefined, undefined, undefined, {
+    initialKey: key, getReferences: () => ++reads === 1 ? refs : [], subscribeReferences: () => () => undefined,
+    open: async () => { opened.push(key); throw new Error('must not open'); },
+  });
+  await tick(); assert.equal(opened.length, 1); assert.match(stale.render(140, 24).join('\n'), /stale/); stale.dispose();
+});
+
+test('explicit initialKey ambiguity and removal stay unavailable without chooser retargeting', async () => {
+  const ref = reference(); let refs = [ref, { ...ref, agentDefinitionId: 'conflicting' }];
+  let listener: () => void = () => undefined; let opens = 0;
+  const options: ZergAgentOverlayOptions = {
+    initialKey: ref, getReferences: () => refs, subscribeReferences: (next) => { listener = next; return () => undefined; },
+    open: async (key) => { opens++; return { getSnapshot: () => snapshot(key), subscribe: () => () => undefined, dispose: () => undefined }; },
+  };
+  const ambiguous = new ZergAgentOverlayComponent(undefined, undefined, undefined, options);
+  await tick(); assert.equal(opens, 0); assert.match(ambiguous.render(140, 24).join('\n'), /ambiguous/); ambiguous.dispose();
+  refs = [ref]; const removed = new ZergAgentOverlayComponent(undefined, undefined, undefined, options);
+  await tick(); refs = [reference('replacement')]; listener(); removed.handleInput('enter');
+  assert.equal(opens, 1); assert.doesNotMatch(removed.render(140, 24).join('\n'), /Exact session chooser/); removed.dispose();
+});
+
+test('legacy no-initialKey read-only chooser retains canonical keys longer than timeline/message cap', async () => {
+  const ref = reference('m'.repeat(600), 'parent-long');
+  const f = fixture([ref]); f.component.handleInput('enter'); await tick();
+  assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.memberRunId, ref.memberRunId); assert.equal(f.opened[0]?.piSessionId, ref.piSessionId);
+  f.component.handleInput('home'); assert.doesNotMatch(f.component.render(140, 30).join('\n'), /Invalid exact/); f.component.dispose();
+});

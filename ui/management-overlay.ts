@@ -1,5 +1,6 @@
 import { Input, type Component, type Focusable } from '@earendil-works/pi-tui';
 import type { AutomationMode, StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergControlController, ZergManagementTargetKind, ZergManagementUiState, ZergOperatorMessageDeliveryStatus, ZergState } from '../types.js';
+import { sanitizeTranscriptText } from './agent-overlay.js';
 import { boldText, columns, fitRawLine, styleText, type UiThemeLike } from './components.js';
 import { ChatPaneActions, cancelChatDraft, renderChatPane, sendChatDraft } from './chat-pane.js';
 import { renderDetailPane, resolveSelectedTarget } from './detail-pane.js';
@@ -7,6 +8,15 @@ import { renderManagementFooter } from './footer.js';
 import { SettingsPaneActions, applyPermissionFromSettings, createSettingsPaneState, cycleController, movePendingPermissionCursor, renderSettingsPane } from './settings-pane.js';
 import { MANAGEMENT_PANES, createManagementUiState, matchesKey, movePaneFocus, setSelectedTarget } from './state.js';
 import { activateTreeSelection, buildManagementTreeRows, collapseTreeSelection, createTreePaneState, expandTreeSelection, moveTreeCursor, renderTreePane } from './tree-pane.js';
+
+function viewerError(error: unknown): string {
+  try {
+    const message: unknown = error instanceof Error ? error.message : error;
+    const text = typeof message === 'string' ? `${error instanceof Error ? 'Error: ' : ''}${message.slice(0, 256)}` : 'Unknown failure (non-text error).';
+    return sanitizeTranscriptText(text).slice(0, 256).replace(/\n/g, ' ');
+  }
+  catch { return 'Unknown failure (unreadable error).'; }
+}
 
 export interface ZergManagementOverlayActions extends SettingsPaneActions, ChatPaneActions {
   selectTarget(target: { id: string; kind: ZergManagementTargetKind }): string;
@@ -18,6 +28,7 @@ export interface ZergManagementOverlayOptions {
   subscribe(listener: () => void): () => void;
   adapterKind: string;
   actions: ZergManagementOverlayActions;
+  viewTimeline?(target: { id: string; kind: ZergManagementTargetKind } | undefined): Promise<void>;
   viewCoding?(target: { id: string; kind: ZergManagementTargetKind } | undefined): Promise<void>;
 }
 
@@ -126,6 +137,10 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
       this.requestRender();
       return;
     }
+    if ((data === 't' || data === 'T') && (this.uiState.focusedPane === 'tree' || this.uiState.focusedPane === 'detail')) {
+      this.openCodingViewer('timeline');
+      return;
+    }
     if ((data === 'v' || data === 'V') && (this.uiState.focusedPane === 'tree' || this.uiState.focusedPane === 'detail')) {
       this.openCodingViewer();
       return;
@@ -232,25 +247,29 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     return !matchesKey(data, 'tab', 'shift-tab');
   }
 
-  private openCodingViewer(): void {
+  private openCodingViewer(view: 'coding' | 'timeline' = 'coding'): void {
     if (this.codingViewerOpen) return;
-    if (!this.options.viewCoding) {
-      this.uiState.statusMessage = 'coding viewer unavailable';
+    const callback = view === 'timeline' ? this.options.viewTimeline : this.options.viewCoding;
+    if (!callback) {
+      this.uiState.statusMessage = `${view} viewer unavailable`;
       this.requestRender();
       return;
     }
-    this.ensureDefaultTarget(this.options.getSnapshot());
-    const target = resolveSelectedTarget(this.options.getSnapshot(), this.uiState);
+    let target: { id: string; kind: ZergManagementTargetKind } | undefined;
+    try {
+      this.ensureDefaultTarget(this.options.getSnapshot());
+      target = resolveSelectedTarget(this.options.getSnapshot(), this.uiState);
+    } catch { this.uiState.statusMessage = `${view} scope unavailable`; this.requestRender(); return; }
     this.codingViewerOpen = true;
-    this.uiState.statusMessage = 'opening read-only coding viewer';
+    this.uiState.statusMessage = `opening read-only ${view} viewer`;
     this.requestRender();
     // Promise boundary catches synchronous throws as well as async host failures.
     void Promise.resolve().then(() => {
-      if (!this.disposed) return this.options.viewCoding?.(target);
+      if (!this.disposed) return callback.call(this.options, target);
     }).then(() => {
-      if (!this.disposed) this.uiState.statusMessage = 'coding viewer closed';
+      if (!this.disposed) this.uiState.statusMessage = `${view} viewer closed`;
     }, (error: unknown) => {
-      if (!this.disposed) this.uiState.statusMessage = `coding viewer unavailable: ${String(error)}`;
+      if (!this.disposed) this.uiState.statusMessage = `${view} viewer unavailable: ${viewerError(error)}`;
     }).finally(() => {
       this.codingViewerOpen = false;
       this.requestRender();
