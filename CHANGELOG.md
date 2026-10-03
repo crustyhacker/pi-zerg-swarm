@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.13] - 2026-10-03
+
+### Added
+
+- Explicit continuation through `session.continuation.prepare` / `start` / `discard`, `/zerg sessions continue`, and coding-view **n**. A separate literal-task editor and current-authority review require **Ctrl+Y** confirmation; existing **b** branch inspection and **c** live messaging keep their meanings.
+- Non-executing preparation binds the exact source tuple, native entry and fingerprint, literal task, current definition/model/tools/permissions, and bounded known resource inputs. Owner-local, expiring, one-use approval rejects stale source/policy, conflicting admission, cancellation, and read-only execution. Historical permissions remain unknown.
+- Fresh task/run/Pi identities and durable explicit lineage for only the selected agent. Public native context projection preserves compaction and context edits; an exclusively created destination imports history without opening or modifying the original, replaying queues, reviving siblings, or restoring historical authority.
+- Normal Pi resources, extensions, skills, and hooks after authorization, with a final admission/model check immediately before the provider request. Startup side effects are authorized, not rolled back or sandboxed; inherited assistant output cannot count as new-task completion.
+- Core/UI regressions, isolated localhost public-SDK coverage including normal-hook read-only/model drift, and actual regular/fullscreen continuation and fresh-restart PTYs. Existing live composer and messaging compatibility checks remain covered.
+
+### Changed
+
+- Package allowlist and documentation include the native history/continuation modules and separate review UI. Recovery preserves inspectable lineage but never restores approval tokens, reconnects, or automatically executes.
+
+### Fixed
+
+- A shutdown polling race in continuation/composer terminal smoke controllers no longer reports a successful host exit as premature; explicit host-result and exit-code checks remain intact.
+
 ## [1.1.12] - 2026-10-03
 
 ### Added

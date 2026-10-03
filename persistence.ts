@@ -156,6 +156,11 @@ export function recoverZergStateAfterRestart(
     if (isTerminalRun(run.status, run.substate)) continue;
     const previousStatus = run.status;
     const previousSubstate = run.substate;
+    // Durable continuation lineage is historical evidence only. Review tokens are
+    // owner-local and are never restored, admitted, or replayed by recovery.
+    const recoveryReason = run.nativeContinuation
+      ? 'continuation interrupted by Pi restart; live session unavailable; new reviewed task required'
+      : 'recovered after Pi restart; live session unavailable';
     const recovery: ZergRunRecoveryInfo = {
       recoveredAt,
       reason: 'process-restart',
@@ -171,9 +176,9 @@ export function recoverZergStateAfterRestart(
       kind: 'subagent',
       status: 'needs-attention',
       health: 'degraded',
-      activity: 'recovered after Pi restart; live session unavailable',
+      activity: recoveryReason,
       substate: 'failed',
-      substateReason: 'recovered after Pi restart; live session unavailable',
+      substateReason: recoveryReason,
       metadata: { ...next.agents[run.runId]?.metadata, recovery },
     }, { now: () => new Date(recoveredAt) });
     if (run.taskId && next.tasks[run.taskId]) {
@@ -186,7 +191,7 @@ export function recoverZergStateAfterRestart(
             ...task,
             status: 'needs-attention',
             substate: 'failed',
-            substateReason: 'recovered after Pi restart; live session unavailable',
+            substateReason: recoveryReason,
             substateUpdatedAt: recoveredAt,
             updatedAt: recoveredAt,
             metadata: { ...task.metadata, recovery } as ZergExtensionFields,

@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.12 release status**
-> Adds a bounded, read-only team/run communication timeline with exact filters and safe navigation to an agent's coding overlay. Operator receipt status, recorded native output, events, and current snapshots remain distinct—not invented replies or delivery history. Existing live messaging, bounded concurrency, truthful outcomes, and opt-in snapshots are preserved.
-> Restart restores inspectable history and quarantines pending receipts; it never reconnects, resumes, or automatically resends. Long-lived agents, automatic sibling wakeups, and explicit resume controls are not included.
+> **v1.1.13 release status**
+> Adds explicitly reviewed continuation from one exact saved native entry into a **new task and Pi session** under current authority. Preparation is non-executing; confirmation authorizes normal Pi resources and hooks. Original history, live messaging, branch inspection, timeline, cancellation, and task-owned cleanup are preserved.
+> Restart restores inspectable history and quarantines pending receipts; it never reconnects, automatically continues, or resends. Historical permissions remain unknown. Continuation is not in-place resume, workspace restoration, or a sandbox.
 
 ## Release status
 
-- Current release: **v1.1.12** (team/run timeline, exact scope filters, and coding-view navigation).
+- Current release: **v1.1.13** (explicit reviewed continuation into a fresh native session).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -104,7 +104,60 @@ A caller ID is unique across the retained ledger. Repeating the same ID with the
 
 Receipt persistence is independently `memory`, `saved`, or `failed`. With existing opt-in snapshot persistence, a successful intent write is required before enqueue; a later save failure does not revoke known queued/delivered status. `saved` means a successful Zerg snapshot write—not fsync/power-loss protection or a durable native transcript. Recovery quarantines pending receipts as `needs-attention` without scanning history, reconnecting, or executing anything. Use one owner per snapshot file; this is not a cross-process mailbox.
 
-The ledger retains at most 128 receipts and 262,144 aggregate body UTF-16 code units, with at most 32 pending per exact session. Capacity exhaustion rejects new messages instead of silently evicting idempotency records; there is no automatic pruning. The overlay shows at most eight receipts; structured listing supports limits 1–128. Outgoing intent bodies are stored for inspection/idempotency, not as a second conversation transcript. Long-lived agents, automatic sibling push/wakeup, and explicit resume/fork controls remain separate work.
+The ledger retains at most 128 receipts and 262,144 aggregate body UTF-16 code units, with at most 32 pending per exact session. Capacity exhaustion rejects new messages instead of silently evicting idempotency records; there is no automatic pruning. The overlay shows at most eight receipts; structured listing supports limits 1–128. Outgoing intent bodies are stored for inspection/idempotency, not as a second conversation transcript. Long-lived agents and automatic sibling push/wakeup remain separate work.
+
+## New task from saved native history
+
+Continuation creates a **new task and native Pi session** using an explicitly selected saved history entry as context. It does not reconnect to, resume in place, or modify the original session. Only the selected agent continues—not its former team or siblings.
+
+The workflow has two separate steps:
+
+1. **Prepare and review** the exact parent/member/Pi identity, selected entry, source fingerprint, literal new task, and current execution policy. Preparation does not construct an agent session, load executable resources, or call a model; it is also available in read-only mode.
+2. **Explicitly authorize startup.** The owner-local review is consumed once. Changed source or fingerprinted policy inputs, expiry, read-only execution admission, or a disposed owner rejects startup; there is no automatic re-prepare or retry. Restart does not restore review tokens or execute anything.
+
+Historical permissions are **unknown**, not inferred from old tool use. Review authorizes a new task under the current selected agent definition, configured tools/denials, model, project instructions, and ordinary Pi resource-loading policy. Normal Pi extensions, skills, and resources remain available; this is not a reduced-capability mode. Confirmation authorizes resource loading and extension startup as well as the task, so startup itself can have side effects before a model request. Cancellation is not rollback.
+
+In the coding overlay, **n** opens the separate new-task flow from the last displayed non-live entry, validated against saved native history. **b** still inspects branches; **c** still sends to an accepting live session. Enter/Ctrl+S prepares a review; only **Ctrl+Y** on the review authorizes the new task. **e** edits and invalidates the review; Escape discards it and returns to the original viewer. Closing after submission does not cancel or retarget the new run. The public Pi editor normalizes newlines/tabs before review; the reviewed draft is then bound unchanged. Oversized disclosure disables confirmation instead of silently hiding part of the policy.
+
+Structured control uses the same flow:
+
+```ts
+const prepared = await control.execute({
+  action: 'session.continuation.prepare', parentRunId, memberRunId, piSessionId,
+  entryId, body: 'Investigate this alternative without modifying files.',
+  model: 'provider/model', // explicit override, or an explicit current definition model
+});
+if (!prepared.ok) throw new Error(prepared.error?.message ?? 'Review unavailable');
+const review = prepared.data.review;
+// Inspect the full review. Stop here; never automatically confirm it.
+```
+
+Only after explicit approval of that exact review:
+
+```ts
+const started = await control.execute({
+  action: 'session.continuation.start', reviewId: review.reviewId, confirm: true,
+});
+// Admission is not completion; inspect the returned runId through runs.show.
+```
+
+Alternatively discard an unused review with `session.continuation.discard` and its `reviewId`.
+
+Equivalent human-facing commands:
+
+```text
+/zerg sessions continue prepare <parent> <member> <pi-id> <entry-id> [--model provider/model] [--ack-unconfirmed] -- <literal new task>
+/zerg sessions continue start <review-id> --confirm
+/zerg sessions continue discard <review-id>
+```
+
+Structured/CLI task bodies preserve legal whitespace and are submitted without slash-command, skill-command, or prompt-template expansion. Normal Pi input and before-agent-start hooks still run and may transform or handle that input; the review discloses this ordinary extension authority. An inherited final assistant response is never counted as completion of the new task.
+
+Attached sources reject. An `unavailable` attachment—including uncertain restart recovery—requires explicit `acknowledgeUnconfirmedSource: true` (UI **Alt+A** / CLI `--ack-unconfirmed`). This acknowledges uncertain closure, not proof that the old process stopped. A confirmed disposed source does not become unconfirmed merely because its view was captured or recovered. The feature copies history only: it neither reconnects nor replays old queues, approvals, or receipts.
+
+Pi's authoritative session projection handles compaction and context edits—not the coding viewer's truncated blocks. The original transcript is never passed to SDK open/fork methods. A fresh, exclusively created native file receives the copied tree; only copied Zerg identity/lineage metadata namespaces change to explicit ancestor metadata. Payloads, entry IDs, and parent links remain intact. A new owning identity and source lineage are recorded, while legacy owning-marker validation remains strict.
+
+**Limits:** this does not restore workspace files, tool processes, historical resource code, credentials, or the old environment. Known current policy inputs are fingerprinted for drift detection, not frozen into an environment snapshot or security sandbox; legacy global npm fallback and transitive/dynamic dependencies are not resolved or sealed during review. Existing native capability checks still apply. The model must be explicit in the current definition or review override; current requested thinking follows normal Pi capability normalization. Missing, malformed, oversized, incomplete tool-call history and unsupported legacy plain system content remain inspectable where supported but cannot be executed through continuation. No fallback silently drops history or broadens permission.
 
 ## Team/run communication timeline
 
@@ -190,10 +243,13 @@ The TypeScript modules are intentionally small:
 - `parse.ts` — pure thinking-step derivation
 - `render.ts` — width-aware text rendering
 - `persistence.ts` — restart-durable run/log snapshot save, load, and recovery helpers
-- `native-transcript.ts` — owner-scoped read-only live observers and validated native history loading
+- `native-transcript.ts` — owner-scoped read-only live observers and bounded transcript projections
+- `native-history.ts` — strict saved-history validation, native context projection, and exclusive fresh-copy import
+- `native-continuation.ts` — bounded current-policy capture, exact one-use reviews, and execution admission
 - `session-messages.ts` — exact live message admission, bounded receipts, persistence barriers, and no-replay recovery
 - `timeline.ts` — pure bounded projection of retained receipts, provenance-linked output, events, and current snapshots
 - `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, explicit composer, and local branch inspection
+- `ui/continuation-review.ts` — separate literal-task editor, current-authority disclosure, and explicit continuation confirmation
 - `ui/team-timeline.ts` — exact filters, bounded timeline/details, and identity-checked coding-view round trips
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
@@ -255,8 +311,9 @@ npm run check:version
 - v1.1.9: patch release mapping exact native session identities and immutable transcript provenance
 - v1.1.10: patch release adding read-only live coding overlays and safe saved raw-history inspection
 - v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts
-- v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation (current release)
-- Next: explicit branch/resume/recovery controls and integrated workspace hardening
+- v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation
+- v1.1.13: patch release adding explicit reviewed continuation into a fresh native session (current release)
+- Next: further recovery controls and integrated workspace hardening
 
 ## License
 
@@ -268,7 +325,7 @@ MIT © 2026 Marc Mironescu (@crustyhacker) <marcm@crustyhacker.dev>
 - All selected team members are required: a worker failure or independent cancellation fails the overall run/task even if the leader succeeds. Parent or leader cancellation still yields a cancelled run; successful handoffs remain available.
 - `tools: []` means no tools. `disallowedTools`/denylist entries remove tools from an allowlist; this is not a sandbox boundary.
 - Native permission modes `manual` and `assisted` are not supported for Pi SDK runner launches; use inherited/default automatic behavior or reject before model execution.
-- Native Pi SDK execution fails closed for `--fork`/`launchMode: 'fork'`, nondefault `maxTurns`, and nonempty `fallbackModels`: the selected leader and every selected team member are checked before any SDK session starts. Clear those options for native runs, or use a supported external adapter/acknowledged slash bridge that implements them. This limitation is in the zerg native runner wiring; Pi's session runtime has fork support, but this runner does not wire parent history yet.
+- Native Pi SDK execution fails closed for `--fork`/`launchMode: 'fork'`, nondefault `maxTurns`, and nonempty `fallbackModels`: the selected leader and every selected team member are checked before any SDK session starts. Clear those options for native runs, or use a supported external adapter/acknowledged slash bridge that implements them. Reviewed continuation is a separate explicit history-import path, not support for these legacy launch options.
 - Legacy operator `message` calls require a live run/member route. Their Pi `steer`/`followUp` acknowledgement remains `queued` or `handled`; UI-local management drafts may use `queued-local` and are not delivery proof. The additive exact-session API has the separate receipt contract described above.
 - Legacy structured `zerg_control` `message` mode accepts only `steer` or `followUp` (default `steer`); ambiguous live target routes require an explicit `runId`. New `session.message.send` requires an explicit mode and all three session IDs.
 - Native team workers have a per-run concurrency limit (default **8**). Set it with `/zerg run <team> "<task>" --concurrency <n>` (also `--concurrency=<n>`) or a positive safe-integer number in structured `zerg_control` run `concurrency: n`. This is not a global/provider-wide limit, and external adapters are responsible for their own enforcement.

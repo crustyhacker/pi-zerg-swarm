@@ -57,6 +57,7 @@ export function createZergSubagentRunSnapshot(run: ZergSubagentRunSnapshot): Zer
     run.metadata && Object.hasOwn(run.metadata, 'nativeSessions') ? run.metadata.nativeSessions : run.nativeSessions,
     run.runId,
   );
+  const nativeContinuation = normalizeNativeContinuationLineage(run.metadata && Object.hasOwn(run.metadata, 'nativeContinuation') ? run.metadata.nativeContinuation : run.nativeContinuation);
   return {
     runId: run.runId,
     agentId: run.agentId,
@@ -77,6 +78,7 @@ export function createZergSubagentRunSnapshot(run: ZergSubagentRunSnapshot): Zer
     ...(run.recovery ? { recovery: { ...run.recovery } } : {}),
     memberProgress: run.memberProgress?.map((member) => ({ ...member })),
     ...(nativeSessions !== undefined ? { nativeSessions } : {}),
+    ...(nativeContinuation ? { nativeContinuation } : {}),
     metadata: cloneRunMetadata(run.metadata, run.runId),
   };
 }
@@ -1270,7 +1272,33 @@ function cloneRunMetadata(metadata: ZergExtensionFields | undefined, parentRunId
     if (nativeSessions === undefined) delete cloned.nativeSessions;
     else cloned.nativeSessions = nativeSessions;
   }
+  if (cloned && Object.hasOwn(cloned, 'nativeContinuation')) {
+    const lineage = normalizeNativeContinuationLineage(cloned.nativeContinuation);
+    if (!lineage) delete cloned.nativeContinuation;
+    else cloned.nativeContinuation = lineage;
+  }
   return cloned;
+}
+
+export function normalizeNativeContinuationLineage(value: unknown): import('./types.js').ZergNativeContinuationLineage | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const data = value as Record<string, unknown>;
+  const fields = ['schemaVersion', 'source', 'entryId', 'sourceFingerprint', 'policyDigest', 'policy'];
+  if (Object.keys(data).length !== fields.length || fields.some((key) => !Object.hasOwn(data, key)) || data.schemaVersion !== 1) return undefined;
+  if (typeof data.entryId !== 'string' || !data.entryId || data.entryId.length > 256 || /[\s\u0000-\u001f\u007f-\u009f]/.test(data.entryId)) return undefined;
+  if (typeof data.sourceFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(data.sourceFingerprint) || typeof data.policyDigest !== 'string' || !/^[a-f0-9]{64}$/.test(data.policyDigest)) return undefined;
+  if (!data.source || typeof data.source !== 'object' || Array.isArray(data.source) || !data.policy || typeof data.policy !== 'object' || Array.isArray(data.policy)) return undefined;
+  const source = data.source as Record<string, unknown>;
+  const sourceFields = ['schemaVersion', 'parentRunId', 'memberRunId', 'agentDefinitionId', 'piSessionId', 'sessionFile', 'cwd', 'createdAt'];
+  if (source.schemaVersion !== 1 || Object.keys(source).length !== sourceFields.length || sourceFields.slice(1).some((key) => typeof source[key] !== 'string' || !(source[key] as string).length || (source[key] as string).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/.test(source[key] as string))) return undefined;
+  const policy = data.policy as Record<string, unknown>;
+  if (policy.schemaVersion !== 1 || policy.resourcePolicy !== 'normal-default-resource-loader' || typeof policy.model !== 'string' || typeof policy.cwd !== 'string' || typeof policy.authorityInstruction !== 'string' || typeof policy.thinkingLevel !== 'string' || !Array.isArray(policy.inputs) || policy.inputs.length > 128 || !Array.isArray(policy.context) || policy.context.length > 32) return undefined;
+  try {
+    const policyText = JSON.stringify(policy);
+    const text = JSON.stringify(data);
+    if (policyText.length > 32768 || text.length > 49152) return undefined;
+    return JSON.parse(text) as import('./types.js').ZergNativeContinuationLineage;
+  } catch { return undefined; }
 }
 
 function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
@@ -1312,6 +1340,7 @@ function fromAgentToRunSnapshot(agent: AgentIdentity): ZergSubagentRunSnapshot {
     ...(recovery?.recoveredAt ? { recovery } : {}),
     memberProgress: Array.isArray(metadata?.memberProgress) ? metadata.memberProgress.map((member) => ({ ...(member as Record<string, unknown>) })) as unknown as ZergSubagentRunSnapshot['memberProgress'] : undefined,
     ...(metadata?.nativeSessions !== undefined ? { nativeSessions: normalizeNativeSessionReferences(metadata.nativeSessions, agent.id) } : {}),
+    ...(metadata?.nativeContinuation !== undefined ? { nativeContinuation: normalizeNativeContinuationLineage(metadata.nativeContinuation) } : {}),
     metadata,
   };
 }

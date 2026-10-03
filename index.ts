@@ -8,6 +8,8 @@ import { createZergPersistenceManager, type ZergPersistenceManager } from './per
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
+import { createNativeContinuationService, captureNativeContinuationPolicy, captureNativeContinuationPolicySync, validateContinuationSourceImmediate, importNativeContinuation, appendNativeContinuationMarker, nativeSourceIdentity, strictContinuationFields, continuationDeclaredDefinition, continuationDigest, type NativeContinuationService, type NativeContinuationAdmission } from './native-continuation.js';
+export type { NativeContinuationPrepare, NativeContinuationReview, NativeContinuationPolicy, NativeContinuationService } from './native-continuation.js';
 import { openZergAgentOverlay } from './ui/agent-overlay.js';
 import { getZergTimeline, validateZergTimelineFilter } from './timeline.js';
 import { openZergTeamTimeline } from './ui/team-timeline.js';
@@ -30,6 +32,7 @@ export interface ZergCommandHandlerOptions {
   nativeTranscriptService?: NativeTranscriptService;
   /** Exact owner capability; independent of the strictly read-only observer. */
   sessionMessageService?: SessionMessageService;
+  nativeContinuationService?: NativeContinuationService;
 }
 
 type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager };
@@ -116,6 +119,7 @@ type PiNativeActiveRun = {
 };
 
 type PiNativeActiveRunRegistry = Map<string, PiNativeActiveRun>;
+const nativeContinuationAdmissions = new WeakMap<ZergSubagentLaunchRequest, NativeContinuationAdmission>();
 
 
 interface NormalizedZergCommandInput {
@@ -569,6 +573,29 @@ async function executeZergControlAction(
         const records = getZergLogs(snapshot, { runId: action.runId, level: action.level, limit: action.limit });
         return controlOk(action.action, { records }, renderZergLogList(records, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision, { runId: action.runId });
       }
+      case 'session.continuation.prepare': {
+        strictContinuationFields(action, ['action', 'parentRunId', 'memberRunId', 'piSessionId', 'entryId', 'body', 'model', 'acknowledgeUnconfirmedSource']);
+        if (signal?.aborted) throw new Error('Continuation request cancelled.');
+        if (!options.nativeContinuationService) throw new Error('Native continuation service unavailable.');
+        const { action: _action, ...input } = action;
+        const review = await options.nativeContinuationService.prepare(input);
+        if (signal?.aborted) { options.nativeContinuationService.discard({ reviewId: review.reviewId }); throw new Error('Continuation request cancelled.'); }
+        return controlOk(action.action, { review }, JSON.stringify(review, null, 2), container.read().revision);
+      }
+      case 'session.continuation.start': {
+        strictContinuationFields(action, ['action', 'reviewId', 'confirm']);
+        if (signal?.aborted) throw new Error('Continuation request cancelled before start.');
+        if (!options.nativeContinuationService) throw new Error('Native continuation service unavailable.');
+        const started = await options.nativeContinuationService.start({ reviewId: action.reviewId, confirm: action.confirm }, signal);
+        if (signal?.aborted) options.subagentAdapter?.interrupt?.(started.runId);
+        return controlOk(action.action, started, `New independent continuation task admitted as ${started.runId}.`, container.read().revision, started);
+      }
+      case 'session.continuation.discard': {
+        strictContinuationFields(action, ['action', 'reviewId']);
+        if (!options.nativeContinuationService) throw new Error('Native continuation service unavailable.');
+        options.nativeContinuationService.discard({ reviewId: action.reviewId });
+        return controlOk(action.action, { reviewId: action.reviewId }, 'Continuation review discarded.', container.read().revision);
+      }
       case 'session.message.send': {
         const key = { parentRunId: action.parentRunId, memberRunId: action.memberRunId, piSessionId: action.piSessionId };
         const input = { key, messageId: action.messageId, body: action.body, mode: action.mode };
@@ -657,6 +684,10 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
         teamId: { type: 'string', description: 'timeline.list exact recorded team ID (no current membership inference).' },
         parentRunId: { type: 'string' },
         memberRunId: { type: 'string' },
+        entryId: { type: 'string' },
+        reviewId: { type: 'string' },
+        confirm: { type: 'boolean' },
+        acknowledgeUnconfirmedSource: { type: 'boolean' },
         piSessionId: { type: 'string' },
         messageId: { type: 'string' },
         limit: { type: 'number', description: 'timeline.list requires an integer 1..256; session.messages.list requires a safe integer 1..128; logs.list retains its existing limit semantics.' },
@@ -716,6 +747,9 @@ function isZergControlActionName(value: string): value is ZergControlAction['act
     || value === 'logs.list'
     || value === 'session.message.send'
     || value === 'session.messages.list'
+    || value === 'session.continuation.prepare'
+    || value === 'session.continuation.start'
+    || value === 'session.continuation.discard'
     || value === 'message'
     || value === 'interrupt';
 }
@@ -2937,6 +2971,7 @@ function createPiSlashBridgeAdapter(
   let disposed = false;
   let listenersDisposed = false;
   const resolveTimestamp = () => (options.now ?? (() => new Date()))().toISOString();
+  installNativeContinuationService(context, container, options, activeRuns, () => disposed, (id) => nativeOwnedRequestIds.add(id));
 
   const resolveTaskIdFromRun = (request: ZergSubagentLaunchRequest): string | undefined => {
     return typeof request.taskId === 'string' && request.taskId.length > 0 ? request.taskId : undefined;
@@ -3475,6 +3510,7 @@ function createPiSlashBridgeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      try { options.nativeContinuationService?.dispose(); } catch { /* Review cleanup cannot block existing run/session cleanup. */ }
       shutdownSessionMessages(options.sessionMessageService);
       shutdownNativeTranscript(options.nativeTranscriptService);
       for (const [runId] of fallbackLaunches) {
@@ -3497,6 +3533,55 @@ function createPiSlashBridgeAdapter(
   };
 }
 
+function installNativeContinuationService(
+  context: StructuralPiExtensionContext, container: ZergStateContainer, options: RuntimeCommandOptions,
+  activeRuns: PiNativeActiveRunRegistry, disposed: () => boolean, own?: (runId: string) => void,
+): void {
+  if (options.nativeContinuationService) return;
+  options.nativeContinuationService = createNativeContinuationService({
+    references: () => nativeReferences(container), now: options.now,
+    blocked: () => disposed() || container.read().mode.readOnly === true || container.read().lifecycle === 'disposed',
+    policy: async (source, override) => {
+      if (disposed()) throw new Error('Continuation owner disposed.');
+      const definition = getAgentDefinition(container.read(), source.agentDefinitionId);
+      if (!definition) throw new Error('Current source definition is missing.');
+      return captureNativeContinuationPolicy(source, definition, override ?? definition.model, resolvePiNativeToolPolicy(definition.tools, definition.disallowedTools));
+    },
+    launch: (admission) => {
+      if (disposed() || container.read().mode.readOnly) throw new Error('Continuation launch blocked.');
+      const runId = resolveRunId(options.idFactory);
+      const taskId = resolveTaskId(options.idFactory);
+      if (container.read().agents[runId] || container.read().tasks[taskId] || activeRuns.has(runId) || runId === admission.source.parentRunId || runId === admission.source.memberRunId) throw new Error('New continuation identity collision.');
+      const policy = admission.review.policy;
+      const request: ZergSubagentLaunchRequest = { agent: policy.definition.id, agentDefinitionId: policy.definition.id,
+        task: admission.review.body, model: policy.model, runId, taskId, launchMode: 'fresh', background: true };
+      nativeContinuationAdmissions.set(request, admission);
+      const metadata = { taskId, runId, originalTask: request.task, launchMode: 'fresh', agentDefinitionId: request.agent,
+        nativeContinuation: { schemaVersion: 1, source: nativeSourceIdentity(admission.source), entryId: admission.review.entryId,
+          sourceFingerprint: admission.review.sourceFingerprint, policyDigest: admission.review.policyDigest, policy } };
+      const now = options.now ?? (() => new Date());
+      const state = upsertTask(container.read(), { id: taskId, title: request.task, ownerAgentId: runId, status: 'running', updatedAt: now().toISOString(), metadata });
+      const activeRun = createPiNativeActiveRun(runId);
+      activeRuns.set(runId, activeRun);
+      own?.(runId);
+      try {
+        // Reentrant subscribers now see the task-owned cancellation handle before publication.
+        container.replace(applyRuntimeTransition(state, { entity: 'agent', action: 'start', id: runId,
+          label: policy.definition.label ?? request.agent, kind: 'subagent', activity: request.task, substate: 'starting', metadata }, { now }));
+        updateZergControlState(container, { activeRunId: runId }, 'new continuation task admitted', options);
+        if (disposed()) { activeRun.disposed = true; activeRun.cancelRequested = true; }
+        activeRun.promise = runPiNativeZergRequest(context, container, options, request, runId, taskId, 'fresh', activeRun)
+          .finally(() => { activeRuns.delete(runId); nativeContinuationAdmissions.delete(request); admission.release(); });
+        void activeRun.promise;
+        return { runId, taskId };
+      } catch (error) {
+        activeRuns.delete(runId); nativeContinuationAdmissions.delete(request); admission.release();
+        throw error;
+      }
+    },
+  });
+}
+
 function createPiNativeAdapter(
   context: StructuralPiExtensionContext,
   container: ZergStateContainer,
@@ -3508,6 +3593,8 @@ function createPiNativeAdapter(
   const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
   persistenceManager?.hydrate(container, runtimeOptions.now);
   persistenceManager?.save(container.read(), runtimeOptions.now);
+  installNativeContinuationService(context, container, runtimeOptions, activeRuns, () => disposed);
+  options.nativeContinuationService ??= runtimeOptions.nativeContinuationService;
   return {
     kind: 'pi-native',
     listAgentDefinitions() {
@@ -3629,6 +3716,7 @@ function createPiNativeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      try { runtimeOptions.nativeContinuationService?.dispose(); } catch { /* Review cleanup cannot block existing run/session cleanup. */ }
       shutdownSessionMessages(runtimeOptions.sessionMessageService);
       shutdownNativeTranscript(runtimeOptions.nativeTranscriptService);
       for (const runId of activeRuns.keys()) {
@@ -3697,12 +3785,12 @@ async function runPiNativeZergRequest(
 ): Promise<void> {
   const timestamp = () => (options.now ?? (() => new Date()))().toISOString();
   const state = container.read();
-  const leaderDefinition = getAgentDefinition(state, request.agent);
+  const leaderDefinition = nativeContinuationAdmissions.get(request)?.review.policy.definition ?? getAgentDefinition(state, request.agent);
   const ledTeam = request.resolvedTeamId ? state.teams[request.resolvedTeamId] : undefined;
   const requestedMemberIds = request.memberAgentIds ?? [];
   const memberDefinitions = requestedMemberIds.map((memberId) => getAgentDefinition(state, memberId));
   const missingMemberIds = requestedMemberIds.filter((_, index) => memberDefinitions[index] === undefined);
-  const cwd = resolvePiNativeCwd(context);
+  const cwd = nativeContinuationAdmissions.get(request)?.review.policy.cwd ?? resolvePiNativeCwd(context);
   const coordDir = `coord/zerg-${runId.replace(/^zerg-/, '')}`;
   const coordPath = resolvePath(cwd, coordDir);
   const workerConcurrency = request.concurrency ?? DEFAULT_NATIVE_WORKER_CONCURRENCY;
@@ -3718,6 +3806,10 @@ async function runPiNativeZergRequest(
       throw new Error(unsupportedCapabilityMessage);
     }
 
+    if (nativeContinuationAdmissions.has(request)) {
+      if (activeRun?.cancelRequested || activeRun?.disposed || container.read().mode.readOnly) throw new Error('Continuation cancelled or blocked before setup.');
+      await nativeContinuationAdmissions.get(request)!.validate();
+    }
     mkdirSync(coordPath, { recursive: true });
     setRunMetadata(container, runId, { coordDir, coordPath, originalTask: request.task, concurrency: workerConcurrency, ...(ledTeam ? { teamId: ledTeam.id, teamLabel: ledTeam.label, memberAgentIds: requestedMemberIds } : {}) }, options);
 
@@ -3786,7 +3878,7 @@ async function runPiNativeZergRequest(
     const leaderInstruction = runnableMemberDefinitions.length > 0
       ? `The worker pass finished with:\n${workerSummaries}\n\nRead ${coordDir}/ and project files as needed, integrate the workers' results within the original task scope, and write ${coordDir}/team-lead-final.md. Only run validation or modify files when the original task explicitly requests that work.`
       : 'Complete the requested task according to its stated scope, only run validation or modify files when that scope requires it, and report final status.';
-    const leaderPrompt = `${promptBase}\n\nYou are ${leaderDefinition?.id ?? request.agent}, the team lead for this zerg run. ${leaderInstruction}`;
+    const leaderPrompt = nativeContinuationAdmissions.get(request)?.review.body ?? `${promptBase}\n\nYou are ${leaderDefinition?.id ?? request.agent}, the team lead for this zerg run. ${leaderInstruction}`;
     const leaderResult = activeRun?.cancelRequested
       ? { agentId: leaderDefinition?.id ?? request.agent, status: 'cancelled' as const, message: 'cancel requested before leader start' }
       : await runSinglePiNativeAgent(context, leaderDefinition ?? { id: request.agent, label: request.agent, prompt: '', source: 'runtime' }, {
@@ -3900,12 +3992,23 @@ async function runSinglePiNativeAgent(
     return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before session start' };
   }
 
+  const admission = nativeContinuationAdmissions.get(run.request);
+  const assertContinuation = async () => {
+    if (!admission) return;
+    if (run.activeRun?.cancelRequested || run.activeRun?.disposed || run.container.read().mode.readOnly) throw new Error('Continuation cancelled or blocked during startup.');
+    await admission.validate();
+    if (run.activeRun?.cancelRequested || run.activeRun?.disposed || run.container.read().mode.readOnly) throw new Error('Continuation cancelled or blocked during startup.');
+  };
+  if (admission) await assertContinuation();
   const sdk = await import('@earendil-works/pi-coding-agent');
-  const cwd = resolvePiNativeCwd(context);
+  if (admission) await assertContinuation();
+  const cwd = admission?.review.policy.cwd ?? resolvePiNativeCwd(context);
   const modelSpec = resolvePiNativeRunModel(definition, run.request);
-  const { session, sessionManager, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec);
+  const { session, sessionManager, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec,
+    admission ? { admission, assert: assertContinuation } : undefined);
   const sessionHandle = session as PiNativeSessionHandle;
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
+  const reviewedEffectiveThinking = admission ? session.thinkingLevel : undefined;
   let reference: ZergNativeSessionReference | undefined;
   const timelineData = (kind: 'native-output' | 'recorded-event') => reference ? { nativeTimeline: {
     schemaVersion: 1, kind, parentRunId: reference.parentRunId, memberRunId: reference.memberRunId,
@@ -3916,6 +4019,18 @@ async function runSinglePiNativeAgent(
   let releaseMessages: (() => void) | undefined;
   let capturedResponse: string | undefined;
   let assistantOutcome: PiNativeAssistantOutcome | undefined;
+  let freshTurnStarted = false;
+  let disposition: string | undefined;
+  const assertImmediate = () => {
+    if (!admission) return;
+    const current = getAgentDefinition(run.container.read(), admission.source.agentDefinitionId);
+    const currentSource = nativeReferences(run.container).filter((ref) => ref.parentRunId === admission.source.parentRunId && ref.memberRunId === admission.source.memberRunId && ref.piSessionId === admission.source.piSessionId);
+    if (!current || currentSource.length !== 1 || continuationDigest(currentSource[0]) !== continuationDigest(admission.source) || run.activeRun?.cancelRequested || run.activeRun?.disposed || run.container.read().mode.readOnly ||
+      continuationDigest(continuationDeclaredDefinition(current)) !== continuationDigest(admission.review.policy.definition)) throw new Error('Current admission changed immediately before the new task.');
+    const policy = captureNativeContinuationPolicySync(sdk, admission.source, current, modelSpec, resolvePiNativeToolPolicy(current.tools, current.disallowedTools));
+    if (continuationDigest(policy) !== admission.review.policyDigest || `${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(modelSpec).modelId || session.thinkingLevel !== reviewedEffectiveThinking) throw new Error('Actual current policy/model/thinking differs from review before the new task.');
+    validateContinuationSourceImmediate(admission);
+  };
   const captureResponse = (value: unknown) => {
     const outcome = inspectPiNativeAssistantOutcome(value);
     const text = extractPiNativePromptResponse(value);
@@ -3940,13 +4055,15 @@ async function runSinglePiNativeAgent(
       piSessionId: reference.piSessionId, sessionFile: reference.sessionFile,
       cwd: reference.cwd, createdAt: reference.createdAt,
     });
+    if (admission) appendNativeContinuationMarker(sessionManager, admission);
     sessionManager.appendSessionInfo(`zerg ${run.runId} (${definition.id})`.slice(0, 160));
     setNativeSessionReference(run, reference);
     registerPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
     if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
     updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
     unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
-      if (event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
+      if (admission ? freshTurnStarted && event.type === 'message_end' && isPiNativeAssistantMessage(event.message)
+        : event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
         captureResponse(event);
       }
       if (event.type === 'tool_execution_start') {
@@ -3972,7 +4089,12 @@ async function runSinglePiNativeAgent(
       });
     } catch { /* A failed observer never prevents execution. */ }
 
+    if (admission) await assertContinuation();
     await session.bindExtensions({ mode: 'print', abortHandler: () => { if (run.activeRun) run.activeRun.cancelRequested = true; } });
+    if (admission) {
+      await assertContinuation();
+      if (`${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(modelSpec).modelId) throw new Error('Actual startup model differs from reviewed current policy.');
+    }
     appendLogToContainer(run.container, run.options, {
       source: 'adapter',
       level: 'info',
@@ -3997,17 +4119,25 @@ async function runSinglePiNativeAgent(
           details: { schemaVersion: 1, ...input.key, messageId: input.messageId, mode: input.mode, agentDefinitionId: definition.id } }, { deliverAs: input.mode }),
       });
     } catch { /* Receipt integration cannot own task execution. */ }
-    const promptResult = await session.prompt(run.task, { source: 'extension' as never });
-    captureResponse(promptResult);
-    const finalMessages = sessionHandle.messages;
-    capturedResponse = extractPiNativePromptResponse(finalMessages);
-    assistantOutcome = inspectPiNativeAssistantOutcome(finalMessages);
+    if (admission) { await assertContinuation(); assertImmediate(); }
+    const promptResult = await session.prompt(run.task, admission
+      ? { source: 'extension' as never, expandPromptTemplates: false, preflightResult: (value) => {
+        disposition = value;
+        if (value === 'started') { assertImmediate(); freshTurnStarted = true; }
+        else { freshTurnStarted = false; capturedResponse = undefined; assistantOutcome = undefined; }
+      } }
+      : { source: 'extension' as never });
+    if (!admission) {
+      captureResponse(promptResult);
+      capturedResponse = extractPiNativePromptResponse(sessionHandle.messages);
+      assistantOutcome = inspectPiNativeAssistantOutcome(sessionHandle.messages);
+    } else if (disposition !== 'started') { capturedResponse = undefined; assistantOutcome = undefined; }
     if (run.activeRun?.cancelRequested) {
       updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancelled' });
       return { agentId: definition.id, status: 'cancelled', message: 'cancelled' };
     }
     if (!assistantOutcome) {
-      const message = 'assistant final outcome was not captured';
+      const message = admission && disposition === 'handled' ? 'new task handled by input hook; no new assistant completion' : 'assistant final outcome was not captured';
       appendLogToContainer(run.container, run.options, {
         source: 'adapter',
         level: 'error',
@@ -4533,16 +4663,20 @@ async function createPiNativeSession(
   task: string,
   cwd: string,
   modelSpec: string | undefined,
+  continuation?: { admission: NativeContinuationAdmission; assert(): Promise<void> },
 ) {
   if (definition.permissionMode === 'manual' || definition.permissionMode === 'assisted') {
     throw new Error(`Native Pi runner does not support agent permissionMode ${definition.permissionMode}; use inherit/default or automatic for native runs.`);
   }
   const agentDir = sdk.getAgentDir();
+  if (continuation && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for continuation.');
+  if (continuation) await continuation.assert();
   const modelRuntime = await sdk.ModelRuntime.create({
     authPath: resolvePath(agentDir, 'auth.json'),
     modelsPath: resolvePath(agentDir, 'models.json'),
     allowModelNetwork: false,
   });
+  if (continuation) await continuation.assert();
   const { modelId, thinkingLevel } = splitModelAndThinking(modelSpec);
   const toolPolicy = resolvePiNativeToolPolicy(definition.tools, definition.disallowedTools);
   const tools = toolPolicy.activeTools;
@@ -4571,15 +4705,19 @@ async function createPiNativeSession(
     retry: { enabled: true, maxRetries: 2 },
     defaultTools: tools,
   });
-  const resourceLoader = await createPiNativeResourceLoader(sdk, definition, task, cwd, settingsManager);
+  if (continuation) await continuation.assert();
+  const loaderDefinition = continuation ? { ...definition, prompt: `${definition.prompt}\n\n${continuation.admission.review.policy.authorityInstruction}` } : definition;
+  const resourceLoader = await createPiNativeResourceLoader(sdk, loaderDefinition, task, cwd, settingsManager);
+  if (continuation) await continuation.assert();
   const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
-  const sessionManager = sdk.SessionManager.create(cwd);
+  if (continuation) await continuation.assert();
+  const sessionManager = continuation ? importNativeContinuation(sdk, continuation.admission) : sdk.SessionManager.create(cwd);
   const { session } = await sdk.createAgentSession({
     cwd,
     agentDir,
     modelRuntime,
     model: model as never,
-    thinkingLevel: thinkingLevel as never,
+    thinkingLevel: (continuation?.admission.review.policy.thinkingLevel ?? thinkingLevel) as never,
     resourceLoader: resourceLoader as never,
     tools: toolPolicy.tools ?? [],
     ...(toolPolicy.noTools ? { noTools: toolPolicy.noTools } : {}),
@@ -4588,6 +4726,16 @@ async function createPiNativeSession(
     sessionManager,
     settingsManager,
   });
+  if (continuation) {
+    try {
+      await continuation.assert();
+      if (`${session.model?.provider}/${session.model?.id}` !== modelId) throw new Error('Resolved model differs from reviewed current policy.');
+      // Persist actual CURRENT metadata after normal Pi capability normalization,
+      // never inherit a saved model/thinking selection as executable authority.
+      sessionManager.appendModelChange(session.model!.provider, session.model!.id);
+      sessionManager.appendThinkingLevelChange(session.thinkingLevel);
+    } catch (error) { session.dispose(); throw error; }
+  }
   return { session, sessionManager, tools };
 }
 
@@ -5096,6 +5244,7 @@ export function createPiZergCommandHandler(
     subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
     open: (key, openOptions) => transcript.open(key, openOptions),
     composer: options.sessionMessageService,
+    nativeContinuationService: options.nativeContinuationService,
   });
 
   const viewTimeline = (context: StructuralPiCommandContext, initialFilter: ZergTimelineFilter = {}) => openZergTeamTimeline(context, {
@@ -5107,12 +5256,20 @@ export function createPiZergCommandHandler(
       subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
       open: (key, openOptions) => transcript.open(key, openOptions),
       composer: options.sessionMessageService,
+      nativeContinuationService: options.nativeContinuationService,
       initialKey: { ...exactKey },
     }),
   });
 
   return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
     const routed = stripOptionalZergInvocation(input.trimStart());
+    if (/^sessions\s+continue(?:\s|$)/i.test(routed)) {
+      const container = getWritableStateContainer(stateOrReader);
+      const parsed = parseNativeContinuationCommand(routed);
+      if (!container || !parsed) { context.ui?.notify?.('Usage: /zerg sessions continue prepare <parent> <member> <pi> <entry> [--model provider/model[:thinking]] [--ack-unconfirmed] -- <literal body>; start <reviewId> --confirm; discard <reviewId>', 'error'); return; }
+      const response = await executeZergControlAction(container, parsed, runtimeOptions);
+      context.ui?.notify?.(response.output ?? response.error?.message ?? 'Continuation outcome unavailable.', response.ok ? 'info' : 'error'); return;
+    }
     if (/^sessions\s+(send|messages)(?:\s|$)/i.test(routed)) {
       const container = getWritableStateContainer(stateOrReader);
       const parsed = parseSessionMessagingCommand(routed);
@@ -5636,4 +5793,25 @@ function shutdownSessionMessages(service: SessionMessageService | undefined): vo
 }
 function closeSessionMessagesParent(service: SessionMessageService | undefined, parentRunId: string): void {
   try { service?.closeParent(parentRunId); } catch { /* Receipt faults cannot block cancellation. */ }
+}
+
+export function parseNativeContinuationCommand(input: string): ZergControlAction | undefined {
+  const prepare = input.match(/^sessions\s+continue\s+prepare\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)([\s\S]*?) -- ([\s\S]*)$/i);
+  if (prepare) {
+    const [, parentRunId, memberRunId, piSessionId, entryId, flags, body] = prepare;
+    let model: string | undefined;
+    let acknowledgeUnconfirmedSource: boolean | undefined;
+    const tokens = flags.trim() ? flags.trim().split(/\s+/) : [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === '--model' && model === undefined && tokens[i + 1] && !tokens[i + 1]!.startsWith('--')) model = tokens[++i];
+      else if (tokens[i] === '--ack-unconfirmed' && acknowledgeUnconfirmedSource === undefined) acknowledgeUnconfirmedSource = true;
+      else return undefined;
+    }
+    return { action: 'session.continuation.prepare', parentRunId: parentRunId!, memberRunId: memberRunId!, piSessionId: piSessionId!, entryId: entryId!, body: body!, ...(model ? { model } : {}), ...(acknowledgeUnconfirmedSource ? { acknowledgeUnconfirmedSource } : {}) };
+  }
+  const start = input.match(/^sessions\s+continue\s+start\s+(\S+)\s+--confirm\s*$/i);
+  if (start) return { action: 'session.continuation.start', reviewId: start[1]!, confirm: true };
+  const discard = input.match(/^sessions\s+continue\s+discard\s+(\S+)\s*$/i);
+  if (discard) return { action: 'session.continuation.discard', reviewId: discard[1]! };
+  return undefined;
 }

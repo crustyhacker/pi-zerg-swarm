@@ -1,5 +1,5 @@
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.12' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.13' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -212,6 +212,15 @@ export interface ZergNativeSessionReference {
   recoveredAt?: string;
 }
 
+/** Read-only durable provenance, never an executable resume/review token. */
+export interface ZergNativeContinuationLineage {
+  schemaVersion: 1;
+  source: Pick<ZergNativeSessionReference, 'schemaVersion' | 'parentRunId' | 'memberRunId' | 'agentDefinitionId' | 'piSessionId' | 'sessionFile' | 'cwd' | 'createdAt'>;
+  entryId: string;
+  sourceFingerprint: string;
+  policyDigest: string;
+  policy: import('./native-continuation.js').NativeContinuationPolicy;
+}
 export interface ZergTimelineFilter {
   teamId?: string;
   parentRunId?: string;
@@ -272,6 +281,7 @@ export interface ZergSubagentRunSnapshot {
   memberProgress?: ZergSubagentMemberProgress[];
   /** Read-only projection of the canonical parent metadata.nativeSessions ledger. */
   nativeSessions?: ZergNativeSessionReference[];
+  nativeContinuation?: ZergNativeContinuationLineage;
   metadata?: ZergExtensionFields;
 }
 
@@ -347,6 +357,9 @@ export type ZergControlAction =
   | ({ action: 'session.message.send'; messageId: string; body: string; mode: ZergOperatorMessageMode } & ZergSessionMessageKey)
   | ({ action: 'session.messages.list'; limit?: number } & ZergSessionMessageKey)
   | ({ action: 'timeline.list' } & ZergTimelineFilter)
+  | ({ action: 'session.continuation.prepare'; entryId: string; body: string; model?: string; acknowledgeUnconfirmedSource?: boolean } & ZergSessionMessageKey)
+  | { action: 'session.continuation.start'; reviewId: string; confirm: true }
+  | { action: 'session.continuation.discard'; reviewId: string }
   | { action: 'logs.list'; runId?: string; level?: ZergLogLevel; limit?: number }
   | { action: 'message'; targetId: string; body: string; runId?: string; mode?: ZergOperatorMessageMode }
   | { action: 'interrupt'; runId?: string };

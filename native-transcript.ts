@@ -1,6 +1,4 @@
-import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { readNativeHistory } from './native-history.js';
 import type { ZergNativeSessionReference } from './types.js';
 
 export type NativeTranscriptKey = Pick<ZergNativeSessionReference, 'parentRunId' | 'memberRunId' | 'piSessionId'>;
@@ -29,7 +27,6 @@ export type NativeTranscriptService = ReturnType<typeof createNativeTranscriptSe
 
 const LIMIT = { bytes: 8 * 1024 * 1024, line: 256 * 1024, entries: 10000, blocks: 200,
   text: 32 * 1024, collector: 256 * 1024, owners: 32, tools: 64, listeners: 64 } as const;
-const MARKER = 'pi-zerg-swarm/native-session/v1';
 type Entry = { id: string; parentId: string | null; blocks: NativeTranscriptBlock[] };
 type Data = { entries: Entry[]; leaf: string | null; extra: NativeTranscriptBlock[]; truncated: boolean; dropped: number };
 const record = (value: unknown): value is Record<string, any> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -305,68 +302,8 @@ export function createNativeTranscriptService(options: { getReferences: () => Ze
 }
 
 async function readSaved(ref: ZergNativeSessionReference, agentDir?: string, signal?: AbortSignal): Promise<Data> {
-  const abort = () => { if (signal?.aborted) throw new Error('Saved history load aborted'); };
-  abort();
-  const root = resolve(agentDir ?? (await import('@earendil-works/pi-coding-agent')).getAgentDir(), 'sessions');
-  const group = `--${resolve(ref.cwd).replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
-  const path = resolve(ref.sessionFile);
-  if (!isAbsolute(ref.sessionFile) || path !== ref.sessionFile || !path.startsWith(`${join(root, group)}${sep}`) ||
-      path.slice(join(root, group).length + 1).includes(sep) || !path.endsWith('.jsonl')) throw new Error('Saved history locator denied');
-  const checkPath = async () => {
-    const parts = path.split(sep).filter(Boolean); let current: string = sep;
-    for (const part of parts) { abort(); current = join(current, part); const stat = await lstat(current); if (stat.isSymbolicLink()) throw new Error('Saved history symlink denied'); }
-    if (await realpath(path) !== path) throw new Error('Saved history canonical path mismatch');
-  };
-  await checkPath();
-  const before = await lstat(path);
-  if (!before.isFile()) throw new Error('Saved history is not a regular file');
-  if (before.size > LIMIT.bytes) throw new Error('Saved history exceeds byte limit');
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  let bytes: Buffer;
-  try {
-    const stat = await file.stat();
-    if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino || stat.size > LIMIT.bytes) throw new Error('Saved history identity changed');
-    bytes = Buffer.alloc(Math.min(stat.size + 1, LIMIT.bytes + 1));
-    let length = 0;
-    while (length < bytes.length) { abort(); const read = await file.read(bytes, length, Math.min(65536, bytes.length - length), length); if (!read.bytesRead) break; length += read.bytesRead; }
-    const after = await file.stat(); await checkPath(); const locator = await lstat(path);
-    if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || locator.dev !== stat.dev || locator.ino !== stat.ino || length !== stat.size) throw new Error('Saved history changed during read');
-    bytes = bytes.subarray(0, length);
-  } finally { await file.close(); }
-  abort();
-  let decoded: string;
-  try { decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { throw new Error('Saved history invalid UTF-8'); }
-  const lines = decoded.split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  if (!lines.length || lines.length > LIMIT.entries + 1) throw new Error('Saved history entry limit or empty file');
-  if (lines.some((line) => Buffer.byteLength(line) > LIMIT.line)) throw new Error('Saved history line limit exceeded');
-  let rows: Record<string, any>[];
-  try { rows = lines.map((line) => { const value: unknown = JSON.parse(line); if (!record(value)) throw new Error(); return value; }); }
-  catch { throw new Error('Saved history corrupt or partial JSONL'); }
-  const header = rows.shift()!;
-  if (header.type !== 'session' || header.version !== 3) throw new Error('Unsupported saved session header (requires v3)');
-  if (header.id !== ref.piSessionId || header.cwd !== ref.cwd || rows.some((entry) => entry.type === 'session')) throw new Error('Saved history header identity mismatch');
-  const markers = rows.filter((entry) => entry.type === 'custom' && entry.customType === MARKER);
-  const identityFields = ['schemaVersion', 'parentRunId', 'memberRunId', 'agentDefinitionId', 'piSessionId', 'sessionFile', 'cwd', 'createdAt'] as const;
-  if (markers.length !== 1 || !record(markers[0].data) || Object.keys(markers[0].data).length !== identityFields.length || identityFields.some((field) => markers[0].data[field] !== ref[field])) throw new Error('Saved history provenance mismatch');
-  const byId = new Map<string, Record<string, any>>();
-  for (const row of rows) {
-    if (typeof row.id !== 'string' || !row.id || row.id.length > 256 || byId.has(row.id) ||
-        !(row.parentId === null || typeof row.parentId === 'string') || typeof row.type !== 'string') throw new Error('Saved history invalid or duplicate entry');
-    byId.set(row.id, row);
-  }
-  const visited = new Set<string>(); let steps = 0;
-  for (const row of rows) {
-    const path = new Set<string>(); let cursor: Record<string, any> | undefined = row;
-    while (cursor && !visited.has(cursor.id)) {
-      if (++steps > LIMIT.entries || path.has(cursor.id)) throw new Error('Saved history cyclic graph or work limit');
-      path.add(cursor.id);
-      if (cursor.parentId === null) break;
-      cursor = byId.get(cursor.parentId); if (!cursor) throw new Error('Saved history orphan entry');
-    }
-    for (const id of path) visited.add(id);
-  }
-  return normalize(rows, rows.at(-1)?.id ?? null);
+  const history = await readNativeHistory(ref, { agentDir, signal });
+  return normalize(history.entries, history.entries.at(-1)?.id ?? null);
 }
 
 function boundExtra(blocks: NativeTranscriptBlock[], data: Data, tools: Map<string, NativeTranscriptBlock>): NativeTranscriptBlock[] {

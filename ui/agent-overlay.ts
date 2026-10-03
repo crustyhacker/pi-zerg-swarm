@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { CURSOR_MARKER, Editor, getKeybindings, matchesKey as piMatchesKey, Text, stripTerminalSequences, truncateToWidth, type Focusable, type TUI } from '@earendil-works/pi-tui';
 import type { NativeTranscriptKey, NativeTranscriptReadHandle, NativeTranscriptSnapshot } from '../native-transcript.js';
+import type { NativeContinuationService } from '../native-continuation.js';
 import type { StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergNativeSessionReference } from '../types.js';
 import { styleText, type UiThemeLike } from './components.js';
+import { ZergContinuationReviewComponent, type ContinuationSource } from './continuation-review.js';
 import { matchesKey } from './state.js';
 
 export type ZergComposerMode = 'steer' | 'followUp';
@@ -35,6 +37,7 @@ export interface ZergAgentOverlayOptions {
   subscribeReferences(listener: () => void): () => void;
   open(key: NativeTranscriptKey, options?: { signal?: AbortSignal }): Promise<NativeTranscriptReadHandle>;
   composer?: ZergOverlayComposer;
+  nativeContinuationService?: NativeContinuationService;
   /** Explicit exact drilldown; never defaults to a chooser/leader if stale. */
   initialKey?: NativeTranscriptKey;
 }
@@ -123,11 +126,14 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
   private editRevision = 0;
   private editorInputs = 0;
   private paste?: { text: string; tail: string; rejected: boolean };
+  private continuation?: ZergContinuationReviewComponent;
+  private displayedContinuation?: { source: ContinuationSource; proof: string };
 
   get focused(): boolean { return this._focused; }
   set focused(value: boolean) {
     this._focused = value;
-    if (this.editor) this.editor.focused = value && this.composing && this.layoutAvailable;
+    if (this.editor) this.editor.focused = value && this.composing && this.layoutAvailable && !this.continuation;
+    if (this.continuation) this.continuation.focused = value;
   }
 
   constructor(
@@ -150,13 +156,16 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     } catch (error) { this.message = `Reference observer unavailable: ${String(error)}`; }
   }
 
-  invalidate(): void { this.cache = undefined; this.editor?.invalidate(); }
+  invalidate(): void { this.cache = undefined; this.editor?.invalidate(); this.continuation?.invalidate(); }
 
   render(width = 100, requestedHeight?: number): string[] {
     const w = Math.max(1, Math.min(512, Math.floor(width) || 1));
     const h = Math.max(1, Math.min(128, Math.floor(requestedHeight ?? (this.tui?.terminal?.rows ?? 32) * 0.82) || 1));
+    if (this.continuation) { this.continuation.focused = this._focused; return this.continuation.render(w, h); }
     this.layoutAvailable = w >= 12 && h >= 10;
     if (this.editor) this.editor.focused = this._focused && this.composing && this.layoutAvailable;
+    // Capture only a transcript frame actually rendered, never a branch chooser or an unseen publication.
+    this.displayedContinuation = this.mode === 'transcript' && !this.loading && !this.composing ? this.continuationSource() : undefined;
     const composerLines = this.mode === 'transcript' && this.options.composer ? this.renderComposer(w, h) : [];
     const layout = this.mode === 'transcript' ? this.formatted(w) : undefined;
     const notice = [
@@ -195,7 +204,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     const footer = this.mode === 'chooser' ? '↑↓ select · Enter inspect · q/Esc close'
       : this.mode === 'branches' ? '↑↓ select · Enter inspect locally · s sessions · q/Esc close'
       : this.composing ? 'Enter newline · Ctrl+s send · Alt+m mode · Esc back (draft retained)'
-      : `${this.options.composer ? 'c compose · ' : ''}s sessions · b branches · ↑↓/PgUp/PgDn/Home scroll · End follow · q/Esc close`;
+      : `${this.options.composer ? 'c compose · ' : ''}${this.options.nativeContinuationService ? 'n NEW continuation · ' : ''}s sessions · b branches · ↑↓/PgUp/PgDn/Home scroll · End follow · q/Esc close`;
     // Reserve composer/receipt/footer rows before transcript slicing; never lose its tail.
     return [title, rowText(status), ...body, ...composerLines, styleText(this.theme, 'dim', footer)]
       .slice(0, h).map((line) => truncateToWidth(line, w, '', true));
@@ -203,7 +212,9 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
 
   handleInput(data: string): void {
     if (this.disposed) return;
+    if (this.continuation) { this.continuation.handleInput(data); return; }
     if (this.composing) { this.handleComposerInput(data); this.requestRender(); return; }
+    if (data.toLowerCase() === 'n') { this.openContinuation(); this.requestRender(); return; }
     if (matchesKey(data, 'escape') || data.toLowerCase() === 'q') { this.dispose(); return; }
     if (data.toLowerCase() === 's' && !(this.options.initialKey && !this.handle)) {
       const hadDraft = Boolean(this.editor?.getExpandedText());
@@ -251,6 +262,50 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
     cleanup(this.done);
   }
 
+  private continuationSource(snapshot = this.snapshot): { source: ContinuationSource; proof: string } | undefined {
+    if (!this.key || !this.handle || !snapshot || !sameKey(snapshot.key, this.key) || snapshot.source === 'live' || snapshot.status === 'running') return;
+    const entryId = snapshot.inspectedLeafId;
+    if (!validExactKey(this.key) || typeof entryId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(entryId)) return;
+    try {
+      const refs = this.options.getReferences().filter((ref) => sameKey(ref, this.key!));
+      const ref = refs[0];
+      if (refs.length !== 1 || !ref || ref.attachment === 'attached') return;
+      // Whitelist exact reference metadata and selection proof. Raw file fingerprinting belongs to prepare/start.
+      const proof = JSON.stringify([this.key.parentRunId, this.key.memberRunId, this.key.piSessionId, this.leafId,
+        snapshot.revision, snapshot.source, snapshot.status, entryId, ref.schemaVersion, ref.agentDefinitionId,
+        ref.sessionFile, ref.cwd, ref.createdAt, ref.attachment, ref.disposedAt, ref.recoveredAt]);
+      if (proof.length > 16384) return;
+      return { source: { key: { parentRunId: this.key.parentRunId, memberRunId: this.key.memberRunId, piSessionId: this.key.piSessionId }, entryId,
+        unconfirmed: ref.attachment === 'unavailable' }, proof };
+    } catch { return; }
+  }
+
+  private continuationCurrent(proof: string): boolean {
+    try {
+      const snapshot = this.handle?.getSnapshot({ leafId: this.leafId });
+      return Boolean(snapshot && this.continuationSource(snapshot)?.proof === proof);
+    } catch { return false; }
+  }
+
+  private openContinuation(): void {
+    const displayed = this.displayedContinuation;
+    const service = this.options.nativeContinuationService;
+    if (!service || this.mode !== 'transcript' || !displayed || !this.continuationCurrent(displayed.proof)) {
+      this.message = 'NEW continuation disabled: display an exact non-live saved entry first; stale/live sources never retarget.';
+      return;
+    }
+    this.continuation = new ZergContinuationReviewComponent(this.tui, this.theme, {
+      source: displayed.source, service, isCurrent: () => !this.disposed && this.continuationCurrent(displayed.proof),
+      close: () => {
+        this.continuation = undefined;
+        this.displayedContinuation = undefined;
+        // Return to the same viewer, never to the destination or another source.
+        if (!this.disposed) { this.readSnapshot(); this.focused = this._focused; this.requestRender(); }
+      },
+    });
+    this.focused = this._focused;
+  }
+
   private requestRender(): void {
     if (this.disposed) return;
     try { this.tui?.requestRender?.(); } catch { this.message = 'Viewer redraw unavailable.'; }
@@ -264,6 +319,7 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       this.references = refs.slice(0, MAX_CHOICES).map((ref) => ({ ...ref }));
       const retained = prior ? this.references.findIndex((ref) => sameKey(ref, prior)) : -1;
       this.choice = retained >= 0 ? retained : Math.min(this.choice, Math.max(0, this.references.length - 1));
+      this.continuation?.sourceChanged();
       if (this.key && !refs.some((ref) => sameKey(ref, this.key!))) {
         this.detach();
         this.mode = this.options.initialKey ? 'transcript' : 'chooser';
@@ -329,11 +385,15 @@ export class ZergAgentOverlayComponent implements StructuralPiCustomComponent, F
       if (snapshot?.source !== 'live') this.follow = false;
       this.message = '';
     } catch (error) { this.snapshot = undefined; this.message = `Transcript unavailable: ${String(error)}`; }
+    this.continuation?.sourceChanged();
     this.invalidate();
   }
 
   private detach(): void {
     this.generation += 1;
+    this.continuation?.dispose();
+    this.continuation = undefined;
+    this.displayedContinuation = undefined;
     this.abort?.abort();
     this.abort = undefined;
     cleanup(this.unsubscribeTranscript);

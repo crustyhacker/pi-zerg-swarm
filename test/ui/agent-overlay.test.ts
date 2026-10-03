@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CURSOR_MARKER, visibleWidth } from '@earendil-works/pi-tui';
 import type { NativeTranscriptKey, NativeTranscriptReadHandle, NativeTranscriptSnapshot } from '../../native-transcript.js';
+import type { NativeContinuationPrepare, NativeContinuationReview } from '../../native-continuation.js';
 import type { ZergNativeSessionReference } from '../../types.js';
 import { openZergAgentOverlay, sanitizeTranscriptText, ZergAgentOverlayComponent, type ZergAgentOverlayOptions, type ZergComposerReceipt, type ZergComposerState, type ZergOverlayComposer } from '../../ui/agent-overlay.js';
 
@@ -818,4 +819,216 @@ test('legacy no-initialKey read-only chooser retains canonical keys longer than 
   const f = fixture([ref]); f.component.handleInput('enter'); await tick();
   assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.memberRunId, ref.memberRunId); assert.equal(f.opened[0]?.piSessionId, ref.piSessionId);
   f.component.handleInput('home'); assert.doesNotMatch(f.component.render(140, 30).join('\n'), /Invalid exact/); f.component.dispose();
+});
+
+
+function continuationFixture() {
+  const ref = { ...reference(), attachment: 'disposed' as const, disposedAt: '2026-10-03T00:00:00Z' };
+  const f = fixture([ref]);
+  const prepares: NativeContinuationPrepare[] = [];
+  const starts: Array<{ reviewId: string; confirm: true }> = [];
+  const discards: string[] = [];
+  let serviceDisposals = 0;
+  const candidate = (request: NativeContinuationPrepare): NativeContinuationReview => ({ reviewId: 'review-viewer', expiresAt: new Date(Date.now() + 60000).toISOString(),
+    key: { parentRunId: request.parentRunId, memberRunId: request.memberRunId, piSessionId: request.piSessionId }, entryId: request.entryId, body: request.body,
+    sourceFingerprint: 'source-file-fingerprint', policyDigest: 'current-policy-digest', warnings: ['Normal Pi startup authority'], policy: { tools: ['read'], denies: ['write'], model: 'current-model', cwd: '/fixture', resources: 'normal Pi' } as unknown as NativeContinuationReview['policy'] });
+  f.options.nativeContinuationService = {
+    prepare: async (request) => { prepares.push(request); return candidate(request); },
+    start: async (request) => { starts.push(request); return { runId: 'destination-run', taskId: 'destination-task' }; },
+    discard: ({ reviewId }) => { discards.push(reviewId); }, dispose: () => { serviceDisposals++; },
+  };
+  f.component.focused = true;
+  const saved = async () => {
+    f.component.handleInput('enter'); await tick();
+    const h = f.handles[0]!;
+    h.value = snapshot(h.value.key, { source: 'saved', status: 'closed', defaultLeafBasis: 'recorded-tip', liveLeafId: null });
+    h.listener();
+    f.component.render(180, 40);
+  };
+  return { ...f, ref, prepares, starts, discards, candidate, saved, get serviceDisposals() { return serviceDisposals; } };
+}
+
+test('n is distinct from b inspection and c composer: saved exact inspected at-entry prepares a NEW task', async () => {
+  const f = continuationFixture();
+  await f.saved();
+  f.component.handleInput('b');
+  f.component.handleInput('down');
+  f.component.handleInput('enter');
+  f.component.render(180, 40);
+  assert.deepEqual(f.handles[0]?.selections.at(-1), { leafId: 'old-leaf' });
+  f.component.handleInput('n');
+  const editing = f.component.render(180, 40).join('\n');
+  assert.match(editing, /zerg NEW continuation/);
+  assert.match(editing, /Selected entry \(at\): old-leaf/);
+  assert.equal(f.prepares.length, 0);
+  assert.equal(f.starts.length, 0);
+  f.component.handleInput('qsb c n literal task');
+  f.component.handleInput('\r'); await tick();
+  assert.deepEqual(f.prepares, [{ parentRunId: 'team-a', memberRunId: 'worker-a', piSessionId: 'pi-team-a-worker-a', entryId: 'old-leaf', body: 'qsb c n literal task' }]);
+  f.component.render(180, 60);
+  f.component.handleInput('\r');
+  assert.equal(f.starts.length, 0);
+  f.component.handleInput('\x19'); await tick();
+  assert.deepEqual(f.starts, [{ reviewId: 'review-viewer', confirm: true }]);
+  assert.match(f.component.render(180, 40).join('\n'), /destination-run/);
+  f.component.handleInput('\x1b');
+  f.component.handleInput('home');
+  const returned = f.component.render(180, 40).join('\n');
+  assert.match(returned, /parent run: team-a/);
+  assert.match(returned, /inspected leaf: old-leaf/);
+  assert.doesNotMatch(returned, /destination-run/);
+  assert.equal(f.opened.length, 1);
+  f.component.dispose();
+  assert.equal(f.serviceDisposals, 0);
+});
+
+test('n never selects unseen saved source after publication, ignored key or branch entry change', async () => {
+  const f = continuationFixture();
+  await f.saved();
+  const h = f.handles[0]!;
+  h.value = { ...h.value, revision: 2, inspectedLeafId: 'UNSEEN-entry' };
+  h.listener(); // Publication requests redraw, but no frame has yet been rendered.
+  f.component.handleInput('ignored-key');
+  f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  assert.equal(f.prepares.length, 0);
+  f.component.handleInput('b');
+  f.component.handleInput('down');
+  f.component.handleInput('enter'); // old-leaf selected, not yet rendered.
+  f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  assert.equal(f.prepares.length, 0);
+  f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /Selected entry \(at\): old-leaf/);
+  f.component.dispose();
+});
+
+test('n disabled live/attached, missing inspected entry, service absent and ambiguous source; no fallback', async () => {
+  const f = continuationFixture();
+  f.component.handleInput('enter'); await tick();
+  f.component.render(180, 40);
+  f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  const h = f.handles[0]!;
+  h.value = snapshot(h.value.key, { source: 'saved', status: 'closed', inspectedLeafId: null }); h.listener();
+  f.component.render(180, 40); f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  h.value.inspectedLeafId = 'tip'; h.listener();
+  f.setReferences([{ ...f.ref, attachment: 'attached' }]);
+  f.component.render(180, 40); f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  f.setReferences([f.ref, { ...f.ref, agentDefinitionId: 'duplicate' }]);
+  f.component.render(180, 40); f.component.handleInput('n');
+  assert.match(f.component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  assert.equal(f.prepares.length, 0);
+  assert.equal(f.starts.length, 0);
+  f.component.dispose();
+  const legacy = fixture(); legacy.component.handleInput('n');
+  assert.equal(legacy.opened.length, 0); legacy.component.dispose();
+});
+
+test('source reference/attachment/definition changes invalidate visible token before confirm', async () => {
+  for (const change of ['definition', 'attachment', 'revision', 'removed']) {
+    const f = continuationFixture(); await f.saved();
+    f.component.handleInput('n'); f.component.render(180, 40);
+    f.component.handleInput('NEW task'); f.component.handleInput('\r'); await tick();
+    f.component.render(180, 60);
+    if (change === 'definition') f.setReferences([{ ...f.ref, agentDefinitionId: 'changed-definition' }]);
+    if (change === 'attachment') f.setReferences([{ ...f.ref, attachment: 'attached' }]);
+    if (change === 'removed') f.setReferences([]);
+    if (change === 'revision') { f.handles[0]!.value.revision++; f.handles[0]!.listener(); }
+    f.component.handleInput('\x19');
+    assert.equal(f.starts.length, 0, change);
+    assert.deepEqual(f.discards, ['review-viewer'], change);
+    f.component.dispose();
+  }
+});
+
+test('unavailable canonical attachment requires explicit source-copy acknowledgement', async () => {
+  const f = continuationFixture(); await f.saved();
+  const h = f.handles[0]!;
+  h.value = snapshot(h.value.key, { source: 'unavailable', status: 'unavailable', inspectedLeafId: 'saved-known-entry', diagnostic: 'Live attachment unavailable', blocks: [] }); h.listener();
+  f.setReferences([{ ...f.ref, attachment: 'unavailable', recoveredAt: '2026-10-03T00:00:00Z' }]);
+  f.component.render(180, 40); f.component.handleInput('n');
+  f.component.render(180, 40); f.component.handleInput('NEW recovery task'); f.component.handleInput('\r'); await tick();
+  assert.equal(f.prepares.length, 0);
+  f.component.handleInput('\x1ba'); f.component.handleInput('\r'); await tick();
+  assert.equal(f.prepares[0]?.entryId, 'saved-known-entry');
+  assert.equal(f.prepares[0]?.acknowledgeUnconfirmedSource, true);
+  assert.equal(f.starts.length, 0);
+  assert.match(f.component.render(180, 60).join('\n'), /not proof of closure/);
+  f.component.dispose();
+});
+
+test('continuation Escape retains original viewer; late prepares are discarded without new runs', async () => {
+  const f = continuationFixture(); await f.saved();
+  let resolve!: (value: NativeContinuationReview) => void;
+  f.options.nativeContinuationService!.prepare = (request) => { f.prepares.push(request); return new Promise((done) => { resolve = done; }); };
+  f.component.handleInput('n'); f.component.render(180, 40);
+  f.component.handleInput('new draft'); f.component.handleInput('\r');
+  f.component.handleInput('\x1b');
+  assert.equal(f.handles[0]?.disposeCount, 0);
+  assert.match(f.component.render(180, 40).join('\n'), /saved · closed/);
+  resolve(f.candidate(f.prepares[0]!)); await tick();
+  assert.deepEqual(f.discards, ['review-viewer']);
+  assert.equal(f.starts.length, 0);
+  assert.equal(f.opened.length, 1);
+  f.component.dispose();
+});
+
+
+test('service-present live viewer preserves b inspection and c send; typed n remains composer body', async () => {
+  const f = composerFixture();
+  let continuationCalls = 0;
+  const component = new ZergAgentOverlayComponent({ terminal: { rows: 40 }, requestRender: () => undefined }, undefined, undefined, {
+    ...f.options, composer: f.composer,
+    nativeContinuationService: {
+      prepare: async () => { continuationCalls++; throw new Error('must not prepare live source'); },
+      start: async () => { continuationCalls++; throw new Error('must not start from n'); },
+      discard: () => undefined, dispose: () => undefined,
+    },
+  });
+  component.focused = true;
+  component.handleInput('enter'); await tick();
+  component.render(180, 40); component.handleInput('n');
+  assert.match(component.render(180, 40).join('\n'), /NEW continuation disabled/);
+  component.handleInput('c');
+  component.handleInput('n');
+  component.handleInput('\r'); // Existing composer still inserts newline, never prepares.
+  component.handleInput('b c q s');
+  component.handleInput('\x13'); await tick();
+  assert.equal(continuationCalls, 0);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0]?.body, 'n\nb c q s');
+  component.handleInput('\x1b');
+  component.handleInput('b'); component.handleInput('down'); component.handleInput('enter');
+  component.handleInput('c');
+  assert.match(component.render(180, 40).join('\n'), /branch inspection is read-only/);
+  assert.equal(continuationCalls, 0);
+  assert.equal(f.calls.length, 1);
+  component.dispose(); f.close();
+});
+
+test('captured and recovered displays preserve confirmed disposed closure without acknowledgement', async () => {
+  for (const kind of ['captured', 'recovered']) {
+    const f = continuationFixture();
+    await f.saved();
+    if (kind === 'captured') {
+      const h = f.handles[0]!;
+      h.value = { ...h.value, source: 'captured' };
+      h.listener();
+    } else f.setReferences([{ ...f.ref, recoveredAt: '2026-10-03T00:00:00Z' }]);
+    f.component.render(180, 40);
+    f.component.handleInput('n');
+    const editing = f.component.render(180, 40).join('\n');
+    assert.match(editing, /Unconfirmed source-copy acknowledgment: not required/, kind);
+    assert.doesNotMatch(editing, /REQUIRED: Alt\+a/, kind);
+    f.component.handleInput(`NEW ${kind} task`);
+    f.component.handleInput('\r'); await tick();
+    assert.equal(f.prepares.length, 1, kind);
+    assert.equal(f.prepares[0]?.acknowledgeUnconfirmedSource, undefined, kind);
+    assert.equal(f.prepares[0]?.body, `NEW ${kind} task`, kind);
+    assert.equal(f.starts.length, 0, kind);
+    f.component.dispose();
+  }
 });

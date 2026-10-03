@@ -203,7 +203,10 @@ def until(check, label):
     while time.monotonic() - start < 50:
         pump()
         if check(): return
-        if proc.poll() is not None: raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
+        if proc.poll() is not None:
+            # Exit can become observable between the condition and this poll.
+            if check(): return
+            raise Exception('Host exited early: ' + label + '\n' + text()[-5000:])
     raise Exception('PTY timeout: ' + label + '\n' + text()[-5000:])
 def phase(name):
     try:
