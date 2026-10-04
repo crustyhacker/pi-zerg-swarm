@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.16] - 2026-10-04
+
+### Added
+
+- Opt-in version-2 read-only workflows with deterministic, schema-checked scalar conditions, bounded boolean composition, explicit conditional skip reasons, and failure-honest conditional aggregation. False admission conditions start no native session.
+- Bounded, non-nested repeat-until body DAGs with schema-validated initial state and feedback, explicit final-output selection, sequential iteration cleanup barriers, and honest non-convergence diagnostics. Body fan-out shares the existing workflow-wide permits and family budgets.
+- Iteration-qualified unit/native provenance, input-and-transition-bound retry reuse, strict bounded snapshot validation, and inert recovery without worker replay or restored execution authority.
+- Exact iteration/body/unit monitor navigation, selection and termination reasons, compact default lists, public authoring types, and a separate documented refinement example. Existing version-1 definitions and the `read-only-review` preset retain their behavior.
+- Focused model/runtime/control/UI regressions and isolated actual SDK plus regular/fullscreen Pi-host conditional and looping acceptance, including fresh-process checkpoint recovery. Scripted loopback evidence is not manual visual acceptance or real-model quality evidence.
+
+### Changed
+
+- Worst-case graph budgeting includes repeat counts, all conditional branches, body fan-out, and existing retry attempts without increasing the existing workflow limits. Bounded iteration counts do not guarantee bounded provider cost or wall-clock duration.
+
 ## [1.1.15] - 2026-10-04
 
 ### Added

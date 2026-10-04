@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.15 release status**
-> Adds bounded declarative **read-only workflows** on the existing native runner: dependency scheduling, parallel reviews, verification/reporting, explicit retries, and a separate progress monitor.
+> **v1.1.16 release status**
+> Adds typed conditions and bounded repeat-until body graphs to declarative **read-only workflows**, using the existing native runner, scheduler, and progress monitor.
 > Restart restores inspectable history, not execution or authority. There is no automatic replay, second transcript store, workspace restoration, or OS sandbox.
 
 ## Release status
 
-- Current release: **v1.1.15** (minimal declarative read-only workflows).
+- Current release: **v1.1.16** (typed conditions and bounded read-only workflow loops).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -76,7 +76,7 @@ Use structured `zerg_control` or `control.execute(...)` for automation:
 | Action | Required fields / meaning |
 | --- | --- |
 | `workflows.list` | Compact definition/attempt summaries; no intermediate results or per-unit identity dump |
-| `workflows.define` | `definition`: validated version-1 graph; replaces a name only when its prior work is settled |
+| `workflows.define` | `definition`: validated version-1 graph or version-2 conditional/repeat graph; replaces a name only when its prior work is settled |
 | `workflows.show` | Exactly one of `definitionId` or `workflowRunId`; attempt view includes exact unit/native correlations |
 | `workflows.start` | `definitionId`, `inputs`, optional `concurrency`; returns a fresh `data.view.workflowRunId` |
 | `workflows.pause` / `workflows.resume` | `workflowRunId`; pause blocks new admission, not already-admitted work |
@@ -115,19 +115,129 @@ await control.execute({ action: 'workflows.start', definitionId: definition.id, 
 
 - Steps have unique IDs and explicit `dependsOn` edges. Cycles, unknown references, unsupported fields, and excessive graphs are rejected before admission.
 - Input bindings are `{ value: <JSON> }` or `{ ref: { source: 'inputs' | 'step' | 'item', path: [...], stepId?: 'dependency-id' } }`. Step references must name explicit dependencies. Paths into single native results are schema-checked; fan-out/aggregate results are referenced as whole envelopes.
-- Native steps may declare `fanout: { from: <reference>, maxItems: N }` over a bounded array. There are no arbitrary loops, conditions, JavaScript, shell steps, teams, forks, or nested delegation.
+- Native steps may declare `fanout: { from: <reference>, maxItems: N }` over a bounded array. Version 2 additionally supports the deterministic conditions and bounded repeat blocks below. There is no JavaScript, expression-string evaluation, shell step, write-capable workflow worker, team/fork step, or nested delegation.
 - Deterministic aggregate steps use `kind: 'aggregate'`, `operation: 'collect' | 'collect-findings' | 'review-report'`, and input bindings. Only aggregates can explicitly set `consumeFailures: true`; otherwise unsuccessful dependencies skip downstream work. Review-specific aggregates expect the preset's envelope shapes.
 - The schema subset supports closed objects, required properties, bounded arrays/strings, numbers/integers, booleans, null, and finite enums. No external references or regex/evaluation language. `maxLength` uses JavaScript string length; independent UTF-8 byte limits also apply.
+
+### Typed conditions and bounded repetition (version 2)
+
+Existing **version-1 definitions and the `read-only-review` preset are unchanged**. Opt in with `version: 2`; version-2 fields on version 1 and unsupported future versions are rejected. The existing version-1 snapshot namespace stores both formats, discriminated by each frozen definition's version. No second scheduler or transcript store is introduced.
+
+A native, aggregate, or repeat step can declare `when`. Conditions are plain data:
+
+| Condition | Fields | Meaning |
+| --- | --- | --- |
+| `boolean` | `value: <binding>` | A strictly boolean value |
+| `eq` / `ne` | `left`, `right` bindings | Strict scalar equality/inequality |
+| `lt` / `lte` / `gt` / `gte` | `left`, `right` bindings | Finite numeric comparison |
+| `all` / `any` | `conditions: [...]` | Bounded conjunction/disjunction |
+| `not` | `condition: {...}` | Boolean negation |
+
+Bindings retain the `{value: ...}` / `{ref: ...}` syntax. Equality supports compatible scalar types, not object/array equality or coercion; integers and numbers are numeric. Conditions allow at most 8 expression levels, 64 nodes, and 16 children per composition. Every operand is validated and evaluated: an unavailable/missing value is an error even in a branch that would be unnecessary under short-circuit evaluation. References use explicit schema-checked path segments, never arbitrary property traversal. A step condition runs after dependencies settle and before materialization/native setup; it cannot reference a fan-out item.
+
+A false condition records `condition-false` with **no unit, native identity, or fabricated result**. Dependency-blocked, cancelled, and recovered/unverified work remain distinguishable. An aggregate can explicitly set `consumeSkips: true` and bind an unavailable branch's **whole** output to receive a status envelope instead of a result. `consumeFailures: true` remains a separate opt-in. These joins do not convert required worker failures into overall success; deliberate condition skips alone are not failures. Ordinary downstream steps still require successful dependencies.
+
+A repeat block declares:
+
+```text
+kind: "repeat"
+initial: <binding>       stateSchema: <schema>
+body: <non-nested DAG>   maxIterations: <integer 1..32>
+feedback: <binding>     until: <condition>
+output: <binding>       outputSchema: <schema>
+```
+
+The first iteration always runs from validated `initial` state. Body nodes support ordinary native steps, conditions, bounded fan-out, and compatible deterministic aggregates. `source: 'inputs'` still means original workflow inputs; `source: 'iteration'` means the current iteration's frozen state. Body `step` references name only explicit body dependencies—never outer nodes, earlier iterations, or future nodes.
+
+After **all body work and native cleanup settle successfully** (allowing intentional skips), `feedback` selects current-body data or iteration state and validates it against `stateSchema`. `until` then reads only literals and the validated **next feedback state** through `source: 'iteration'`. If true, `output` selects that next state or current-body data and validates it against `outputSchema`. Otherwise the next iteration may start only after fresh authority, pause/cancellation, and budget checks. No previous conversation history is copied between iterations.
+
+Failure, invalid feedback, missing termination data, cancellation, or uncertain cleanup prevents another iteration. A false condition at `maxIterations` is **non-convergence**, not success. Earlier structured observations remain bounded diagnostic history, not a verified final result. Explicit failure-consuming aggregates receive an unavailable envelope with termination and diagnostic iteration provenance; feedback larger than 16 KiB is represented there by its hash, while the bounded iteration ledger retains the feedback. `workflows.report` includes the orchestration view: use its repeat termination reason alongside report data, rather than treating a model's `done` field as independent proof of correctness.
+
+#### Read-only refinement example
+
+Configure explicit provider/model IDs on `generalist` and `reviewer` first. This separate example does not modify the preset. It inspects supplied targets, conditionally adds a review, then refines findings and independently assesses remaining questions for at most three iterations:
+
+```ts
+import type { WorkflowBinding, WorkflowDefinition, WorkflowRef, WorkflowSchema } from 'pi-zerg-swarm';
+
+const text: WorkflowSchema = { type: 'string', maxLength: 2048 };
+const stateSchema: WorkflowSchema = {
+  type: 'object', additionalProperties: false,
+  required: ['findings', 'questions', 'done'],
+  properties: {
+    findings: { type: 'array', maxItems: 4, items: text },
+    questions: { type: 'array', maxItems: 4, items: text },
+    done: { type: 'boolean' },
+  },
+};
+// Authoring helper only: no functions enter the submitted JSON definition.
+const ref = (source: WorkflowRef['source'], path: string[] = [], stepId?: string): WorkflowBinding => ({ ref: {
+  source, path, ...(stepId ? { stepId } : {}),
+} });
+const definition: WorkflowDefinition = {
+  id: 'bounded-read-only-refinement', version: 2, label: 'Read-only refinement',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['targets', 'extraReview'],
+    properties: {
+      targets: { type: 'array', maxItems: 4, items: { type: 'string', maxLength: 512 } },
+      extraReview: { type: 'boolean' },
+    },
+  },
+  steps: [
+    { id: 'inspect', kind: 'native', dependsOn: [], agentId: 'generalist',
+      prompt: 'Read only the supplied targets. Return structured findings and open questions; no edits or shell commands.',
+      inputs: { targets: ref('inputs', ['targets']) }, outputSchema: stateSchema },
+    { id: 'extra', kind: 'native', dependsOn: ['inspect'], agentId: 'reviewer',
+      when: { op: 'boolean', value: ref('inputs', ['extraReview']) },
+      prompt: 'Independently review these findings against supplied targets, read-only. Return a JSON string.',
+      inputs: { targets: ref('inputs', ['targets']), findings: ref('step', [], 'inspect') },
+      outputSchema: text },
+    { id: 'coverage', kind: 'aggregate', operation: 'collect', consumeSkips: true,
+      dependsOn: ['inspect', 'extra'],
+      inputs: { inspection: ref('step', [], 'inspect'), additionalReview: ref('step', [], 'extra') } },
+    { id: 'refine', kind: 'repeat', dependsOn: ['inspect', 'coverage'],
+      initial: ref('step', [], 'inspect'), stateSchema, maxIterations: 3,
+      body: [
+        { id: 'revise', kind: 'native', dependsOn: [], agentId: 'generalist',
+          prompt: 'Read only supplied targets. Refine the structured findings and remaining questions; return schema JSON.',
+          inputs: { targets: ref('inputs', ['targets']), prior: ref('iteration') },
+          outputSchema: stateSchema },
+        { id: 'assess', kind: 'native', dependsOn: ['revise'], agentId: 'reviewer',
+          prompt: 'Independently assess these findings using read-only inspection of supplied targets. Preserve unresolved questions. Set done only if none remain; this is your assessment, not proof. Return schema JSON.',
+          inputs: { targets: ref('inputs', ['targets']), findings: ref('step', [], 'revise') },
+          outputSchema: stateSchema },
+      ],
+      feedback: ref('step', [], 'assess'),
+      until: { op: 'boolean', value: ref('iteration', ['done']) },
+      output: ref('iteration'), outputSchema: stateSchema },
+    { id: 'report', kind: 'aggregate', operation: 'collect', consumeFailures: true,
+      dependsOn: ['coverage', 'refine'],
+      inputs: { coverage: ref('step', [], 'coverage'), findings: ref('step', [], 'refine') } },
+  ],
+};
+
+await control.execute({ action: 'workflows.define', definition });
+const started = await control.execute({ action: 'workflows.start',
+  definitionId: definition.id, inputs: { targets: ['README.md'], extraReview: false } });
+// Later, after inspecting progress:
+await control.execute({ action: 'workflows.report',
+  workflowRunId: started.data.view.workflowRunId });
+```
+
+For two alternative branches, give one `when: condition` and the other `when: {op: 'not', condition}`; join both with an explicit `collect` aggregate and `consumeSkips: true`, then make the common reporting step depend on that join. Missing values still fail either condition rather than silently selecting the other branch.
+
+The monitor shows selection/skip reasons, current/max iteration, and termination/non-convergence. Enter drills into the exact iteration, body step, and unit; **c** opens that unit's native coding view. Stable qualified identities, not visible row positions, preserve selection on return. Closing the monitor does not cancel work.
 
 ### Authority, bounds, retries, and recovery
 
 - Each attempt freezes its definition, declared JSON inputs, agent definitions, and explicit model selections. Relevant current-agent/model/tool drift fails closed. Effective tools are the definition's expanded tools minus denials, **intersected with `read`, `grep`, `find`, `ls`**; an empty intersection is refused. Broad definitions are restricted, not silently granted new tools. Replacement builtins and dynamically activated gateways are refused.
 - Starting work authorizes normal current Pi resources and hooks. Outputs/source text remain data, not permission. Read-only tools are not filesystem confinement or an OS sandbox, and trusted extensions are not universally certified. Zerg's read-only **control mode** blocks new workflow execution; it is separate from the workflow's read-only tool policy.
-- Limits: **16 steps**, **32 fan-out items**, concurrency **1–32** (default **8**), **3 attempts** and at most **256 native admissions per family**. Graph validation budgets all three attempts. An owner also shares a conservative ceiling no greater than its most restrictive unsettled workflow's concurrency; this is not a provider-wide limit.
+- Limits: **16 authored steps including repeat containers and body nodes**, **32 fan-out items**, at most **32 iterations per repeat**, concurrency **1–32** (default **8**), **3 attempts** and at most **256 native admissions per family**. Validation conservatively counts every conditional branch, fan-out bound, and repeat iteration, budgets all three attempts, and caps expanded orchestration nodes at 256 per attempt. Runtime ledger/admission limits still apply; these are not increased for loops. Iterations are sequential; independent body work shares the same workflow-wide permits. An owner also shares a conservative ceiling no greater than its most restrictive unsettled workflow's concurrency; this is not a provider-wide limit. Bounded iteration/admission counts do **not** guarantee bounded provider cost or wall-clock duration.
 - A permit covers native setup, execution, and owned cleanup—not just the final answer. Pause does not free active permits; cancel may remain `cancelling`. Missing/uncertain cleanup is `needs-attention`, blocks further admission/retry, and is not represented as successful disposal. Unit states distinguish completed, failed, cancelled, skipped, and unverified work.
 - UTF-8 limits: definition **64 KiB**, start inputs **32 KiB**, resolved workflow prompt/input **256 KiB**, raw native unit result **16 KiB before JSON parsing**, aggregate **256 KiB**. The **entire workflow namespace** (registry plus retained runs) is capped at **2 MiB**, with at most **16 definitions / 16 retained attempts**. Complexity limits also apply. Overflow is explicit; results are not silently clipped and history is not automatically pruned. Normal Pi resource context and native JSONL have separate limits; these are not token budgets.
 - Retry requires a fully settled failed/cancelled latest attempt and unchanged frozen identities. It creates a new workflow run with the same family, incremented attempt number, and `retryOf`; only matching completed units are reused, retaining their original native identities. Newly executed units receive fresh task/run/Pi identities. There is no automatic retry, permission replay, or exactly-once guarantee.
-- Frozen inputs are **not a filesystem snapshot**. Reused results describe their original observations; after workspace changes, start a new workflow rather than assume cached results are fresh. Retry cannot replace inputs; changed inputs require a new run.
+- Version-2 unit identities include block, iteration, body step, and fan-out item where applicable. Retry reuse additionally binds exact iteration state, feedback/transition history, dependency results, frozen definition, and agent policy; similar prompts or identical values in different iterations do not authorize reuse. Newly executed units always receive fresh native identities. An explicit retry can reproduce non-convergence using exact cached completed units without new provider calls; it does not force those units to execute again.
+- Frozen inputs and their hashes are **not a filesystem snapshot or proof of workspace freshness**. Reused results describe their original observations; after workspace changes, start a new workflow rather than assume cached results are fresh. Retry cannot replace inputs; changed inputs require a new run. Stronger source-state reconciliation and durable execution resumption are outside this stage.
 - Workflow state uses the existing `extensions.workflows` snapshot namespace. Without opt-in persistence it is process-local. Recovery never starts work, reconnects SDK sessions, or replays messages; interrupted work is marked unverified/`needs-attention` and cannot simply resume or retry with unknown cleanup. Corrupt workflow data is retained and workflow actions fail closed without suppressing unrelated run recovery. Snapshot persistence retains its existing error/durability limitations.
 
 ## Native session reference foundation

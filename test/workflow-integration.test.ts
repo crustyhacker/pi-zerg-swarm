@@ -15,6 +15,7 @@ const loader = createRequire(import.meta.url).resolve('tsx');
 for (const [fixture, deadline, marker] of [
   ['native-workflow-smoke.mjs', 240_000, 'PASS native workflow acceptance'],
   ['workflow-host-smoke.mjs', 300_000, 'PASS workflow host acceptance'],
+  ['workflow-loop-host-smoke.mjs', 300_000, 'PASS workflow loop host acceptance'],
 ] as const) {
   test(`isolated workflow acceptance: ${fixture}`, {
     skip: approved ? false : 'Parent SDK/PTY acceptance grant required', timeout: deadline + 25_000,
@@ -152,6 +153,7 @@ sys.exit(0 if report['ok'] else 1)
       assert.equal(report.ok, true, `Natural owned process settlement required; evidence ${root}`);
       assert.deepEqual(report.remaining, []);
       assert.match(text, new RegExp(marker));
+      if (fixture === 'native-workflow-smoke.mjs') assert.match(text, /PASS Stage8A native:.*real-inflight-zero-replay/);
     } finally {
       // Preserve truthful bounded logs/cleanup proof on failure AND success.
       // If ownership cannot settle, retain the empty isolated resources too.

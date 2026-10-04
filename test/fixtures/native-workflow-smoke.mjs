@@ -20,7 +20,8 @@ const model = await import(new URL('../../workflow-model.ts', import.meta.url).h
 const persistence = await import(new URL('../../persistence.ts', import.meta.url).href);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const digest = file => createHash('sha256').update(readFileSync(file)).digest('hex');
-const units = run => run.steps.flatMap(step => step.units);
+const entries = run => model.workflowStepEntries(run);
+const units = run => entries(run).flatMap(({ step }) => step.units);
 
 if (process.argv[2] === '--recover') {
   const info = JSON.parse(readFileSync(process.argv[3], 'utf8'));
@@ -36,7 +37,11 @@ if (process.argv[2] === '--recover') {
     const shown = await owner.execute({ action: 'workflows.show', workflowRunId: info.workflowRunId }); assert(shown.ok);
     assert.equal(shown.data.view.status, 'needs-attention'); assert.equal(shown.data.view.recovered, true);
     assert.equal(shown.data.view.cleanupSettled, false);
-    assert.equal((await owner.execute({ action: 'workflows.retry', workflowRunId: info.workflowRunId })).ok, false);
+    const recovered = owner.getState().extensions.workflows.runs.find(run => run.workflowRunId === info.workflowRunId);
+    const unit = units(recovered).find(unit => unit.id === info.activeUnit.id);
+    assert(unit); assert.equal(unit.status, 'unverified'); assert.equal(unit.cleanupSettled, false);
+    assert.deepEqual(unit.native, info.activeUnit.native); assert.equal(unit.inputHash, info.activeUnit.inputHash);
+    for (const action of ['workflows.resume', 'workflows.retry']) assert.equal((await owner.execute({ action, workflowRunId: info.workflowRunId })).ok, false);
     assert.equal(executions, 0); assert.equal(guard.requests, 0);
     for (const [file, hash] of info.hashes) assert.equal(digest(file), hash);
     console.log('PASS workflow fresh-process hydrate: zero SDK/provider/tool replay; unverified cleanup blocks retry');
@@ -52,6 +57,7 @@ if (process.argv[2] === '--recover') {
   const gates = new Map(), seen = new Set(), trace = [], sessions = new Set(), disposed = new Map();
   let owner, restartChild, serverFailure, failure, retryMode = false, verifierTurns = 0;
   let active = 0, peakSDK = 0, peakLedger = 0, unsubscribe;
+  let loopGate = false, loopShutdown = false, fanShutdown = 0;
   function gate(name) {
     seen.add(name); return new Promise(resolve => { assert(!gates.has(name), 'Unique gate ' + name); gates.set(name, () => { gates.delete(name); resolve(); }); });
   }
@@ -72,6 +78,8 @@ if (process.argv[2] === '--recover') {
     async shutdown(role) {
       trace.push({ kind: 'shutdown', role });
       if (role.startsWith('cancel-')) await gate('shutdown');
+      if (role === 'refine' && loopShutdown) await gate('loop-shutdown');
+      if (role === 'fan') await gate('fan-shutdown-' + fanShutdown++);
     },
   };
   mkdirSync(join(agentDir, 'extensions')); mkdirSync(join(work, '.pi'));
@@ -106,7 +114,7 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
       assert(requests.length <= 64); assert.equal(input.stream, true);
       assert.deepEqual((input.tools ?? []).map(tool => tool.function.name), ['read'], 'No shell/MCP/delegation exposure');
       const role = input.model, data = envelope(input).inputs;
-      assert(['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway'].includes(role));
+      assert(['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway', 'refine', 'assess', 'fan'].includes(role));
       const toolResults = input.messages.filter(row => row.role === 'tool');
       const calls = new Map(input.messages.filter(row => row.role === 'assistant').flatMap(row => row.tool_calls ?? []).map(call => [call.id, call]));
       for (const result of toolResults) assert(calls.has(result.tool_call_id), 'Genuine matched SDK result');
@@ -141,7 +149,9 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
       else if (toolResults.length === 0) tool = ['read', { path: target }];
       else {
         if (role !== 'denied-call') assert(toolResults.some(row => text(row).includes('WORKFLOW_READ_EVIDENCE')), 'Real built-in read evidence required');
-        if (role === 'discover') answer = JSON.stringify({ targets: paths });
+        if (role === 'refine' || role === 'fan') answer = JSON.stringify(data.state + 1);
+        else if (role === 'assess') answer = JSON.stringify(data.state);
+        else if (role === 'discover') answer = JSON.stringify({ targets: paths });
         else if (role === 'review') {
           if (!retryMode && target === 'failed.txt') { res.writeHead(401); res.end('{"error":{"message":"synthetic worker failed"}}'); return; }
           answer = !retryMode && target === 'malformed.txt' ? '{not-json' : !retryMode && target === 'oversized.txt' ? 'x'.repeat(16385) :
@@ -157,6 +167,7 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
       if (role === 'cancel-stream') { emit({ content: 'pending' }); await new Promise(resolve => { gates.set('stream', resolve); seen.add('stream'); res.on('close', resolve); }); gates.delete('stream'); }
       if (role === 'discover' && toolResults.length && !retryMode) await gate('discover');
       if (role === 'review' && toolResults.length && ['a.txt', 'b.txt'].includes(target) && !retryMode) await gate('review-' + target);
+      if (role === 'refine' && toolResults.length && loopGate) await gate('loop-stream');
       if (res.destroyed) return;
       if (tool) { emit({ tool_calls: [{ index: 0, id: 'wf-call-' + requests.length, type: 'function', function: { name: tool[0], arguments: JSON.stringify(tool[1]) } }] }); emit({}, 'tool_calls'); }
       else { emit({ content: answer }); emit({}, 'stop'); }
@@ -207,10 +218,15 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
     return (await execute({ action: 'workflows.start', definitionId: definition.id, inputs, concurrency: 2 })).data.view.workflowRunId;
   }
   async function identities(run) {
-    for (const unit of units(run).filter(unit => unit.native && !unit.reusedFrom)) {
+    for (const entry of entries(run)) for (const unit of entry.step.units.filter(unit => unit.native && !unit.reusedFrom)) {
       const native = (await execute({ action: 'runs.show', runId: unit.native.runId })).data.run;
       assert.equal(native.taskId, unit.native.taskId);
-      assert.deepEqual(native.metadata.workflow, { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, stepId: unit.stepId, unitId: unit.id, inputHash: unit.inputHash });
+      assert.deepEqual(native.metadata.workflow, { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, stepId: unit.stepId, unitId: unit.id, inputHash: unit.inputHash, ...(entry.blockId ? { blockId: entry.blockId, iterationId: entry.iterationId, iterationNo: entry.iterationNo } : {}) });
+      if (entry.blockId) {
+        assert.equal(entry.step.id, entry.iterationId + '/' + entry.spec.id);
+        assert(unit.id.startsWith(entry.step.id + ':'));
+        assert.equal(entry.iterationId, entry.blockId + '@' + (entry.iterationNo - 1));
+      }
       assert.equal(native.nativeSessions.length, 1); const ref = native.nativeSessions[0];
       assert.equal(ref.parentRunId, unit.native.runId); assert.equal(ref.memberRunId, unit.native.runId);
       assert.equal(ref.attachment, 'disposed'); assert(ref.piSessionId && ref.sessionFile);
@@ -222,14 +238,14 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const settings = { packages: [], extensions: ['-builtin:mcp', '-builtin:llama.cpp', '-builtin:codemode', '-builtin:tool-search'], skills: [], prompts: [], themes: [], noExtensions: false, noSkills: false, noPromptTemplates: false, noThemes: true, defaultProjectTrust: 'never', enableInstallTelemetry: false, enableAnalytics: false, cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } };
     writeFileSync(join(agentDir, 'settings.json'), JSON.stringify(settings)); writeFileSync(join(work, '.pi/settings.json'), JSON.stringify(settings)); writeFileSync(join(agentDir, 'auth.json'), '{}');
-    writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { fixture: { api: 'openai-completions', baseUrl: 'http://127.0.0.1:' + server.address().port + '/v1', apiKey: 'dummy-workflow-only', models: ['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway'].map(id => ({ id, reasoning: false, input: ['text'], contextWindow: 65536, maxTokens: 8192 })) } } }));
+    writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { fixture: { api: 'openai-completions', baseUrl: 'http://127.0.0.1:' + server.address().port + '/v1', apiKey: 'dummy-workflow-only', models: ['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway', 'refine', 'assess', 'fan'].map(id => ({ id, reasoning: false, input: ['text'], contextWindow: 65536, maxTokens: 8192 })) } } }));
     const container = state.createZergStateContainer();
     owner = zerg.createZergControl(container, { persistence: { enabled: true, snapshotFile } });
     unsubscribe = container.subscribe(current => {
       const pending = (current.extensions.workflows?.runs ?? []).flatMap(units).filter(unit => unit.native && !unit.cleanupSettled).length;
       peakLedger = Math.max(peakLedger, pending); assert(pending <= 2, 'Ledger setup/execution/cleanup permits <=2');
     });
-    for (const role of ['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway']) {
+    for (const role of ['discover', 'review', 'verify', 'cancel-startup', 'cancel-stream', 'cancel-tool', 'denied-call', 'override', 'gateway', 'refine', 'assess', 'fan']) {
       await agent(role, role === 'review' ? ['read', 'bash', 'edit', 'write', 'mcp', 'zerg_control', 'codemode'] : ['read']);
     }
     // The current broad definition is frozen honestly; private workflow authority
@@ -279,10 +295,9 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
       else if (unit.native) assert(!units(first).some(prior => prior.native?.runId === unit.native.runId), 'Newly executed retry unit gets fresh native identity');
     }
     assert.equal((await execute({ action: 'workflows.report', workflowRunId: second.workflowRunId })).data.report.partial, false);
-    let lastCancel;
     for (const role of ['cancel-startup', 'cancel-stream', 'cancel-tool']) {
       seen.clear(); const count = requests.length;
-      const cancelledId = await start(simple('wf-' + role, role, true)); lastCancel = cancelledId;
+      const cancelledId = await start(simple('wf-' + role, role, true));
       await until(() => seen.has(role === 'cancel-startup' ? 'startup' : role === 'cancel-stream' ? 'stream' : 'tool'), role + ' admitted gate');
       container.update(current => ({ mode: { ...current.mode, readOnly: true } }));
       assert.equal((await owner.execute({ action: 'workflows.start', definitionId: 'wf-' + role, inputs: {} })).ok, false);
@@ -363,13 +378,133 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
     assert.equal(changedInputs.ok, false); assert.match(JSON.stringify(changedInputs), /unknown workflow action field/i);
     assert(trace.some(row => row.kind === 'startup' && row.role === 'discover'), 'Normal resource startup hooks retained');
     assert(trace.some(row => row.kind === 'tool-result' && row.name === 'read' && !row.isError));
-    const saved = owner.getState(); owner.dispose();
-    // Owned crash-boundary injection, NOT claiming a still-live native session.
-    const recovered = saved.extensions.workflows.runs.find(run => run.workflowRunId === lastCancel);
-    recovered.status = 'running'; recovered.cleanupSettled = false;
-    const admitted = units(recovered).find(unit => unit.native); admitted.status = 'running'; admitted.cleanupSettled = false;
+    // Stage8A: retain every Stage7 scenario above; these additions share the
+    // unchanged 64-request/225-second guard and two-permit native ledger.
+    const ref = (source, path = [], stepId) => ({ ref: { source, path, ...(stepId ? { stepId } : {}) } });
+    const number = { type: 'integer' };
+    const empty = { type: 'object', properties: {}, required: [], additionalProperties: false };
+    const nativeStep = (id, role, dependsOn, stateBinding) => ({ id, kind: 'native', dependsOn, agentId: role,
+      prompt: 'Read a.txt only, then return the scripted integer as JSON. READONLY.',
+      inputs: { target: { value: 'a.txt' }, state: stateBinding }, outputSchema: number });
+    function loopDefinition(id, target, maxIterations = 2) {
+      return { id, version: 2, label: id, inputSchema: empty, steps: [{
+        id: 'refinement', kind: 'repeat', dependsOn: [], initial: { value: 0 }, stateSchema: number,
+        body: [nativeStep('refine', 'refine', [], ref('iteration')),
+          nativeStep('assess', 'assess', ['refine'], ref('step', [], 'refine'))],
+        feedback: ref('step', [], 'assess'), until: { op: 'gte', left: ref('iteration'), right: { value: target } },
+        output: ref('step', [], 'assess'), outputSchema: number, maxIterations,
+      }] };
+    }
+    const falseDefinition = simple('wf-false', 'refine'); falseDefinition.version = 2;
+    falseDefinition.steps[0].when = { op: 'boolean', value: { value: false } };
+    const zero = { sessions: sessions.size, requests: requests.length, startups: trace.filter(row => row.kind === 'startup').length };
+    const falseRun = await settled(await start(falseDefinition));
+    assert.equal(falseRun.steps[0].status, 'skipped'); assert.deepEqual(falseRun.steps[0].units, []);
+    assert.equal(falseRun.steps[0].output, undefined);
+    assert.deepEqual({ sessions: sessions.size, requests: requests.length, startups: trace.filter(row => row.kind === 'startup').length }, zero);
+    const alternative = { ...falseDefinition, id: 'wf-alternative', steps: [falseDefinition.steps[0],
+      { id: 'chosen', kind: 'aggregate', dependsOn: [], operation: 'collect', inputs: { choice: { value: 'chosen' } } },
+      { id: 'join', kind: 'aggregate', dependsOn: ['first', 'chosen'], operation: 'collect', consumeSkips: true,
+        inputs: { absent: ref('step', [], 'first'), present: ref('step', [], 'chosen') } }] };
+    const joined = await settled(await start(alternative)); assert.equal(joined.status, 'completed');
+    assert.equal(joined.steps[2].output.absent.status, 'skipped');
+    assert.deepEqual(joined.steps[2].output.present, { choice: 'chosen' });
+    assert.equal(sessions.size, zero.sessions); assert.equal(requests.length, zero.requests);
+    // Explicit fixture housekeeping after inspection, not automatic engine pruning.
+    // Keep the alternative join (including its skipped branch) in recovery history.
+    await execute({ action: 'workflows.forget', workflowRunId: falseRun.workflowRunId });
+    for (const [name, target, limit, count, status] of [
+      ['first', 1, 2, 1, 'completed'], ['later', 2, 2, 2, 'completed'], ['bounded', 3, 1, 1, 'failed'],
+    ]) {
+      const run = await settled(await start(loopDefinition('wf-loop-' + name, target, limit)));
+      assert.equal(run.status, status); const iterations = run.steps[0].iterations;
+      assert.equal(iterations.length, count);
+      for (const [index, iteration] of iterations.entries()) {
+        assert.equal(iteration.id, 'refinement@' + index); assert.equal(iteration.index, index);
+        assert.equal(iteration.state, index); assert.equal(iteration.feedback, index + 1);
+        assert.equal(iteration.decision, index + 1 >= target, 'Until observes validated NEXT feedback, not prior state');
+        assert.equal(iteration.steps.length, 2); assert(iteration.steps.every(step => step.status === 'completed'));
+      }
+      assert.equal(run.steps[0].output, status === 'completed' ? count : undefined);
+      assert.equal(run.steps[0].termination, status === 'completed' ? 'converged' : 'max-iterations');
+      if (status === 'failed') assert.match(run.steps[0].error, /did not converge within maxIterations/);
+      await identities(run);
+      assert.equal(new Set(units(run).map(unit => unit.native.runId)).size, count * 2);
+      if (name === 'later') {
+        // Pure hash counterfactual over a detached REAL native ledger, not a
+        // fabricated executable/recovered attempt or an API for changed inputs.
+        const detached = JSON.parse(JSON.stringify(run));
+        const entry = entries(detached).find(row => row.step.id === 'refinement@1/refine');
+        const unit = entry.step.units[0], spec = model.qualifyWorkflowStep(entry.spec, entry.iterationId);
+        assert.equal(model.workflowUnitHash(detached, spec, unit.inputs), unit.inputHash);
+        detached.steps[0].iterations[0].feedback = 99;
+        assert.notEqual(model.workflowUnitHash(detached, spec, unit.inputs), unit.inputHash,
+          'Changed prior feedback invalidates downstream retry eligibility even with unchanged unit inputs');
+        assert.equal(run.steps[0].iterations[0].feedback, 1, 'Never mutate live ledger for counterfactual');
+      }
+      if (name === 'bounded') {
+        const boundary = { requests: requests.length, sessions: sessions.size };
+        const retryId = (await execute({ action: 'workflows.retry', workflowRunId: run.workflowRunId })).data.view.workflowRunId;
+        const retry = await settled(retryId);
+        assert.equal(retry.status, 'failed'); assert.equal(retry.steps[0].termination, 'max-iterations');
+        assert.equal(retry.steps[0].output, undefined, 'Explicit retry cannot turn nonconvergence into success');
+        assert.equal(retry.familyId, run.familyId); assert.equal(retry.attemptNo, 2);
+        for (const unit of units(retry)) {
+          const prior = units(run).find(row => row.id === unit.id);
+          assert.equal(unit.reusedFrom.workflowRunId, run.workflowRunId);
+          assert.equal(unit.reusedFrom.unitId, prior.id); assert.equal(unit.inputHash, prior.inputHash);
+          assert.deepEqual(unit.native, prior.native);
+        }
+        assert.deepEqual({ requests: requests.length, sessions: sessions.size }, boundary, 'Exact completed loop nodes reuse without SDK replay');
+      }
+    }
+    const fan = loopDefinition('wf-loop-fanout', 1, 1);
+    fan.inputSchema = { type: 'object', properties: { targets: { type: 'array', items: scalar, maxItems: 3 } }, required: ['targets'], additionalProperties: false };
+    const block = fan.steps[0];
+    block.body = [{ ...nativeStep('review', 'fan', [], ref('iteration')),
+      fanout: { from: { source: 'inputs', path: ['targets'] }, maxItems: 3 } }];
+    block.feedback = ref('iteration'); block.output = ref('iteration'); block.until = { op: 'boolean', value: { value: true } };
+    const fanId = await start(fan, { targets: ['a.txt', 'b.txt', 'a.txt'] });
+    await until(() => gates.has('fan-shutdown-0') && gates.has('fan-shutdown-1'), 'two loop fanout permits retained through shutdown');
+    assert.equal(active, 2); assert.equal(units(get(fanId)).filter(unit => unit.native).length, 2);
+    await sleep(100); assert.equal(units(get(fanId)).filter(unit => unit.native).length, 2, 'Third fanout cannot reuse a cleanup-owned permit');
+    release('fan-shutdown-0'); release('fan-shutdown-1');
+    await until(() => gates.has('fan-shutdown-2'), 'third fanout after cleanup release'); release('fan-shutdown-2');
+    const fanDone = await settled(fanId); assert.equal(fanDone.status, 'completed');
+    assert.equal(units(fanDone).length, 3); await identities(fanDone);
+    // Capture the live loop, pause while its stream owns a permit, then cancel
+    // during actual shutdown. Restore the detached checkpoint only after drain.
+    loopGate = true; loopShutdown = true;
+    const loopId = await start(loopDefinition('wf-loop-recovery', 1));
+    await until(() => gates.has('loop-stream'), 'real loop body in-flight stream');
+    const saved = JSON.parse(JSON.stringify(owner.getState())), checkpoint = JSON.stringify(saved);
+    const recovered = saved.extensions.workflows.runs.find(run => run.workflowRunId === loopId);
+    const admitted = units(recovered).find(unit => unit.native);
+    assert.equal(admitted.status, 'running'); assert.equal(admitted.cleanupSettled, false);
+    assert.equal(recovered.status, 'running'); assert.equal(recovered.steps[0].iterations.length, 1);
+    await execute({ action: 'workflows.pause', workflowRunId: loopId });
+    release('loop-stream'); await until(() => gates.has('loop-shutdown'), 'actual loop shutdown owns permit');
+    assert.equal(get(loopId).cleanupSettled, false);
+    assert(!units(get(loopId)).some(unit => unit.stepId.endsWith('/assess') && unit.native));
+    await execute({ action: 'workflows.cancel', workflowRunId: loopId });
+    assert.equal((await owner.execute({ action: 'workflows.retry', workflowRunId: loopId })).ok, false);
+    loopGate = false; loopShutdown = false; release('loop-shutdown');
+    assert.equal((await settled(loopId)).status, 'cancelled');
+    const retriedLoop = (await execute({ action: 'workflows.retry', workflowRunId: loopId })).data.view;
+    const retried = await settled(retriedLoop.workflowRunId); assert.equal(retried.status, 'completed');
+    assert.equal(retried.steps[0].iterations[0].state, 0, 'Retry cannot advance from uncommitted feedback');
+    assert.equal(retried.steps[0].iterations[0].feedback, 1); await identities(retried);
+    assert.equal(active, 0); assert([...sessions].every(session => disposed.get(session) === 1));
+    for (const unit of units(recovered).filter(unit => unit.native)) {
+      const native = (await execute({ action: 'runs.show', runId: unit.native.runId })).data.run;
+      for (const session of native.nativeSessions) {
+        assert.equal(session.attachment, 'disposed'); hashes.push([session.sessionFile, digest(session.sessionFile)]);
+      }
+    }
+    owner.dispose(); assert.equal(JSON.stringify(saved), checkpoint, 'Real checkpoint never rewritten as a synthetic running attempt');
     persistence.createZergPersistenceManager({ enabled: true, snapshotFile }).save(saved);
-    const info = join(work, 'recover-info.json'); writeFileSync(info, JSON.stringify({ snapshotFile, workflowRunId: lastCancel, hashes }));
+    const info = join(work, 'recover-info.json'); writeFileSync(info, JSON.stringify({ snapshotFile, workflowRunId: loopId,
+      activeUnit: { id: admitted.id, native: admitted.native, inputHash: admitted.inputHash }, hashes }));
     const loader = createRequire(import.meta.url).resolve('tsx');
     restartChild = spawn(process.execPath, ['--import', loader, fileURLToPath(import.meta.url), '--recover', info], { cwd: work, env: guard.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
     const output = []; let bytes = 0;
@@ -379,6 +514,7 @@ pi.on('session_shutdown',(_e,ctx)=>globalThis[key].shutdown(ctx.model?.id));
     const code = await new Promise((resolve, reject) => { restartChild.once('error', reject); restartChild.once('close', (code, signal) => signal ? reject(Error('Recovery forced signal ' + signal)) : resolve(code)); }).finally(() => clearTimeout(timer));
     assert.equal(code, 0, Buffer.concat(output).toString()); assert.match(Buffer.concat(output).toString(), /zero SDK\/provider\/tool replay/);
     assert.equal(active, 0); assert([...sessions].every(session => disposed.get(session) === 1)); unchanged();
+    console.log('PASS Stage8A native: false-zero-startup, alternative-join, first/later/bounded repeat, fanout-cleanup-cap, loop-pause-cancel-retry, exact-retry-reuse/pure-feedback-hash-invalidation, exact-lineage, real-inflight-zero-replay');
     console.log('PASS native workflow acceptance: preset partial coverage/dedupe, pause/resume, explicit exact retry, setup/stream/read/shutdown cancellation, current readonly/private tool authority, inert fresh recovery; requests=' + requests.length + ', peakObservedSDK=' + peakSDK + ', peakLedger=' + peakLedger);
   }
   try { await acceptance(); } catch (error) {

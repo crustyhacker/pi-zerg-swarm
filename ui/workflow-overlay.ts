@@ -1,6 +1,7 @@
 import { Text, isKeyRelease, truncateToWidth, type Focusable } from '@earendil-works/pi-tui';
 import type { StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle } from '../types.js';
-import type { WorkflowAction, WorkflowNativeIdentity, WorkflowRun, WorkflowService, WorkflowUnit } from '../workflow-model.js';
+import { workflowStepEntries } from '../workflow-model.js';
+import type { WorkflowAction, WorkflowNativeIdentity, WorkflowRun, WorkflowService, WorkflowStepRun, WorkflowUnit } from '../workflow-model.js';
 import { sanitizeUiText, styleText, uiErrorText, visibleSlice, type UiThemeLike } from './components.js';
 import { matchesKey } from './state.js';
 
@@ -9,8 +10,8 @@ export interface ZergWorkflowOverlayOptions {
   workflowRunId?: string;
   onOpenNative?(identity: WorkflowNativeIdentity): void | Promise<void>;
 }
-interface ViewState { level: 'list' | 'steps' | 'units' | 'result'; runId?: string; stepId?: string; unitId?: string; scroll: number }
-interface Proof { runId: string; stepId?: string; unitId?: string; identity: string; status: WorkflowRun['status']; cleanup: boolean }
+interface ViewState { level: 'list' | 'steps' | 'iterations' | 'body' | 'units' | 'result'; runId?: string; stepId?: string; blockId?: string; iterationId?: string; unitId?: string; restoredIdentity?: string; scroll: number }
+interface Proof { iterationId?: string; runId: string; stepId?: string; unitId?: string; identity: string; status: WorkflowRun['status']; cleanup: boolean }
 interface CodingResult { native: WorkflowNativeIdentity; state: ViewState }
 const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f-\x9f]/u.test(value);
 const cleanup = (fn?: () => void) => { try { fn?.(); } catch { /* Finish every UI cleanup stage. */ } };
@@ -20,15 +21,26 @@ function copyNative(value?: WorkflowNativeIdentity): WorkflowNativeIdentity | un
   return value && validId(value.runId) && validId(value.taskId) ? { runId: value.runId, taskId: value.taskId } : undefined;
 }
 function identity(run: WorkflowRun, stepId?: string, unitId?: string): string {
-  const step = stepId === undefined ? undefined : run.steps.find((row) => row.id === stepId);
+  const entry = stepId === undefined ? undefined : workflowStepEntries(run).find(({ step }) => step.id === stepId);
+  const step = entry?.step;
   const unit = unitId === undefined ? undefined : step?.units.find((row) => row.id === unitId);
   if (!validId(run.workflowRunId) || !validId(run.familyId) || !validId(run.definition.id) || !Number.isSafeInteger(run.attemptNo)
     || typeof run.definitionHash !== 'string' || run.definitionHash.length > 256 || typeof run.createdAt !== 'string' || run.createdAt.length > 64
-    || (stepId !== undefined && (!validId(stepId) || !step || run.steps.filter((row) => row.id === stepId).length !== 1))
+    || (stepId !== undefined && (!validId(stepId) || !step || workflowStepEntries(run).filter(({ step }) => step.id === stepId).length !== 1))
     || (unitId !== undefined && (!validId(unitId) || !unit || unit.stepId !== stepId || typeof unit.inputHash !== 'string' || unit.inputHash.length > 256 || step!.units.filter((row) => row.id === unitId).length !== 1))) throw new Error('Invalid/ambiguous workflow identity.');
   return JSON.stringify([run.workflowRunId, run.familyId, run.attemptNo, run.retryOf, run.definition.id, run.definitionHash, run.createdAt,
-    stepId, unitId, unit?.inputHash, unit?.native?.runId, unit?.native?.taskId,
+    stepId, entry?.blockId, entry?.iterationId, entry?.iterationNo, unitId, unit?.inputHash, unit?.native?.runId, unit?.native?.taskId,
     unit?.reusedFrom?.workflowRunId, unit?.reusedFrom?.unitId, unit?.reusedFrom?.native.runId, unit?.reusedFrom?.native.taskId]);
+}
+/** Report the recorded transition, never infer exhaustion from a generic failure. */
+function repeatOutcome(step: WorkflowStepRun, recovered: boolean): string {
+  if (step.status === 'unverified' || recovered || step.termination === 'recovery') return 'uncertain/unverified';
+  if (step.status === 'cancelled' || step.termination === 'cancelled') return 'cancelled';
+  if (step.termination === 'converged') return step.status === 'completed' ? 'converged' : 'convergence not confirmed';
+  if (step.termination === 'max-iterations') return 'nonconverged (max-iterations)';
+  if (step.termination === 'body-failed') return 'body-failed';
+  if (step.termination === 'invalid-transition') return 'invalid-transition (schema/feedback/condition/output)';
+  return step.status === 'failed' ? 'failed (termination unspecified)' : 'convergence not confirmed';
 }
 /** Explicit local result drill only. Bound traversal BEFORE formatting, not a context/transcript copy. */
 function resultPreview(value: unknown): string {
@@ -114,12 +126,13 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
     this.invalidate();
     try { this.tui?.requestRender?.(); } catch { this.observerNotice = 'Workflow redraw unavailable.'; }
   }
-  private selectedId(): string | undefined { return this.state.level === 'list' ? this.state.runId : this.state.level === 'steps' ? this.state.stepId : this.state.unitId; }
+  private selectedId(): string | undefined { return this.state.level === 'list' ? this.state.runId : this.state.level === 'iterations' ? this.state.iterationId : ['steps', 'body'].includes(this.state.level) ? this.state.stepId : this.state.unitId; }
   private select(id?: string): void {
     if (this.state.level === 'list') { this.state.runId = id; this.state.stepId = this.state.unitId = undefined; }
-    else if (this.state.level === 'steps') { this.state.stepId = id; this.state.unitId = undefined; }
+    else if (this.state.level === 'iterations') { this.state.iterationId = id; this.state.unitId = undefined; }
+    else if (['steps', 'body'].includes(this.state.level)) { this.state.stepId = id; this.state.unitId = undefined; }
     else this.state.unitId = id;
-    this.state.scroll = 0; this.proof = undefined;
+    this.state.restoredIdentity = undefined; this.state.scroll = 0; this.proof = undefined;
   }
   render(width = 100, requestedHeight?: number): string[] {
     if (this.disposed) return [];
@@ -138,15 +151,27 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
     }
     const run = this.state.runId ? this.options.service.get(this.state.runId) : undefined;
     if (run && run.workflowRunId !== this.state.runId) throw new Error('Wrong workflow returned for exact ID.');
-    const step = run?.steps.find((row) => row.id === this.state.stepId);
+    const entries = run ? workflowStepEntries(run) : [];
+    const block = run?.steps.find((row) => row.id === this.state.blockId);
+    const iteration = block?.iterations?.find((row) => row.id === this.state.iterationId);
+    const step = entries.find(({ step }) => step.id === this.state.stepId)?.step;
     if (this.state.level === 'steps') { this.rows = unique(run?.steps.slice(0, 16).map((row) => row.id) ?? []); if (this.state.stepId === undefined) this.select(this.rows[0]); }
+    if (this.state.level === 'iterations') { this.rows = unique(block?.iterations?.slice(0, 32).map((row) => row.id) ?? []); if (this.state.iterationId === undefined) this.select(this.rows[0]); }
+    if (this.state.level === 'body') { this.rows = unique(iteration?.steps.slice(0, 16).map((row) => row.id) ?? []); if (this.state.stepId === undefined) this.select(this.rows[0]); }
     if (this.state.level === 'units' || this.state.level === 'result') { this.rows = unique(step?.units.slice(0, 32).map((row) => row.id) ?? []); if (this.state.unitId === undefined) this.select(this.rows[0]); }
-    const selectedStep = run?.steps.find((row) => row.id === this.state.stepId);
+    const selectedEntry = entries.find(({ step }) => step.id === this.state.stepId);
+    const selectedStep = selectedEntry?.step;
+    if (this.state.blockId && ['body', 'units', 'result'].includes(this.state.level)
+      && (selectedEntry?.blockId !== this.state.blockId || selectedEntry?.iterationId !== this.state.iterationId)) throw new Error('Exact iteration selection missing/changed; no fallback.');
+    if (this.state.restoredIdentity && (!run || identity(run, this.state.stepId, this.state.unitId) !== this.state.restoredIdentity)) throw new Error('Exact coding selection changed; no fallback.');
     const unit = selectedStep?.units.find((row) => row.id === this.state.unitId);
     const status = run ? `${run.status}${!run.cleanupSettled ? ' · cleanup-pending' : ''}${run.recovered ? ' · recovered/unverified history' : ''}` : 'missing/evicted (no fallback)';
     const label = run?.definition.label ?? 'workflow runs';
-    const header = [`zerg workflows · ${this.state.level} · ${label}`, `${this.state.runId ?? 'all retained runs'} · attempt ${run?.attemptNo ?? '?'} · ${status}`,
-      `${this.pending ? 'Control pending. ' : ''}${this.notice} ${this.observerNotice} ${run?.error ? `Workflow error: ${sanitizeUiText(run.error)} · ` : ''}Pause closes admission only; admitted workers continue. UI bounds: 16 runs/16 phases/32 units.`];
+    const blockSpec = entries.find(({ step }) => step.id === block?.id)?.spec;
+    const repeatStatus = block && blockSpec?.kind === 'repeat'
+      ? ` · ${block.id} iteration ${block.iterations?.length ?? 0}/${blockSpec.maxIterations} · ${block.status} · ${repeatOutcome(block, run!.recovered)}${block.skipReason ? ` · ${block.skipReason}` : ''}${block.error ? ` · ${block.error}` : ''}` : '';
+    const header = [`zerg workflows · ${this.state.level} · ${label}`, `${this.state.runId ?? 'all retained runs'} · attempt ${run?.attemptNo ?? '?'} · ${status}${repeatStatus}`,
+      `${this.pending ? 'Control pending. ' : ''}${this.notice} ${this.observerNotice} ${run?.error ? `Workflow error: ${sanitizeUiText(run.error)} · ` : ''}Pause closes admission only; admitted workers continue. UI bounds: 16 runs/16 phases/32 iterations/32 units.`];
     const headerCount = Math.min(3, Math.max(0, h - 2)); const footerCount = h >= 3 ? 1 : 0;
     const capacity = Math.max(1, h - headerCount - footerCount); this.viewport = capacity;
     const selected = this.selectedId();
@@ -177,9 +202,14 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
           const counts = ['queued', 'running', 'completed', 'failed', 'cancelled', 'skipped', 'unverified'].map((key) => `${key}:${view.counts[key as keyof typeof view.counts]}`).join(' ');
           return `${mark} ${id} · ${view.definitionId} · attempt ${view.attemptNo} · ${view.status}${view.cleanupSettled ? '' : ' · cleanup-pending'} · ${counts}`;
         }
-        if (this.state.level === 'steps') {
-          const row = run!.steps.find((entry) => entry.id === id)!;
-          return `${mark} phase ${id} · ${row.status} · ${row.units.length} units · ${row.error ?? ''}`;
+        if (this.state.level === 'iterations') {
+          const row = block!.iterations!.find((entry) => entry.id === id)!;
+          return `${mark} iteration ${id} · ${row.index + 1} · decision ${row.decision ?? 'pending'} · ${row.error ?? ''}`;
+        }
+        if (this.state.level === 'steps' || this.state.level === 'body') {
+          const entry = entries.find(({ step }) => step.id === id)!;
+          const row = entry.step;
+          return `${mark} phase ${id} · ${row.status} · ${row.units.length} units${entry.spec.kind === 'repeat' ? ` · iteration ${row.iterations?.length ?? 0}/${entry.spec.maxIterations}` : ''} · ${row.skipReason ?? ''} ${row.error ?? ''}${entry.spec.kind === 'repeat' ? ` · ${repeatOutcome(row, run!.recovered)}` : ''}`;
         }
         const row = selectedStep!.units.find((entry) => entry.id === id)!;
         return `${mark} unit ${id} · ${row.status}${row.cleanupSettled ? '' : ' · cleanup-pending'}${row.reusedFrom ? ` · reused from ${row.reusedFrom.workflowRunId}/${row.reusedFrom.unitId} native:${row.reusedFrom.native.runId}` : ''} · ${row.error ?? ''}`;
@@ -199,13 +229,15 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
       }
       const stepId = this.state.level === 'list' ? undefined : this.state.stepId;
       const unitId = ['units', 'result'].includes(this.state.level) ? this.state.unitId : undefined;
-      this.proof = { runId: run.workflowRunId, stepId, unitId, identity: identity(run, stepId, unitId), status: run.status, cleanup: run.cleanupSettled };
+      this.proof = { iterationId: this.state.iterationId, runId: run.workflowRunId, stepId, unitId, identity: identity(run, stepId, unitId), status: run.status, cleanup: run.cleanupSettled };
     }
     return output;
   }
   private current(proof: Proof | undefined): WorkflowRun | undefined {
     if (!proof || proof.runId !== this.state.runId || (proof.stepId !== undefined && proof.stepId !== this.state.stepId) || (proof.unitId !== undefined && proof.unitId !== this.state.unitId)) return;
     const run = this.options.service.get(proof.runId);
+    if (proof.iterationId !== this.state.iterationId) return;
+    if (proof.iterationId && (!run || run.steps.find((row) => row.id === this.state.blockId)?.iterations?.filter((row) => row.id === proof.iterationId).length !== 1)) return;
     if (!run || identity(run, proof.stepId, proof.unitId) !== proof.identity) return;
     return run;
   }
@@ -222,7 +254,14 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
     if (matchesKey(data, 'escape', 'q')) {
       if (this.confirmation) { this.confirmation = undefined; this.confirmationRendered = false; }
       else if (this.state.level === 'list') { this.dispose(); return; }
-      else { this.state.level = this.state.level === 'result' ? 'units' : this.state.level === 'units' ? 'steps' : 'list'; this.proof = undefined; this.state.scroll = 0; }
+      else {
+        if (this.state.level === 'result') this.state.level = 'units';
+        else if (this.state.level === 'units') this.state.level = this.state.blockId ? 'body' : 'steps';
+        else if (this.state.level === 'body') { this.state.level = 'iterations'; this.state.stepId = this.state.blockId; }
+        else if (this.state.level === 'iterations') { this.state.level = 'steps'; this.state.stepId = this.state.blockId; this.state.blockId = this.state.iterationId = undefined; }
+        else this.state.level = 'list';
+        this.proof = undefined; this.state.restoredIdentity = undefined; this.state.scroll = 0;
+      }
       this.redraw(); return;
     }
     if (this.pending) return;
@@ -244,11 +283,18 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
           if (run.status !== proof.status || run.cleanupSettled !== proof.cleanup || !terminal(run) || !run.cleanupSettled) this.notice = 'Retry requires terminal attempt and settled cleanup; redraw before retry.';
           else { this.confirmation = { ...proof }; this.confirmationRendered = false; }
         } else if (matchesKey(data, 'c')) {
-          const native = copyNative(nativeOf(run.steps.find((step) => step.id === proof.stepId)?.units.find((unit) => unit.id === proof.unitId)));
+          const native = copyNative(nativeOf(workflowStepEntries(run).find(({ step }) => step.id === proof.stepId)?.step.units.find((unit) => unit.id === proof.unitId)));
           if (!native || !this.options.onOpenNative) this.notice = 'Select a unit with exact recorded native identity; coding unavailable.';
-          else { this.finish({ native, state: { ...this.state } }); return; }
+          else { this.finish({ native, state: { ...this.state, restoredIdentity: proof.identity } }); return; }
         } else {
-          this.state.level = this.state.level === 'list' ? 'steps' : this.state.level === 'steps' ? 'units' : 'result'; this.state.scroll = 0; this.proof = undefined;
+          if (this.state.level === 'list') this.state.level = 'steps';
+          else if (this.state.level === 'iterations') { this.state.level = 'body'; this.state.stepId = undefined; }
+          else if (this.state.level === 'steps' || this.state.level === 'body') {
+            const entry = workflowStepEntries(run).find(({ step }) => step.id === this.state.stepId);
+            if (entry?.spec.kind === 'repeat') { this.state.level = 'iterations'; this.state.blockId = this.state.stepId; this.state.iterationId = undefined; }
+            else this.state.level = 'units';
+          } else this.state.level = 'result';
+          this.state.restoredIdentity = undefined; this.state.scroll = 0; this.proof = undefined;
         }
       } else if (this.state.level === 'result' && matchesKey(data, 'up', 'down', 'pageup', 'pagedown', 'home', 'end')) {
         this.state.scroll = matchesKey(data, 'home') ? 0 : matchesKey(data, 'end') ? 512 : Math.max(0, this.state.scroll + (matchesKey(data, 'up', 'pageup') ? -1 : 1) * (matchesKey(data, 'pageup', 'pagedown') ? this.viewport : 1));

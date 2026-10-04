@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { registerHooks } from 'node:module';
 import { createZergState, createZergStateContainer } from '../state.js';
-import type { WorkflowDefinition, WorkflowReply, WorkflowState } from '../workflow-model.js';
+import type { WorkflowReply, WorkflowState } from '../workflow-model.js';
+import type { WorkflowDefinition, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from '../index.js';
 import type { ZergControl, ZergStateContainer, StructuralPiCommandOptions } from '../types.js';
 
 // This module never starts the SDK. Dynamic SDK imports resolve only to this
@@ -193,12 +194,12 @@ test('workflow dispose leaves native lifecycle nonterminal while cleanup is pend
   assert.equal(control.getState().agents[native.runId].status, 'cancelled');
 });
 
-test('owned slash workflows reject input-changing messages and interrupt without external bridge emissions', async () => {
+for (const repeat of [false, true]) test(`owned slash workflows ${repeat ? 'v2 repeat' : 'v1'} reject input-changing messages and interrupt without external bridge emissions`, async () => {
   reset(); let tool: any; const emissions: string[] = [];
   const extension = registerZergSwarmExtension({ events: { on() { return () => {}; }, emit(name) { emissions.push(String(name)); } }, registerTool(value) { tool = value; } });
   const execute = async (action: any) => (await tool.execute('fake-control', action)).details;
   const saved = await execute({ action: 'agents.create', id: 'safe', prompt: 'Read only.', model: 'fake/model', tools: ['read', 'bash', 'mcp', 'zerg_control'] }); assert.equal(saved.ok, true);
-  reply(await execute({ action: 'workflows.define', definition: definition() }));
+  reply(await execute({ action: 'workflows.define', definition: repeat ? repeatDefinition() : definition() }));
   const prompt = deferred(), abort = deferred(); host.promptGate = prompt.promise; host.abortGate = abort.promise; host.releasePrompt = prompt.resolve;
   const id = reply(await execute({ action: 'workflows.start', definitionId: 'control-test', inputs: {}, concurrency: 1 })).view!.workflowRunId;
   await until(() => host.providers === 1); assert.deepEqual(host.options.tools, ['read']);
@@ -280,7 +281,7 @@ test('lazy workflow initialization refuses reentrant first-read observers withou
   } finally { unsubscribe(); control.dispose(); }
 });
 
-for (const referenceCase of ['exact', 'missing', 'ambiguous', 'stale-pi', 'wrong-member'] as const) test(`workflow control to coding UI ${referenceCase} uses exact initial identity or refuses without chooser`, async () => {
+for (const repeat of [false, true]) for (const referenceCase of ['exact', 'missing', 'ambiguous', 'stale-pi', 'wrong-member'] as const) test(`workflow control to coding UI ${repeat ? 'v2 repeat' : 'v1'} ${referenceCase} uses exact initial identity or refuses without chooser`, async () => {
   reset();
   const { createNativeTranscriptService } = await import('../native-transcript.js');
   const commands = new Map<string, StructuralPiCommandOptions>();
@@ -296,7 +297,7 @@ for (const referenceCase of ['exact', 'missing', 'ambiguous', 'stale-pi', 'wrong
   const extension = registerZergSwarmExtension({ registerCommand(name, command) { commands.set(name, command); } }, { nativeTranscriptService: transcript });
   try {
     reply(await extension.control.execute({ action: 'agents.create', id: 'safe', prompt: 'Read only.', model: 'fake/model', tools: ['read'] }));
-    const id = await start(extension.control); await extension.control.drain!();
+    const id = repeat ? await startDefinition(extension.control, repeatDefinition()) : await start(extension.control); await extension.control.drain!();
     const native = (await view(extension.control, id)).correlations[0].native!;
     const run = (await extension.control.execute({ action: 'runs.show', runId: native.runId })).data as { run: { nativeSessions: import('../types.js').ZergNativeSessionReference[] } };
     const reference = run.run.nativeSessions[0]!;
@@ -322,6 +323,7 @@ for (const referenceCase of ['exact', 'missing', 'ambiguous', 'stale-pi', 'wrong
           assert.ok(workflowEntries <= 2, 'bounded workflow return path');
           if (workflowEntries === 1) {
             component.render(512); component.handleInput!('\r');
+            if (repeat) { component.render(512); component.handleInput!('\r'); component.render(512); component.handleInput!('\r'); }
             component.render(512); component.handleInput!('c');
           } else returnedFrames.push(component.render(512).join('\n'));
         }
@@ -345,4 +347,67 @@ for (const referenceCase of ['exact', 'missing', 'ambiguous', 'stale-pi', 'wrong
     }
     assert.equal(host.creates, 1); assert.equal(host.providers, 1); assert.equal(host.disposes, 1, 'viewer does not own or restart native lifecycle');
   } finally { extension.dispose(); }
+});
+
+function repeatDefinition(): WorkflowDefinition {
+  const native = definition().steps[0]!;
+  const stateSchema: WorkflowSchema = native.outputSchema!;
+  const feedbackRef: WorkflowRef = { source: 'step', stepId: 'body', path: [] };
+  const feedback: WorkflowBinding = { ref: feedbackRef };
+  const until: WorkflowCondition = { op: 'boolean', value: { ref: { source: 'iteration', path: ['ok'] } } };
+  return { ...definition(), version: 2, steps: [{ id: 'loop', kind: 'repeat', dependsOn: [],
+    initial: { value: { ok: false } }, stateSchema, body: [{ ...native, id: 'body' }],
+    feedback, until,
+    output: { ref: { source: 'iteration', path: [] } }, outputSchema: native.outputSchema, maxIterations: 2,
+  }] };
+}
+async function startDefinition(control: ZergControl, value: WorkflowDefinition) {
+  reply(await control.execute({ action: 'workflows.define', definition: value }));
+  return reply(await control.execute({ action: 'workflows.start', definitionId: value.id, inputs: {}, concurrency: 1 })).view!.workflowRunId;
+}
+test('v2 false condition has zero native setup/admissions and explicit skipped branch join', async () => {
+  reset(); const state = container(); const control = createZergControl(state);
+  const value = definition(); value.version = 2; value.steps[0]!.when = { op: 'boolean', value: { value: false } };
+  value.steps.push({ id: 'join', kind: 'aggregate', dependsOn: ['step0'], operation: 'collect', consumeSkips: true,
+    inputs: { branch: { ref: { source: 'step', stepId: 'step0', path: [] } } } });
+  const id = await startDefinition(control, value); await control.drain!();
+  assert.equal(host.loads, 0); assert.equal(host.creates, 0); assert.equal(host.providers, 0);
+  const ledger = (state.read().extensions.workflows as WorkflowState).runs.find(row => row.workflowRunId === id)!;
+  assert.equal(ledger.admissions, 0); assert.equal(ledger.steps[0]!.skipReason, 'condition-false');
+  assert.deepEqual(ledger.steps[0]!.units, []); assert.equal(ledger.steps[0]!.output, undefined);
+  assert.equal(ledger.steps[1]!.status, 'completed'); assert.match(JSON.stringify(ledger.steps[1]!.output), /skipped/);
+  control.dispose();
+});
+test('v2 required branch failure is not hidden by an explicitly consuming aggregate', async () => {
+  reset(); host.text = 'invalid-json'; const control = createZergControl(container());
+  const value = definition(); value.version = 2;
+  value.steps.push({ id: 'join', kind: 'aggregate', dependsOn: ['step0'], operation: 'collect', consumeFailures: true,
+    inputs: { branch: { ref: { source: 'step', stepId: 'step0', path: [] } } } });
+  const id = await startDefinition(control, value); await control.drain!();
+  assert.notEqual((await view(control, id)).status, 'completed'); control.dispose();
+});
+test('v2 repeat native task and agent publish exact qualified lineage with unchanged read-only policy', async () => {
+  reset(); const state = container(); const control = createZergControl(state);
+  const id = await startDefinition(control, repeatDefinition()); await control.drain!();
+  const ledger = (state.read().extensions.workflows as WorkflowState).runs.find(row => row.workflowRunId === id)!;
+  assert.equal(ledger.status, 'completed'); const iteration: WorkflowIterationRun = ledger.steps[0]!.iterations![0]!;
+  assert.equal(iteration.id, 'loop@0'); assert.equal(iteration.decision, true);
+  const unit = iteration.steps[0]!.units[0]!; assert.equal(unit.id, 'loop@0/body:0'); assert.equal(unit.stepId, 'loop@0/body');
+  assert.ok(unit.native); const native = state.read().agents[unit.native.runId]!;
+  const lineage = native.metadata!.workflow;
+  assert.deepEqual(lineage, { workflowRunId: id, familyId: ledger.familyId, attemptNo: 1, stepId: unit.stepId, unitId: unit.id,
+    inputHash: unit.inputHash, blockId: 'loop', iterationId: 'loop@0', iterationNo: 1 });
+  assert.deepEqual(state.read().tasks[unit.native.taskId]!.metadata!.workflow, lineage);
+  const summary = await view(control, id); assert.equal(summary.correlations[0]!.native!.runId, unit.native.runId);
+  assert.equal(host.settings.retry.enabled, false); assert.deepEqual(host.options.tools, ['read']); control.dispose();
+});
+test('v2 repeat pause closes next iteration admission and cancel settles exact active body worker', async () => {
+  reset(); host.text = '{"ok":false}'; const gate = deferred(); host.promptGate = gate.promise; host.releasePrompt = gate.resolve;
+  const state = container(); const control = createZergControl(state);
+  const id = await startDefinition(control, repeatDefinition()); await until(() => host.providers === 1);
+  reply(await control.execute({ action: 'workflows.pause', workflowRunId: id }));
+  assert.equal((await view(control, id)).status, 'paused'); assert.equal(host.aborts, 0);
+  reply(await control.execute({ action: 'workflows.cancel', workflowRunId: id })); await control.drain!();
+  const summary = await view(control, id); assert.equal(summary.status, 'cancelled'); assert.equal(summary.cleanupSettled, true);
+  assert.equal(host.providers, 1); assert.ok(host.aborts >= 1); assert.equal(summary.correlations[0]!.stepId, 'loop@0/body'); control.dispose();
 });

@@ -7,20 +7,28 @@ export interface WorkflowSchema {
   properties?: Record<string, WorkflowSchema>; required?: string[]; additionalProperties?: false;
   items?: WorkflowSchema; maxItems?: number; maxLength?: number; enum?: WorkflowJson[];
 }
-export interface WorkflowRef { source: 'inputs' | 'step' | 'item'; stepId?: string; path: string[] }
+export interface WorkflowRef { source: 'inputs' | 'step' | 'item' | 'iteration'; stepId?: string; path: string[] }
 export type WorkflowBinding = { value: WorkflowJson } | { ref: WorkflowRef };
+export type WorkflowCondition =
+  | { op: 'boolean'; value: WorkflowBinding }
+  | { op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte'; left: WorkflowBinding; right: WorkflowBinding }
+  | { op: 'all' | 'any'; conditions: WorkflowCondition[] }
+  | { op: 'not'; condition: WorkflowCondition };
 export interface WorkflowStep {
-  id: string; dependsOn: string[]; kind: 'native' | 'aggregate';
-  inputs: Record<string, WorkflowBinding>;
+  id: string; dependsOn: string[]; kind: 'native' | 'aggregate' | 'repeat';
+  inputs?: Record<string, WorkflowBinding>;
   agentId?: string; prompt?: string; outputSchema?: WorkflowSchema;
   fanout?: { from: WorkflowRef; maxItems: number };
   operation?: 'collect' | 'collect-findings' | 'review-report';
   /** Aggregate operations alone may explicitly consume failed dependency envelopes. */
-  consumeFailures?: boolean;
+  consumeFailures?: boolean; consumeSkips?: boolean; when?: WorkflowCondition;
+  initial?: WorkflowBinding; stateSchema?: WorkflowSchema; body?: WorkflowStep[]; feedback?: WorkflowBinding;
+  until?: WorkflowCondition; output?: WorkflowBinding; maxIterations?: number;
 }
-export interface WorkflowDefinition { id: string; version: 1; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[] }
+export interface WorkflowDefinition { id: string; version: 1 | 2; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[] }
 export interface WorkflowNativeIdentity { runId: string; taskId: string }
 export interface WorkflowNativeLineage {
+  blockId?: string; iterationId?: string; iterationNo?: number;
   workflowRunId: string; familyId: string; attemptNo: number; stepId: string; unitId: string; inputHash: string;
 }
 export interface WorkflowNativeRequest extends WorkflowNativeLineage {
@@ -48,7 +56,8 @@ export interface WorkflowUnit {
   inputs: WorkflowJson; result?: WorkflowJson; error?: string; native?: WorkflowNativeIdentity;
   cleanupSettled: boolean; reusedFrom?: { workflowRunId: string; unitId: string; native: WorkflowNativeIdentity };
 }
-export interface WorkflowStepRun { id: string; status: WorkflowUnitStatus; units: WorkflowUnit[]; output?: WorkflowJson; error?: string }
+export interface WorkflowIterationRun { id: string; index: number; state: WorkflowJson; steps: WorkflowStepRun[]; feedback?: WorkflowJson; decision?: boolean; error?: string }
+export interface WorkflowStepRun { id: string; status: WorkflowUnitStatus; units: WorkflowUnit[]; output?: WorkflowJson; error?: string; condition?: boolean; skipReason?: 'condition-false' | 'dependency' | 'cancelled' | 'recovery'; iterations?: WorkflowIterationRun[]; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery' }
 export interface WorkflowRun {
   workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; supersededBy?: string;
   definition: WorkflowDefinition; definitionHash: string; inputs: WorkflowJson;
@@ -60,12 +69,13 @@ export interface WorkflowState { version: 1; definitions: WorkflowDefinition[]; 
 export interface WorkflowView {
   workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; definitionId: string;
   status: WorkflowRunStatus; createdAt: string; updatedAt: string; cleanupSettled: boolean; recovered: boolean;
+  steps?: Array<{ id: string; kind: WorkflowStep['kind']; status: WorkflowUnitStatus; condition?: boolean; skipReason?: WorkflowStepRun['skipReason']; iterations?: number; maxIterations?: number; currentIteration?: number; iterationId?: string; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery'; error?: string }>;
   counts: Record<WorkflowUnitStatus, number>;
-  correlations: Array<{ stepId: string; unitId: string; status: WorkflowUnitStatus; native?: WorkflowNativeIdentity; reusedFrom?: WorkflowUnit['reusedFrom'] }>;
+  correlations: Array<{ blockId?: string; iterationId?: string; iterationNo?: number; stepId: string; unitId: string; status: WorkflowUnitStatus; native?: WorkflowNativeIdentity; reusedFrom?: WorkflowUnit['reusedFrom'] }>;
   error?: string;
 }
 /** Compact structured list DTO; unit/native/reuse correlations require explicit show. */
-export type WorkflowRunSummary = Omit<WorkflowView, 'correlations'>;
+export type WorkflowRunSummary = Omit<WorkflowView, 'correlations' | 'steps'>;
 export type WorkflowAction =
   | { action: 'workflows.list' }
   | { action: 'workflows.define'; definition: WorkflowDefinition }
@@ -191,27 +201,36 @@ export function validateWorkflowValue(value: WorkflowJson, schema: WorkflowSchem
 }
 const identifier = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(v);
 export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowDefinition {
+  return validateDefinition(value);
+}
+function validateDefinition(value: WorkflowDefinition, iterationSchema?: WorkflowSchema): WorkflowDefinition {
   const def = freezeWorkflowData(value, WORKFLOW_LIMITS.definitionBytes);
   keysOnly(def, ['id', 'version', 'label', 'inputSchema', 'steps']);
-  workflowAssert(identifier(def.id) && def.version === 1 && typeof def.label === 'string' && def.label.length > 0 && def.label.length <= 160, 'Invalid workflow identity');
+  workflowAssert(identifier(def.id) && (def.version === 1 || def.version === 2) && typeof def.label === 'string' && def.label.length > 0 && def.label.length <= 160, 'Invalid workflow identity');
   validateWorkflowSchema(def.inputSchema);
   workflowAssert(Array.isArray(def.steps) && def.steps.length > 0 && def.steps.length <= WORKFLOW_LIMITS.steps, 'Workflow step limit exceeded');
   const byId = new Map(def.steps.map(s => [s.id, s]));
   workflowAssert(byId.size === def.steps.length, 'Duplicate step IDs');
   let nativeUnits = 0;
   for (const s of def.steps) {
-    keysOnly(s, ['id', 'dependsOn', 'kind', 'inputs', 'agentId', 'prompt', 'outputSchema', 'fanout', 'operation', 'consumeFailures']);
+    keysOnly(s, s.kind === 'repeat' && def.version === 2 ? ['id', 'kind', 'dependsOn', 'initial', 'stateSchema', 'body', 'feedback', 'until', 'output', 'outputSchema', 'maxIterations', 'when'] : ['id', 'dependsOn', 'kind', 'inputs', 'agentId', 'prompt', 'outputSchema', 'fanout', 'operation', 'consumeFailures', ...(def.version === 2 ? ['when', 'consumeSkips'] : [])]);
     workflowAssert(identifier(s.id) && Array.isArray(s.dependsOn) && new Set(s.dependsOn).size === s.dependsOn.length && s.dependsOn.every(d => typeof d === 'string' && byId.has(d) && d !== s.id), 'Unknown/self/duplicate dependency');
+    if (s.kind === 'repeat') {
+      workflowAssert(def.version === 2 && !iterationSchema && s.stateSchema && s.outputSchema && s.initial && s.feedback && s.until && s.output && Array.isArray(s.body) && Number.isSafeInteger(s.maxIterations) && s.maxIterations! >= 1 && s.maxIterations! <= 32, 'Invalid repeat');
+      validateWorkflowSchema(s.stateSchema); validateWorkflowSchema(s.outputSchema);
+      validateDefinition({ id: def.id, version: 2, label: def.label, inputSchema: def.inputSchema, steps: s.body }, s.stateSchema);
+      continue;
+    }
     workflowAssert(s.inputs && typeof s.inputs === 'object' && !Array.isArray(s.inputs), 'Invalid step inputs');
     if (s.kind === 'native') {
-      workflowAssert(identifier(s.agentId) && typeof s.prompt === 'string' && s.prompt.length > 0 && s.outputSchema && s.operation === undefined && s.consumeFailures === undefined, 'Invalid native step');
+      workflowAssert(identifier(s.agentId) && typeof s.prompt === 'string' && s.prompt.length > 0 && s.outputSchema && s.operation === undefined && s.consumeFailures === undefined && s.consumeSkips === undefined, 'Invalid native step');
       validateWorkflowSchema(s.outputSchema);
       if (s.fanout) {
         keysOnly(s.fanout, ['from', 'maxItems']); workflowAssert(Number.isSafeInteger(s.fanout.maxItems) && s.fanout.maxItems >= 0 && s.fanout.maxItems <= 32, 'Invalid fanout bound');
       }
       nativeUnits += s.fanout?.maxItems ?? 1;
     } else {
-      workflowAssert(s.kind === 'aggregate' && ['collect', 'collect-findings', 'review-report'].includes(s.operation!) && s.agentId === undefined && s.prompt === undefined && s.outputSchema === undefined && s.fanout === undefined && (s.consumeFailures === undefined || typeof s.consumeFailures === 'boolean'), 'Invalid deterministic aggregate');
+      workflowAssert(s.kind === 'aggregate' && ['collect', 'collect-findings', 'review-report'].includes(s.operation!) && s.agentId === undefined && s.prompt === undefined && s.outputSchema === undefined && s.fanout === undefined && (s.consumeFailures === undefined || typeof s.consumeFailures === 'boolean') && (s.consumeSkips === undefined || typeof s.consumeSkips === 'boolean'), 'Invalid deterministic aggregate');
     }
   }
   workflowAssert(nativeUnits * WORKFLOW_LIMITS.attempts <= WORKFLOW_LIMITS.admissions, 'Graph exceeds family admission budget');
@@ -220,13 +239,15 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
   def.steps.forEach(s => visit(s.id));
   const refSchema = (r: WorkflowRef, s: WorkflowStep): WorkflowSchema | undefined => {
     workflowAssert(r && typeof r === 'object', 'Invalid reference'); keysOnly(r, ['source', 'stepId', 'path']);
-    workflowAssert(['inputs', 'step', 'item'].includes(r.source) && Array.isArray(r.path) && r.path.length <= 24 && r.path.every(p => typeof p === 'string' && !['__proto__', 'constructor', 'prototype'].includes(p)), 'Invalid reference path');
+    workflowAssert(['inputs', 'step', 'item', ...(def.version === 2 ? ['iteration'] : [])].includes(r.source) && Array.isArray(r.path) && r.path.length <= 24 && r.path.every(p => typeof p === 'string' && !['__proto__', 'constructor', 'prototype'].includes(p)), 'Invalid reference path');
     let schema: WorkflowSchema | undefined;
+    if (r.source === 'iteration') { workflowAssert(iterationSchema && r.stepId === undefined, 'Iteration reference outside repeat'); schema = iterationSchema; }
     if (r.source === 'inputs') { workflowAssert(r.stepId === undefined, 'Input reference has stepId'); schema = def.inputSchema; }
     if (r.source === 'step') {
       workflowAssert(typeof r.stepId === 'string' && s.dependsOn.includes(r.stepId), 'Reference must name an explicit dependency');
       const dep = byId.get(r.stepId)!;
-      if (dep.kind === 'native' && !dep.fanout) schema = dep.outputSchema;
+      if ((s.consumeSkips && dep.when !== undefined) || (def.version === 2 && s.consumeFailures)) workflowAssert(r.path.length === 0, 'Skip consumption requires whole unavailable envelope');
+      if ((dep.kind === 'native' && !dep.fanout) || dep.kind === 'repeat') schema = dep.outputSchema;
       else workflowAssert(r.path.length === 0, 'Envelope/aggregate references require whole output');
     }
     if (r.source === 'item') {
@@ -243,7 +264,7 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
     return schema;
   };
   const findingsBound = (s: WorkflowStep): number => {
-    const binding = s.inputs.reviews;
+    const binding = s.inputs!.reviews;
     workflowAssert(binding && 'ref' in binding && binding.ref.source === 'step' && binding.ref.path.length === 0 && s.dependsOn.includes(binding.ref.stepId!), 'collect-findings requires whole review dependency envelopes');
     const review = byId.get(binding.ref.stepId!)!;
     const schema = review.outputSchema?.properties?.findings;
@@ -251,21 +272,40 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
     const bound = review.fanout.maxItems * schema.maxItems!;
     workflowAssert(bound <= 32, 'Collected finding expansion exceeds declared maximum32'); return bound;
   };
+  const binding = (b: WorkflowBinding, s: WorkflowStep): WorkflowSchema | undefined => {
+    workflowAssert(b && typeof b === 'object' && !Array.isArray(b), 'Invalid binding');
+    if ('ref' in b) { keysOnly(b, ['ref']); return refSchema(b.ref, s); }
+    keysOnly(b, ['value']); workflowAssert(Object.hasOwn(b, 'value'), 'Binding requires value or ref'); return schemaForValue(b.value);
+  };
   for (const s of def.steps) {
-    if (s.operation === 'collect-findings') { workflowAssert(Object.keys(s.inputs).length === 1 && s.consumeFailures === true, 'collect-findings requires explicit failure consumption'); findingsBound(s); }
+    if (s.when !== undefined) validateWorkflowCondition(s.when, b => binding(b, { ...s, fanout: undefined }));
+    if (s.kind === 'repeat') {
+      validateBindingCompatibility(s.initial!, binding(s.initial!, s), s.stateSchema!);
+      const boundary = { ...s, dependsOn: s.body!.map(b => b.id) };
+      const bodyDef: WorkflowDefinition = { id: def.id, version: 2, label: def.label, inputSchema: def.inputSchema, steps: s.body! };
+      // Boundary bindings see current body outputs and state, never outer dependencies.
+      validateBindingCompatibility(s.feedback!, validateBoundaryBinding(s.feedback!, bodyDef, s.stateSchema!, boundary), s.stateSchema!);
+      validateBindingCompatibility(s.output!, validateBoundaryBinding(s.output!, bodyDef, s.stateSchema!, boundary), s.outputSchema!);
+      validateWorkflowCondition(s.until!, b => {
+        workflowAssert(!('ref' in b) || b.ref.source === 'iteration', 'Until permits only next iteration state and literals');
+        return validateBoundaryBinding(b, bodyDef, s.stateSchema!, { ...boundary, dependsOn: [] });
+      });
+      continue;
+    }
+    if (s.operation === 'collect-findings') { workflowAssert(Object.keys(s.inputs!).length === 1 && s.consumeFailures === true, 'collect-findings requires explicit failure consumption'); findingsBound(s); }
     if (s.operation === 'review-report') {
-      workflowAssert(Object.keys(s.inputs).sort().join(',') === 'candidates,discovery,findings,reviews,verifications' && s.consumeFailures === true, 'review-report requires explicit coverage inputs and failure consumption');
+      workflowAssert(Object.keys(s.inputs!).sort().join(',') === 'candidates,discovery,findings,reviews,verifications' && s.consumeFailures === true, 'review-report requires explicit coverage inputs and failure consumption');
       const dependency = (key: string): WorkflowStep => {
-        const b = s.inputs[key]; workflowAssert('ref' in b && b.ref.source === 'step' && b.ref.path.length === 0 && s.dependsOn.includes(b.ref.stepId!), 'Report requires whole explicit dependency references'); return byId.get(b.ref.stepId!)!;
+        const b = s.inputs![key]; workflowAssert('ref' in b && b.ref.source === 'step' && b.ref.path.length === 0 && s.dependsOn.includes(b.ref.stepId!), 'Report requires whole explicit dependency references'); return byId.get(b.ref.stepId!)!;
       };
-      const candidates = s.inputs.candidates;
+      const candidates = s.inputs!.candidates;
       workflowAssert('ref' in candidates && candidates.ref.source === 'inputs' && refSchema(candidates.ref, s)?.type === 'array', 'Report candidates require bounded input array');
       const discovery = dependency('discovery'), reviews = dependency('reviews'), findings = dependency('findings'), verifications = dependency('verifications');
       workflowAssert(discovery.kind === 'native' && !discovery.fanout && discovery.outputSchema?.properties?.targets?.type === 'array' && discovery.outputSchema.required?.includes('targets'), 'Report requires bounded discovery targets');
       workflowAssert(reviews.kind === 'native' && reviews.fanout && findings.operation === 'collect-findings', 'Report requires review envelopes and collected findings');
-      const reviewBinding = findings.inputs.reviews;
+      const reviewBinding = findings.inputs!.reviews;
       workflowAssert('ref' in reviewBinding && reviewBinding.ref.stepId === reviews.id, 'Report findings/review source mismatch');
-      const verifyBinding = verifications.inputs.finding;
+      const verifyBinding = verifications.inputs!.finding;
       workflowAssert(verifications.kind === 'native' && verifications.fanout?.from.stepId === findings.id && verifyBinding && 'ref' in verifyBinding && verifyBinding.ref.source === 'item' && verifyBinding.ref.path.length === 0 &&
         verifications.outputSchema?.type === 'object' && ['id', 'verdict', 'reason'].every(k => verifications.outputSchema?.properties?.[k]?.type === 'string' && verifications.outputSchema.required?.includes(k)), 'Report verifier schema/source mismatch');
     }
@@ -275,15 +315,123 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
       const dep = s.fanout.from.stepId ? byId.get(s.fanout.from.stepId) : undefined;
       workflowAssert(schema ? schema.type === 'array' && schema.maxItems! <= s.fanout.maxItems : dep?.operation === 'collect-findings' && findingsBound(dep) <= s.fanout.maxItems, 'Fanout requires a bounded array source');
     }
-    for (const b of Object.values(s.inputs)) {
+    for (const b of Object.values(s.inputs!)) {
       workflowAssert(b && typeof b === 'object' && !Array.isArray(b), 'Invalid binding');
       if ('ref' in b) { keysOnly(b, ['ref']); refSchema(b.ref, s); } else { keysOnly(b, ['value']); workflowAssert(Object.hasOwn(b, 'value'), 'Binding requires value or ref'); }
     }
   }
+  if (!iterationSchema && def.version === 2) {
+    let authored = 0, expanded = 0, native = 0;
+    for (const s of def.steps) {
+      authored++; expanded += s.kind === 'repeat' ? 1 : s.fanout?.maxItems ?? 1;
+      if (s.kind === 'native') native += s.fanout?.maxItems ?? 1;
+      if (s.kind === 'repeat') for (const b of s.body!) { authored++; expanded += (b.fanout?.maxItems ?? 1) * s.maxIterations!; if (b.kind === 'native') native += (b.fanout?.maxItems ?? 1) * s.maxIterations!; }
+    }
+    workflowAssert(authored <= 16 && expanded <= 256 && native * 3 <= 256, 'Repeat expansion exceeds workflow budget');
+  }
   return def;
 }
-export function resolveWorkflowRef(ref: WorkflowRef, inputs: WorkflowJson, outputs: Record<string, WorkflowJson>, item?: WorkflowJson): WorkflowJson {
-  let value = ref.source === 'inputs' ? inputs : ref.source === 'item' ? item : outputs[ref.stepId!];
+
+function validateBoundaryBinding(binding: WorkflowBinding, def: WorkflowDefinition, schema: WorkflowSchema, boundary: WorkflowStep): WorkflowSchema | undefined {
+  workflowAssert(!('ref' in binding) || ['iteration', 'step'].includes(binding.ref.source), 'Boundary permits only body outputs and iteration');
+  let id = 'boundary'; while (def.steps.some(s => s.id === id)) id += '-';
+  // The ordinary graph validator enforces the same reference/path rules at boundaries.
+  validateDefinition({ ...def, steps: [...def.steps, { id, kind: 'aggregate', operation: 'collect', dependsOn: boundary.dependsOn, inputs: { value: binding } }] }, schema);
+  if ('value' in binding) return schemaForValue(binding.value);
+  const ref = binding.ref, dep = def.steps.find(s => s.id === ref.stepId);
+  let result = ref.source === 'iteration' ? schema : dep?.kind === 'native' && !dep.fanout ? dep.outputSchema : undefined;
+  for (const path of ref.path) result = result?.type === 'object' ? result.properties![path] : result?.type === 'array' ? result.items : undefined;
+  return result;
+}
+function schemaForValue(value: WorkflowJson): WorkflowSchema {
+  if (value === null) return { type: 'null' };
+  if (typeof value === 'boolean') return { type: 'boolean' };
+  if (typeof value === 'number') { workflowAssert(Number.isFinite(value), 'Nonfinite condition operand'); return { type: Number.isSafeInteger(value) ? 'integer' : 'number' }; }
+  if (typeof value === 'string') return { type: 'string', maxLength: value.length };
+  // Composite literals are checked directly against boundary schemas, never condition operands.
+  if (Array.isArray(value)) return { type: 'array', maxItems: value.length, items: value.length ? schemaForValue(value[0]) : { type: 'null' } };
+  return { type: 'object', properties: Object.fromEntries(Object.entries(value).map(([k, v]) => [k, schemaForValue(v)])), required: Object.keys(value), additionalProperties: false };
+}
+function validateBindingCompatibility(binding: WorkflowBinding, source: WorkflowSchema | undefined, target: WorkflowSchema): void {
+  if ('value' in binding) { validateWorkflowValue(binding.value, target); return; }
+  // Aggregate/envelope shapes have no output schema. Preserve their runtime validation.
+  if (!source) return;
+  const compatible = (from: WorkflowSchema, to: WorkflowSchema): boolean => {
+    if (from.type !== to.type && !(['number', 'integer'].includes(from.type) && ['number', 'integer'].includes(to.type))) return false;
+    if (from.type === 'object' && to.type === 'object') {
+      if (to.required?.some(k => !Object.hasOwn(from.properties!, k)) || from.required?.some(k => !Object.hasOwn(to.properties!, k))) return false;
+      return Object.entries(from.properties!).every(([k, v]) => !to.properties![k] || compatible(v, to.properties![k]));
+    }
+    if (from.type === 'array' && to.type === 'array') return !from.maxItems || !to.maxItems || compatible(from.items!, to.items!);
+    return true;
+  };
+  workflowAssert(compatible(source, target), 'Binding schema is incompatible with repeat boundary');
+}
+export function validateWorkflowCondition(condition: WorkflowCondition, binding: (binding: WorkflowBinding) => WorkflowSchema | undefined | void): void {
+  let nodes = 0;
+  const operand = (b: WorkflowBinding): string => {
+    workflowAssert(b && typeof b === 'object' && !Array.isArray(b), 'Invalid condition binding');
+    const resolved = binding(b);
+    if ('value' in b) keysOnly(b, ['value']); else { keysOnly(b, ['ref']); workflowAssert('ref' in b, 'Missing condition binding'); }
+    const schema = 'value' in b ? schemaForValue(b.value) : resolved;
+    workflowAssert(schema && ['null', 'boolean', 'number', 'integer', 'string'].includes(schema.type), 'Condition requires known primitive operand schema');
+    return schema.type === 'integer' ? 'number' : schema.type;
+  };
+  const visit = (c: WorkflowCondition, depth: number): void => {
+    workflowAssert(c && typeof c === 'object' && !Array.isArray(c) && ++nodes <= 64 && depth <= 8, 'Condition complexity exceeded');
+    switch (c.op) {
+      case 'boolean': keysOnly(c, ['op', 'value']); workflowAssert(operand(c.value) === 'boolean', 'Condition requires boolean operand'); break;
+      case 'eq': case 'ne': case 'lt': case 'lte': case 'gt': case 'gte': {
+        keysOnly(c, ['op', 'left', 'right']); const left = operand(c.left), right = operand(c.right);
+        workflowAssert(left === right && (['eq', 'ne'].includes(c.op) || left === 'number'), 'Condition operands have incompatible types'); break;
+      }
+      case 'not': keysOnly(c, ['op', 'condition']); visit(c.condition, depth + 1); break;
+      case 'all': case 'any': keysOnly(c, ['op', 'conditions']); workflowAssert(Array.isArray(c.conditions) && c.conditions.length > 0 && c.conditions.length <= 16, 'Condition child limit exceeded'); c.conditions.forEach(child => visit(child, depth + 1)); break;
+      default: workflowAssert(false, 'Unknown condition operator');
+    }
+  };
+  visit(condition, 1);
+}
+export function evaluateWorkflowCondition(condition: WorkflowCondition, resolve: (binding: WorkflowBinding) => WorkflowJson): boolean {
+  const values = new Map<WorkflowBinding, WorkflowJson>();
+  validateWorkflowCondition(condition, b => { const value = resolve(b); values.set(b, value); return schemaForValue(value); });
+  const resolved = (b: WorkflowBinding) => values.get(b)!;
+  const evaluate = (c: WorkflowCondition): boolean => {
+    switch (c.op) {
+      case 'boolean': { const value = resolved(c.value); workflowAssert(typeof value === 'boolean', 'Condition requires boolean'); return value; }
+      case 'not': return !evaluate(c.condition);
+      case 'all': case 'any': { const values = c.conditions.map(evaluate); return c.op === 'all' ? values.every(Boolean) : values.some(Boolean); }
+      default: {
+        const left = resolved(c.left), right = resolved(c.right);
+        if (c.op === 'eq' || c.op === 'ne') { workflowAssert(left === null ? right === null : typeof left === typeof right && ['boolean', 'number', 'string'].includes(typeof left), 'Condition operands have incompatible types'); const equal = left === right; return c.op === 'eq' ? equal : !equal; }
+        workflowAssert(typeof left === 'number' && Number.isFinite(left) && typeof right === 'number' && Number.isFinite(right), 'Ordered condition requires finite numbers');
+        return c.op === 'lt' ? left < right : c.op === 'lte' ? left <= right : c.op === 'gt' ? left > right : left >= right;
+      }
+    }
+  };
+  return evaluate(condition);
+}
+export interface WorkflowStepEntry { spec: WorkflowStep; step: WorkflowStepRun; blockId?: string; iterationId?: string; iterationNo?: number }
+export function workflowStepEntries(run: WorkflowRun): WorkflowStepEntry[] {
+  const entries: WorkflowStepEntry[] = [];
+  workflowAssert(run.steps.length === run.definition.steps.length && new Set(run.steps.map(s => s.id)).size === run.steps.length, 'Invalid top-level step identities');
+  run.steps.forEach(step => {
+    const spec = run.definition.steps.find(s => s.id === step.id);
+    workflowAssert(spec, 'Unknown top-level step identity'); entries.push({ spec, step });
+    for (const iteration of step.iterations ?? []) {
+      workflowAssert(spec.kind === 'repeat' && iteration.steps.length === spec.body!.length && new Set(iteration.steps.map(s => s.id)).size === iteration.steps.length, 'Invalid body step identities');
+      iteration.steps.forEach(body => {
+        const bodySpec = spec.body!.find(s => `${iteration.id}/${s.id}` === body.id);
+        workflowAssert(bodySpec, 'Unknown qualified body step identity');
+        entries.push({ spec: bodySpec, step: body, blockId: step.id, iterationId: iteration.id, iterationNo: iteration.index + 1 });
+      });
+    }
+  });
+  return entries;
+}
+
+export function resolveWorkflowRef(ref: WorkflowRef, inputs: WorkflowJson, outputs: Record<string, WorkflowJson>, item?: WorkflowJson, iteration?: WorkflowJson): WorkflowJson {
+  let value = ref.source === 'iteration' ? iteration : ref.source === 'inputs' ? inputs : ref.source === 'item' ? item : outputs[ref.stepId!];
   workflowAssert(value !== undefined, 'Missing workflow reference');
   for (const p of ref.path) { workflowAssert(value !== null && typeof value === 'object' && Object.hasOwn(value, p), 'Missing reference path'); value = (value as Record<string, WorkflowJson>)[p]; }
   workflowAssert(value !== undefined, 'Missing workflow value'); return workflowJson(value);
@@ -291,8 +439,8 @@ export function resolveWorkflowRef(ref: WorkflowRef, inputs: WorkflowJson, outpu
 export function workflowView(run: WorkflowRun): WorkflowView {
   const counts: WorkflowView['counts'] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unverified: 0 };
   const correlations: WorkflowView['correlations'] = [];
-  for (const step of run.steps) for (const unit of step.units) { counts[unit.status]++; correlations.push({ stepId: step.id, unitId: unit.id, status: unit.status, ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}) }); }
-  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...(run.error ? { error: run.error } : {}) };
+  for (const { step, blockId, iterationId, iterationNo } of workflowStepEntries(run)) for (const unit of step.units) { counts[unit.status]++; correlations.push({ ...(blockId ? { blockId, iterationId, iterationNo } : {}), stepId: step.id, unitId: unit.id, status: unit.status, ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}) }); }
+  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...(run.definition.version === 2 ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
 }
 
 const stringSchema = (maxLength: number): WorkflowSchema => ({ type: 'string', maxLength });
@@ -422,10 +570,36 @@ export function normalizeWorkflowAgent(agent: ZergAgentDefinition): ZergAgentDef
 
 /** Dependency identities include resolved output data and frozen agent policy, never mutable caller objects. */
 export function workflowUnitHash(run: WorkflowRun, spec: WorkflowStep, inputs: WorkflowJson): string {
-  return workflowHash({ definitionHash: run.definitionHash, inputs: run.inputs, step: spec, unitInputs: inputs,
+  const context = workflowStepContext(run, spec.id);
+  return workflowHash({ ...(context.iteration ? { address: spec.id, state: context.iteration.state, transitionPrefix: context.block!.iterations!.slice(0, context.iteration.index).map(i => ({ state: i.state, feedback: i.feedback, decision: i.decision })) } : {}), definitionHash: run.definitionHash, inputs: run.inputs, step: spec, unitInputs: inputs,
     agent: spec.agentId ? run.agents[spec.agentId] : null,
     dependencies: spec.dependsOn.map(id => {
-      const dep = run.steps.find(s => s.id === id)!;
+      const dep = context.steps.find(s => s.id === id)!;
       return { id, status: dep.status, units: dep.units.map(u => ({ inputHash: u.inputHash, status: u.status, result: u.result ?? null })), output: dep.output ?? null };
     }) });
+}
+
+/** A scope is only a view into the existing run ledger, never a scheduler or owner. */
+export function workflowStepContext(run: WorkflowRun, stepId: string): { steps: WorkflowStepRun[]; iteration?: WorkflowIterationRun; block?: WorkflowStepRun } {
+  for (const block of run.steps) for (const iteration of block.iterations ?? [])
+    if (iteration.steps.some(s => s.id === stepId)) return { steps: iteration.steps, iteration, block };
+  return { steps: run.steps };
+}
+export function qualifyWorkflowStep(spec: WorkflowStep, iterationId?: string): WorkflowStep {
+  return iterationId ? { ...spec, id: `${iterationId}/${spec.id}`, dependsOn: spec.dependsOn.map(id => `${iterationId}/${id}`) } : spec;
+}
+
+/** Unavailable values are materialized only for an explicitly consuming aggregate. */
+export function workflowUnavailableEnvelope(step: WorkflowStepRun): WorkflowJson {
+  if (step.skipReason === 'condition-false') return { id: step.id, status: 'skipped', skipReason: 'condition-false' };
+  const last = step.iterations?.at(-1);
+  let diagnostic: WorkflowJson | undefined;
+  if (last) {
+    diagnostic = { iterationId: last.id, iterationNo: last.index + 1, ...(last.decision !== undefined ? { decision: last.decision } : {}) };
+    if (last.feedback !== undefined) {
+      try { (diagnostic as Record<string, WorkflowJson>).feedback = workflowJson(last.feedback, WORKFLOW_LIMITS.resultBytes); }
+      catch { (diagnostic as Record<string, WorkflowJson>).feedbackHash = workflowHash(last.feedback); }
+    }
+  }
+  return workflowJson({ id: step.id, status: step.status, ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}), ...(diagnostic ? { diagnostic } : {}) });
 }

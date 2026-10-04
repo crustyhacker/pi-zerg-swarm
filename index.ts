@@ -7,7 +7,7 @@ import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { createWorkflowService } from './workflow-runtime.js';
 import { WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService } from './workflow-model.js';
-export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun } from './workflow-model.js';
+export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
@@ -6191,7 +6191,10 @@ function createOwnedWorkflowNative(
           admission.assert();
           activeRuns.set(runId, active);
           const now = (options.now ?? (() => new Date()))().toISOString();
-          const lineage = { workflowRunId: request.workflowRunId, familyId: request.familyId, attemptNo: request.attemptNo, stepId: request.stepId, unitId: request.unitId, inputHash: request.inputHash };
+          const lineage = { workflowRunId: request.workflowRunId, familyId: request.familyId, attemptNo: request.attemptNo, stepId: request.stepId, unitId: request.unitId, inputHash: request.inputHash,
+            ...(request.blockId !== undefined ? { blockId: request.blockId } : {}),
+            ...(request.iterationId !== undefined ? { iterationId: request.iterationId } : {}),
+            ...(request.iterationNo !== undefined ? { iterationNo: request.iterationNo } : {}) };
           const taskState = upsertTask(container.read(), { id: taskId, title: `Workflow ${request.stepId}/${request.unitId}`, status: 'running', ownerAgentId: runId, updatedAt: now, metadata: { workflow: lineage } });
           const started = applyRuntimeTransition(taskState, { entity: 'agent', action: 'start', id: runId, label: request.agent.label, kind: 'subagent', substate: 'starting', activity: 'read-only workflow unit', metadata: { taskId, agentDefinitionId: request.agent.id, launchMode: 'fresh', workflow: lineage } }, { now: () => new Date(now) });
           published = true;

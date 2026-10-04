@@ -318,3 +318,276 @@ test('structured list stays compact across retained attempts while internal list
     assert.equal(h.service.list()[0].counts.completed, 2); // Summary mutations cannot reach the ledger/UI.
   } finally { unsubscribe(); h.service.dispose(); }
 });
+
+function repeatDef(maxIterations = 3): WorkflowDefinition {
+  return { id: 'simple', version: 2, label: 'Repeat', inputSchema: { type: 'array', maxItems: 4, items: outputSchema }, steps: [{ id: 'loop', kind: 'repeat', dependsOn: [], initial: { value: 0 }, stateSchema: { type: 'integer' }, maxIterations,
+    body: [{ id: 'body', kind: 'native', dependsOn: [], inputs: { state: { ref: { source: 'iteration', path: [] } }, original: { ref: { source: 'inputs', path: [] } } }, agentId: 'reviewer', prompt: 'Readonly', outputSchema: { type: 'integer' } }],
+    feedback: { ref: { source: 'step', stepId: 'body', path: [] } }, until: { op: 'gte', left: { ref: { source: 'iteration', path: [] } }, right: { value: 2 } }, output: { ref: { source: 'iteration', path: [] } }, outputSchema: { type: 'integer' } }] };
+}
+
+test('v2 false branches create no units/startup; explicit skip joins retain unavailable envelope', async () => {
+  const h = harness(); h.def.version = 2; h.def.steps[0].when = { op: 'boolean', value: { value: false } }; h.def.steps[1].consumeSkips = true;
+  const id = await start(h); await h.service.drain(); const r = run(h.service, id);
+  assert.equal(h.fake.requests.length, 0); assert.equal(r.status, 'completed'); assert.deepEqual(r.steps[0].units, []); assert.equal(r.steps[0].output, undefined); assert.equal(r.steps[0].skipReason, 'condition-false');
+  assert.deepEqual(r.steps[1].output, { results: { id: 'work', status: 'skipped', skipReason: 'condition-false' } });
+  const recovered = recoverWorkflowState(h.container.read().extensions.workflows); assert.deepEqual(recoverWorkflowState(recovered), recovered);
+  const list = await h.service.execute({ action: 'workflows.list' }); assert(!('steps' in list.runs![0])); assert(!('correlations' in list.runs![0])); h.service.dispose();
+});
+
+test('v2 failures poison skip/failure-consuming aggregate runs and skips require explicit opt-in', async () => {
+  for (const failure of [false, true]) {
+    const h = harness(1); h.def.version = 2; if (!failure) h.def.steps[0].when = { op: 'boolean', value: { value: false } };
+    const id = await start(h, ['a']); if (failure) h.fake.done(0, '', 'failed'); await h.service.drain();
+    assert.equal(run(h.service, id).status, 'failed'); assert.equal(run(h.service, id).steps[1].status, failure ? 'completed' : 'skipped'); h.service.dispose();
+  }
+});
+
+test('repeat first/later convergence and bounded nonconvergence preserve feedback and exact lineage', async () => {
+  for (const values of [[2], [1, 2], [0, 0, 0]]) {
+    const h = harness(); h.def = repeatDef(); const id = await start(h, ['original']);
+    for (const [index, value] of values.entries()) {
+      assert.equal(h.fake.requests.length, index + 1); const request = h.fake.requests[index];
+      assert.equal(request.stepId, `loop@${index}/body`); assert.equal(request.unitId, `loop@${index}/body:0`); assert.equal(request.blockId, 'loop'); assert.equal(request.iterationId, `loop@${index}`); assert.equal(request.iterationNo, index + 1);
+      assert(request.prompt.includes('original')); assert(request.prompt.includes(`"state":${index ? values[index - 1] : 0}`));
+      h.fake.done(index, String(value)); await turns(12);
+    }
+    await h.service.drain(); const r = run(h.service, id), block = r.steps[0], converged = values.at(-1) === 2;
+    assert.equal(r.status, converged ? 'completed' : 'failed'); assert.equal(block.output, converged ? 2 : undefined); assert.equal(block.iterations!.length, values.length);
+    assert.equal(block.iterations!.at(-1)!.feedback, values.at(-1)); assert.equal(block.iterations!.at(-1)!.decision, converged);
+    assert.equal(block.termination, converged ? 'converged' : 'max-iterations');
+    const view = h.service.list()[0]; assert.equal(view.steps![0].maxIterations, 3); assert.equal(view.correlations.at(-1)!.iterationNo, values.length);
+    const recovered = recoverWorkflowState(h.container.read().extensions.workflows); assert.deepEqual(recoverWorkflowState(recovered), recovered); h.service.dispose();
+  }
+});
+
+test('repeat reentrant transition pause/cancel prevents next iteration admission', async () => {
+  for (const action of ['workflows.pause', 'workflows.cancel'] as const) {
+    const h = harness(); h.def = repeatDef(); let hit = false;
+    h.service.subscribe(views => { const v = views[0]; if (v && !hit && h.service.get(v.workflowRunId)?.steps[0].iterations?.[0].decision === false) { hit = true; void h.service.execute({ action, workflowRunId: v.workflowRunId }); } });
+    const id = await start(h); h.fake.done(0, '1'); await h.service.drain(); assert(hit); assert.equal(h.fake.requests.length, 1); assert.equal(run(h.service, id).steps[0].iterations!.length, 1);
+    assert.equal(run(h.service, id).status, action === 'workflows.pause' ? 'paused' : 'cancelled');
+    if (action === 'workflows.pause') { assert((await h.service.execute({ action: 'workflows.resume', workflowRunId: id })).ok); await turns(12); h.fake.done(1, '2'); await h.service.drain(); assert.equal(run(h.service, id).status, 'completed'); }
+    h.service.dispose();
+  }
+});
+
+test('repeat cancellation waits for running body cleanup; uncertain cleanup prevents transitions', async () => {
+  for (const uncertain of [false, true]) {
+    const h = harness(); h.def = repeatDef(); const id = await start(h);
+    if (!uncertain) { await h.service.execute({ action: 'workflows.cancel', workflowRunId: id }); assert.equal(run(h.service, id).status, 'cancelling'); assert(h.fake.requests[0].signal.aborted); }
+    h.fake.done(0, '1', 'completed', !uncertain);
+    if (uncertain) await assert.rejects(h.service.drain()); else await h.service.drain();
+    assert.equal(run(h.service, id).status, uncertain ? 'needs-attention' : 'cancelled'); assert.equal(h.fake.requests.length, 1); assert.equal(run(h.service, id).steps[0].iterations![0].feedback, undefined); h.service.dispose();
+  }
+});
+
+test('repeat raw recovery is recursively inert, twice stable, no fresh-service replay, and rejects tamper', async () => {
+  const h = harness(); h.def = repeatDef(); const id = await start(h); h.fake.done(0, '1'); await turns(12);
+  const raw = JSON.parse(JSON.stringify(h.container.read().extensions.workflows));
+  const recovered = recoverWorkflowState(raw); assert.equal(recovered.runs[0].status, 'needs-attention'); assert.equal(recovered.runs[0].steps[0].iterations![1].steps[0].status, 'unverified'); assert.deepEqual(recoverWorkflowState(recovered), recovered);
+  const mutations: Array<(r: WorkflowRun) => void> = [
+    r => { r.steps[0].iterations![1].index = 5; }, r => { r.steps[0].iterations![1].state = 8; },
+    r => { r.steps[0].iterations![0].feedback = 9; }, r => { r.steps[0].iterations![0].decision = true; },
+    r => { r.steps[0].iterations![0].steps[0].units[0].inputHash = '0'.repeat(64); },
+    r => { r.steps[0].iterations![0].steps[0].units[0].inputs = { state: 5 }; },
+    r => { r.steps[0].iterations![0].steps[0].units[0].cleanupSettled = false; },
+    r => { r.steps[0].iterations![0].steps[0].id = 'body'; },
+    r => { r.steps[0].iterations![0].steps[0].units[0].native = { runId: 'n', taskId: 't', unexpected: true } as never; },
+    r => { r.steps[0].output = 1; },
+  ];
+  for (const mutate of mutations) { const value = JSON.parse(JSON.stringify(raw)); mutate(value.runs[0]); assert.throws(() => recoverWorkflowState(value)); }
+  const replacement = createWorkflowService(h.container, h.fake.port); await turns(); assert.equal(h.fake.requests.length, 2); assert.equal((await replacement.execute({ action: 'workflows.resume', workflowRunId: id })).ok, false);
+  h.fake.done(1, '2'); await h.service.drain(); assert.equal(replacement.get(id)!.status, 'needs-attention'); replacement.dispose(); h.service.dispose();
+});
+
+test('repeat fanout shares original scheduler permits across iterations and concurrent runs', async () => {
+  const h = harness(); h.def = repeatDef(2);
+  const block = h.def.steps[0], body = block.body![0];
+  body.fanout = { from: { source: 'inputs', path: [] }, maxItems: 4 }; body.inputs!.item = { ref: { source: 'item', path: [] } };
+  block.feedback = { value: 2 };
+  const one = await start(h, ['a', 'b', 'c'], 2);
+  const two = await h.service.execute({ action: 'workflows.start', definitionId: 'simple', inputs: ['x', 'y'], concurrency: 2 }); assert(two.ok); await turns();
+  assert.equal(h.fake.requests.length, 2);
+  h.fake.done(0, '1'); await turns(12); assert.equal(h.fake.requests.length, 3);
+  h.fake.done(1, '1'); await turns(12); assert.equal(h.fake.requests.length, 4);
+  h.fake.done(2, '1'); await turns(12); assert.equal(h.fake.requests.length, 5);
+  h.fake.done(3, '1'); h.fake.done(4, '1'); await h.service.drain();
+  assert.equal(run(h.service, one).status, 'completed'); assert.equal(run(h.service, two.view!.workflowRunId).status, 'completed'); h.service.dispose();
+});
+
+test('repeat retry reuses exact completed addresses; changed feedback invalidates downstream iteration hashes', async () => {
+  const h = harness(); h.def = repeatDef();
+  const id = await start(h); h.fake.done(0, '1'); await turns(12); const firstHash = h.fake.requests[1].inputHash;
+  h.fake.done(1, '', 'failed'); await h.service.drain();
+  const reply = await h.service.execute({ action: 'workflows.retry', workflowRunId: id }); assert(reply.ok); await turns(12);
+  assert.equal(h.fake.requests.length, 3); assert.equal(h.fake.requests[2].stepId, 'loop@1/body'); assert.equal(h.fake.requests[2].inputHash, firstHash);
+  const retry = run(h.service, reply.view!.workflowRunId); assert.equal(retry.steps[0].iterations![0].steps[0].units[0].reusedFrom!.unitId, 'loop@0/body:0');
+  const { workflowUnitHash, qualifyWorkflowStep } = await import('../workflow-model.js');
+  const unit = retry.steps[0].iterations![1].steps[0].units[0], spec = qualifyWorkflowStep(retry.definition.steps[0].body![0], 'loop@1');
+  assert.equal(workflowUnitHash(retry, spec, unit.inputs), firstHash);
+  retry.steps[0].iterations![0].feedback = 0;
+  assert.notEqual(workflowUnitHash(retry, spec, unit.inputs), firstHash);
+  h.fake.done(2, '2'); await h.service.drain();
+  const recovered = recoverWorkflowState(h.container.read().extensions.workflows); assert.deepEqual(recoverWorkflowState(recovered), recovered); h.service.dispose();
+});
+
+test('repeat validates initial, feedback, until types and converged output without fabricating results', async () => {
+  for (const failure of ['initial', 'feedback', 'until', 'output'] as const) {
+    const h = harness(); h.def = repeatDef(); const block = h.def.steps[0];
+    if (failure === 'initial') block.initial = { value: 'bad' };
+    if (failure === 'feedback') block.feedback = { value: 'bad' };
+    if (failure === 'until') block.until = { op: 'boolean', value: { ref: { source: 'iteration', path: [] } } };
+    if (failure === 'output') block.output = { value: 'bad' };
+    const defined = await h.service.execute({ action: 'workflows.define', definition: h.def }); assert.equal(defined.ok, false); assert.equal(h.fake.requests.length, 0); h.service.dispose();
+  }
+});
+
+test('body reentrant reservation pause/cancel and admission callbacks retain one owned scheduler', async () => {
+  for (const action of ['workflows.pause', 'workflows.cancel'] as const) {
+    const h = harness(); h.def = repeatDef(); let hit = false;
+    h.service.subscribe(views => { const view = views[0]; if (view && !hit && view.counts.running > 0) { hit = true; void h.service.execute({ action, workflowRunId: view.workflowRunId }); } });
+    const id = await start(h); assert(hit); assert.equal(h.fake.requests.length, 0);
+    if (action === 'workflows.pause') { assert.equal(run(h.service, id).status, 'paused'); await h.service.execute({ action: 'workflows.resume', workflowRunId: id }); await turns(12); h.fake.done(0, '2'); }
+    await h.service.drain(); assert.equal(run(h.service, id).status, action === 'workflows.pause' ? 'completed' : 'cancelled'); h.service.dispose();
+  }
+});
+
+test('step traversal pairs exact authored identities after reorder and rejects duplicate/malformed addresses', async () => {
+  const h = harness(); h.def = repeatDef(); h.def.steps[0].body!.push({ id: 'other', kind: 'aggregate', operation: 'collect', dependsOn: [], inputs: {} });
+  const id = await start(h); h.fake.done(0, '2'); await h.service.drain();
+  const r = run(h.service, id), { workflowStepEntries } = await import('../workflow-model.js');
+  r.steps[0].iterations![0].steps.reverse();
+  const entries = workflowStepEntries(r); assert.equal(entries[1].spec.id, 'other'); assert.equal(entries[1].step.id, 'loop@0/other');
+  r.steps[0].iterations![0].steps[0].id = 'loop@0/body'; assert.throws(() => workflowStepEntries(r)); h.service.dispose();
+});
+
+test('repeat nonconvergence explicit failure report retains feedback/provenance without verified output', async () => {
+  const h = harness(); h.def = repeatDef(1);
+  h.def.steps.push({ id: 'report', kind: 'aggregate', operation: 'collect', consumeFailures: true, dependsOn: ['loop'], inputs: { loop: { ref: { source: 'step', stepId: 'loop', path: [] } } } });
+  const id = await start(h); h.fake.done(0, '1'); await h.service.drain(); const r = run(h.service, id);
+  assert.equal(r.status, 'failed'); assert.equal(r.steps[0].output, undefined); assert.equal(r.steps[1].status, 'completed');
+  assert.deepEqual((r.report as Record<string, any>).loop.diagnostic, { iterationId: 'loop@0', iterationNo: 1, feedback: 1, decision: false });
+  assert.equal((r.report as Record<string, any>).loop.termination, 'max-iterations'); assert(!('result' in (r.report as Record<string, any>).loop));
+  const recovered = recoverWorkflowState(h.container.read().extensions.workflows); assert.deepEqual(recoverWorkflowState(recovered), recovered); h.service.dispose();
+});
+
+test('repeat transition publication rechecks readonly and agent authority before creating the next iteration', async () => {
+  for (const drift of ['readonly', 'agent']) {
+    const h = harness(); h.def = repeatDef(); let hit = false;
+    h.service.subscribe(views => { const view = views[0]; if (view && !hit && h.service.get(view.workflowRunId)?.steps[0].iterations?.[0].decision === false) {
+      hit = true; const current = h.container.read();
+      if (drift === 'readonly') h.container.update({ mode: { ...current.mode, readOnly: true } });
+      else h.container.update({ agentDefinitions: { ...current.agentDefinitions, reviewer: { ...current.agentDefinitions.reviewer, prompt: 'changed' } } });
+    } });
+    const id = await start(h); h.fake.done(0, '1'); await h.service.drain(); assert(hit);
+    assert.equal(h.fake.requests.length, 1); assert.equal(run(h.service, id).steps[0].iterations!.length, 1); assert.equal(run(h.service, id).status, 'paused'); h.service.dispose();
+  }
+});
+
+test('repeat runtime validates numeric boundary refinements and optional missing until paths', async () => {
+  for (const failure of ['initial', 'feedback', 'until', 'output']) {
+    const h = harness(); h.def = repeatDef(); const block = h.def.steps[0];
+    if (failure === 'initial') { h.def.inputSchema = { type: 'number' }; block.initial = { ref: { source: 'inputs', path: [] } }; block.body![0].inputs = {}; }
+    if (failure === 'feedback') block.body![0].outputSchema = { type: 'number' };
+    if (failure === 'output') { block.stateSchema = { type: 'number' }; block.body![0].outputSchema = { type: 'number' }; block.until = { op: 'gte', left: { ref: { source: 'iteration', path: [] } }, right: { value: 1 } }; }
+    if (failure === 'until') {
+      block.initial = { value: {} }; block.stateSchema = { type: 'object', properties: { done: { type: 'boolean' } }, additionalProperties: false }; block.feedback = { value: {} };
+      block.until = { op: 'boolean', value: { ref: { source: 'iteration', path: ['done'] } } }; block.outputSchema = block.stateSchema;
+    }
+    const id = await start(h, failure === 'initial' ? 1.5 : []); if (failure !== 'initial') h.fake.done(0, failure === 'until' ? '1' : '1.5'); await h.service.drain();
+    const r = run(h.service, id); assert.equal(r.status, 'failed'); assert.equal(r.report, undefined); assert.equal(r.steps[0].output, undefined); assert.equal(r.steps[0].termination, 'invalid-transition');
+    await assertInertRecovery(h.container.read().extensions.workflows); h.service.dispose();
+  }
+});
+
+test('repeat runtime ledger budget fails before admitting an oversized next fanout', async () => {
+  const h = harness(); h.def = repeatDef(2); h.def.inputSchema = { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 900 } };
+  const block = h.def.steps[0]; block.body![0].fanout = { from: { source: 'inputs', path: [] }, maxItems: 32 }; block.feedback = { value: 1 };
+  const id = await start(h, Array(32).fill('x'.repeat(900)), 32); assert.equal(h.fake.requests.length, 32);
+  for (let i = 0; i < 32; i++) h.fake.done(i, '1'); await h.service.drain();
+  const r = run(h.service, id); assert.equal(r.status, 'failed'); assert.equal(h.fake.requests.length, 32); assert.equal(r.steps[0].output, undefined);
+  assert(Buffer.byteLength(JSON.stringify(h.container.read().extensions.workflows)) <= 2097152); recoverWorkflowState(h.container.read().extensions.workflows); h.service.dispose();
+});
+
+async function assertInertRecovery(raw: unknown) {
+  const recovered = recoverWorkflowState(raw);
+  assert.deepEqual(recoverWorkflowState(recovered), recovered);
+  const container = createZergStateContainer({ extensions: { workflows: raw } } as never);
+  let requests = 0;
+  const service = createWorkflowService(container, { preflight() {}, async execute() { requests++; throw new Error('Recovery replay'); } });
+  if (recovered.runs.some(r => !r.cleanupSettled)) await assert.rejects(service.drain(), /cleanup settlement is uncertain/);
+  else await service.drain();
+  await turns(); assert.equal(requests, 0);
+  assert.deepEqual(service.list().map(r => r.status), recovered.runs.map(r => r.status)); service.dispose();
+}
+function assertRejectedRecovery(raw: unknown, pattern: RegExp) {
+  assert.throws(() => recoverWorkflowState(raw), pattern);
+  let requests = 0;
+  const container = createZergStateContainer({ extensions: { workflows: raw } } as never);
+  assert.throws(() => createWorkflowService(container, { preflight() {}, async execute() { requests++; throw new Error('Recovery replay'); } }), pattern);
+  assert.equal(requests, 0);
+}
+
+test('raw recovery requires condition and dependency evidence for completed empty fanout', async () => {
+  for (const version of [1, 2] as const) for (const condition of [undefined, true, false]) {
+    if (version === 1 && condition !== undefined) continue;
+    const h = harness(0); h.def.version = version; h.def.steps.pop();
+    if (condition !== undefined) h.def.steps[0].when = { op: 'boolean', value: { value: condition } };
+    await start(h, []); await h.service.drain();
+    const raw = JSON.parse(JSON.stringify(h.container.read().extensions.workflows));
+    await assertInertRecovery(raw);
+    if (condition !== undefined) {
+      raw.runs[0].steps[0] = { id: 'work', status: 'completed', units: [], output: [] }; raw.runs[0].report = [];
+      assertRejectedRecovery(raw, /true condition/);
+    }
+    h.service.dispose();
+  }
+  const h = harness(0); h.def.version = 2;
+  h.def.steps = [
+    { id: 'gate', kind: 'aggregate', operation: 'collect', dependsOn: [], inputs: {}, when: { op: 'boolean', value: { value: false } } },
+    { ...h.def.steps[0], dependsOn: ['gate'] },
+  ];
+  await start(h, []); await h.service.drain();
+  const raw = JSON.parse(JSON.stringify(h.container.read().extensions.workflows)); await assertInertRecovery(raw);
+  raw.runs[0].steps[1] = { id: 'work', status: 'completed', units: [], output: [] }; raw.runs[0].report = [];
+  assertRejectedRecovery(raw, /materialized dependency/); h.service.dispose();
+});
+
+test('raw repeat recovery rejects contradictory transition errors and termination statuses', async () => {
+  const h = harness(); h.def = repeatDef(); await start(h); h.fake.done(0, '2'); await h.service.drain();
+  const raw = JSON.parse(JSON.stringify(h.container.read().extensions.workflows)); await assertInertRecovery(raw);
+  for (const mutate of [
+    (s: any) => { s.iterations[0].error = 'Transition failed'; },
+    (s: any) => { s.error = 'Transition failed'; },
+    (s: any) => { s.status = 'failed'; delete s.output; },
+    ...['invalid-transition', 'body-failed', 'cancelled', 'recovery', 'max-iterations'].map(termination => (s: any) => { s.status = 'running'; delete s.output; s.termination = termination; }),
+  ]) {
+    const forged = structuredClone(raw); mutate(forged.runs[0].steps[0]); delete forged.runs[0].report;
+    assertRejectedRecovery(forged, /repeat status|convergence|requires|nonconvergence/);
+  }
+  h.service.dispose();
+  for (const decision of [1, 2]) {
+    const paused = harness(); paused.def = repeatDef(); let hit = false;
+    paused.service.subscribe(views => { const v = views[0]; if (v && !hit && paused.service.get(v.workflowRunId)?.steps[0].iterations?.[0].decision !== undefined) { hit = true; void paused.service.execute({ action: 'workflows.pause', workflowRunId: v.workflowRunId }); } });
+    await start(paused); paused.fake.done(0, String(decision)); await paused.service.drain(); assert(hit);
+    await assertInertRecovery(paused.container.read().extensions.workflows); paused.service.dispose();
+  }
+});
+
+test('live and recovered native identities use distinct run/task namespaces', async () => {
+  const h = harness(2); h.def.version = 2; h.def.steps.pop(); let count = 0;
+  h.fake.port.execute = async request => {
+    const index = count++, identity = index === 0 ? { runId: 'same', taskId: 'same' } : { runId: 'other', taskId: 'other' };
+    request.onIdentity(identity); return { status: 'completed', text: '"ok"', cleanupSettled: true, identity };
+  };
+  await start(h, ['a', 'b']); await h.service.drain(); assert.equal(count, 2);
+  const raw = JSON.parse(JSON.stringify(h.container.read().extensions.workflows)); assert.equal(raw.runs[0].status, 'completed'); await assertInertRecovery(raw);
+  for (const key of ['runId', 'taskId']) {
+    const forged = structuredClone(raw); forged.runs[0].steps[0].units[1].native[key] = 'same';
+    assertRejectedRecovery(forged, /Duplicate native identity/);
+  }
+  const swapped = structuredClone(raw); swapped.runs[0].steps[0].units[0].native = { runId: 'a', taskId: 'b' }; swapped.runs[0].steps[0].units[1].native = { runId: 'b', taskId: 'a' };
+  const { workflowUnitEnvelope } = await import('../workflow-model.js');
+  swapped.runs[0].steps[0].output = swapped.runs[0].steps[0].units.map(workflowUnitEnvelope); swapped.runs[0].report = swapped.runs[0].steps[0].output;
+  await assertInertRecovery(swapped); h.service.dispose();
+});

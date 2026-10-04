@@ -11,7 +11,7 @@ const unit = (id = 'unit-a', status: WorkflowUnit['status'] = 'completed'): Work
 });
 const run = (id = 'workflow-a', patch: Partial<WorkflowRun> = {}): WorkflowRun => ({
   workflowRunId: id, familyId: 'family-a', attemptNo: 1, definitionHash: 'definition-hash', inputs: {}, agents: {}, concurrency: 8,
-  definition: { id: 'definition-a', version: 1, label: 'Read-only review', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, steps: [] },
+  definition: { id: 'definition-a', version: 1, label: 'Read-only review', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, steps: [{ id: 'review', kind: 'native', dependsOn: [], inputs: {} }] },
   status: 'completed', createdAt: '2026-10-04T00:00:00Z', updatedAt: '2026-10-04T00:00:01Z', admissions: 1, cleanupSettled: true, recovered: false,
   steps: [{ id: 'review', status: 'completed', units: [unit()] }], ...patch,
 });
@@ -189,4 +189,127 @@ test('public Kitty/CSI keys work; key release and mixed suffix packets cannot tr
   out(f.component); f.component.handleInput('\x1b[13u'); assert.match(out(f.component), /· steps ·/);
   f.component.handleInput('\x1b[13u'); out(f.component); f.component.handleInput('\x1b[99u');
   assert.deepEqual(f.result?.native, { runId: 'native-unit-a', taskId: 'task-unit-a' }); assert.equal(f.unsubscribed, 1);
+});
+
+function loopRun(): WorkflowRun {
+  const value = run(); value.definition.version = 2;
+  value.definition.steps = [{ id: 'loop', kind: 'repeat', dependsOn: [], maxIterations: 3,
+    body: [{ id: 'review', kind: 'native', dependsOn: [], inputs: {} }] }];
+  value.steps = [{ id: 'loop', status: 'completed', termination: 'converged', units: [], iterations: [0, 1].map(index => ({
+    id: `loop@${index}`, index, state: { private: 'STATE-ONLY-DETAIL' }, decision: index === 1,
+    steps: [{ id: `loop@${index}/review`, status: 'completed', units: [{ ...unit(`loop@${index}/review:0`), stepId: `loop@${index}/review` }] }],
+  })) }]; return value;
+}
+function loopUnits(component: ZergWorkflowComponent): void {
+  units(component); // list -> steps -> iterations
+  component.handleInput('end'); out(component); component.handleInput('enter'); out(component); // exact last iteration -> body
+  component.handleInput('enter'); out(component); // body -> units
+}
+test('repeat monitor drills iteration/body/unit by exact qualified ID and returns from native despite reorder', async () => {
+  const source = loopRun(); const f = fixture([source]); f.component.dispose(); let visits = 0;
+  await openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async factory => {
+    const component = await (factory as StructuralPiCustomFactory)() as ZergWorkflowComponent;
+    if (++visits === 1) {
+      out(component); component.handleInput('enter'); assert.match(out(component), /iteration 2\/3.*converged/);
+      component.handleInput('enter'); assert.match(out(component), /iteration loop@1.*decision true/);
+      assert.doesNotMatch(out(component), /STATE-ONLY-DETAIL/);
+      component.handleInput('end'); out(component); component.handleInput('enter'); out(component); component.handleInput('enter'); out(component); component.handleInput('c');
+    } else {
+      assert.match(out(component), /› unit loop@1\/review:0/);
+      component.handleInput('q'); assert.match(out(component), /· body ·/);
+      component.handleInput('q'); assert.match(out(component), /› iteration loop@1/);
+      component.handleInput('\x03');
+    }
+  } } }, { ...f.options, onOpenNative: async native => {
+    assert.deepEqual(native, { runId: 'native-loop@1/review:0', taskId: 'task-loop@1/review:0' });
+    source.steps[0]!.iterations!.reverse(); f.update([source]);
+  } });
+  assert.equal(visits, 2); assert.equal(f.actions.length, 0);
+});
+test('repeat monitor rejects stale iteration/native identity and renders skip/nonconvergence safely at narrow widths', () => {
+  for (const mutate of [(value: WorkflowRun) => { value.steps[0]!.iterations = []; },
+    (value: WorkflowRun) => { value.steps[0]!.iterations![1]!.steps[0]!.units[0]!.native!.taskId = 'replacement'; }]) {
+    const source = loopRun(); const f = fixture([source]); loopUnits(f.component); mutate(source); f.update([source]);
+    f.component.handleInput('c'); assert.equal(f.done, 0); assert.equal(f.actions.length, 0); f.component.dispose();
+  }
+  const source = loopRun(); source.steps[0]!.status = 'failed'; source.steps[0]!.termination = 'max-iterations'; source.definition.steps[0]!.maxIterations = 2; source.steps[0]!.iterations![1]!.decision = false;
+  source.steps[0]!.error = 'Maximum iterations reached \x1b]52;c;HIDDEN\x07';
+  const f = fixture([source]); out(f.component); f.component.handleInput('enter');
+  assert.match(out(f.component), /nonconverged/); assert.doesNotMatch(out(f.component), /HIDDEN/);
+  for (const width of [1, 2, 8, 20, 80]) for (const height of [1, 3, 8]) {
+    const lines = f.component.render(width, height); assert.ok(lines.length <= height); lines.forEach(line => assert.ok(visibleWidth(line) <= width));
+  }
+  source.steps[0]!.status = 'skipped'; source.steps[0]!.skipReason = 'condition-false'; source.steps[0]!.iterations = [];
+  f.update([source]); assert.match(out(f.component), /condition-false/); f.component.dispose();
+});
+
+for (const [status, termination, expected] of [
+  ['failed', 'body-failed', 'body-failed'],
+  ['failed', 'invalid-transition', 'invalid-transition (schema/feedback/condition/output)'],
+  ['failed', undefined, 'failed (termination unspecified)'],
+  ['cancelled', 'cancelled', 'cancelled'],
+  ['unverified', 'recovery', 'uncertain/unverified'],
+  ['cancelled', 'converged', 'cancelled'],
+  ['unverified', 'converged', 'uncertain/unverified'],
+  ['failed', 'converged', 'convergence not confirmed'],
+  ['completed', undefined, 'convergence not confirmed'],
+] as const) test(`repeat outcome ${status}/${termination} never infers convergence from a true decision`, () => {
+  const source = loopRun(); const block = source.steps[0]!;
+  block.status = status; block.termination = termination; block.error = 'exact diagnostic';
+  const f = fixture([source]); out(f.component); f.component.handleInput('enter');
+  const text = out(f.component); assert.ok(text.includes(expected), text);
+  assert.match(text, /exact diagnostic/); assert.doesNotMatch(text, / · converged|nonconverged/);
+  f.component.handleInput('enter'); assert.ok(out(f.component).includes(expected)); f.component.dispose();
+});
+
+test('repeat iteration UI is bounded at 32 and never claims recovered history is verified convergence', () => {
+  const source = loopRun(); source.recovered = true;
+  const f = fixture([source]); out(f.component); f.component.handleInput('enter');
+  assert.match(out(f.component), /uncertain\/unverified/); assert.doesNotMatch(out(f.component), / · converged/);
+  const sample = source.steps[0]!.iterations![0]!;
+  source.steps[0]!.iterations = Array.from({ length: 33 }, (_, index) => ({ ...sample, index, id: `loop@${index}`,
+    steps: [{ id: `loop@${index}/review`, status: 'completed', units: [{ ...unit(`loop@${index}/review:0`), stepId: `loop@${index}/review` }] }],
+  }));
+  f.component.handleInput('enter'); assert.match(out(f.component), /16 phases\/32 iterations\/32 units/);
+  f.component.handleInput('end'); assert.match(out(f.component), /› iteration loop@31/);
+  assert.doesNotMatch(out(f.component), /iteration loop@32/); f.component.dispose();
+});
+
+test('native return preserves exact repeat body spec across phase and body reorder', async () => {
+  const source = loopRun();
+  source.definition.steps.push({ id: 'tail', kind: 'aggregate', dependsOn: [], inputs: {} });
+  source.steps.push({ id: 'tail', status: 'completed', units: [] });
+  source.definition.steps[0]!.body!.push({ id: 'other', kind: 'aggregate', dependsOn: [], inputs: {} });
+  for (const iteration of source.steps[0]!.iterations!) iteration.steps.push({ id: `${iteration.id}/other`, status: 'completed', units: [] });
+  const f = fixture([source]); f.component.dispose(); let visits = 0;
+  await openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async factory => {
+    const component = await (factory as StructuralPiCustomFactory)() as ZergWorkflowComponent;
+    if (++visits === 1) { loopUnits(component); component.handleInput('c'); }
+    else {
+      assert.match(out(component), /› unit loop@1\/review:0/);
+      component.handleInput('q'); assert.match(out(component), /› phase loop@1\/review/);
+      component.handleInput('enter'); assert.match(out(component), /› unit loop@1\/review:0/);
+      component.handleInput('\x03');
+    }
+  } } }, { ...f.options, onOpenNative: async native => {
+    assert.deepEqual(native, { runId: 'native-loop@1/review:0', taskId: 'task-loop@1/review:0' });
+    for (const iteration of source.steps[0]!.iterations!) iteration.steps.reverse();
+    source.steps[0]!.iterations!.reverse(); source.steps.reverse(); f.update([source]);
+  } });
+  assert.equal(visits, 2); assert.equal(f.actions.length, 0);
+});
+
+test('native return refuses changed exact unit identity instead of silently accepting replacement', async () => {
+  const source = loopRun(); const f = fixture([source]); f.component.dispose(); let visits = 0;
+  await openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async factory => {
+    const component = await (factory as StructuralPiCustomFactory)() as ZergWorkflowComponent;
+    if (++visits === 1) { loopUnits(component); component.handleInput('c'); }
+    else {
+      assert.match(out(component), /Exact coding selection changed; no fallback/);
+      component.handleInput('c'); component.handleInput('x'); component.handleInput('\x03');
+    }
+  } } }, { ...f.options, onOpenNative: async () => {
+    source.steps[0]!.iterations![1]!.steps[0]!.units[0]!.native!.taskId = 'replacement'; f.update([source]);
+  } });
+  assert.equal(visits, 2); assert.equal(f.actions.length, 0);
 });

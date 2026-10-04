@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { ZergAgentDefinition, ZergStateContainer } from './types.js';
 import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, aggregateWorkflow, createReadOnlyReviewDefinition,
   freezeWorkflowData, normalizeWorkflowAgent, resolveWorkflowRef, validateReviewInputs, validateWorkflowDefinition, validateWorkflowValue,
-  workflowAssert, workflowHash, workflowJson, workflowUnitHash, workflowUnitEnvelope, workflowView } from './workflow-model.js';
+  workflowUnavailableEnvelope, evaluateWorkflowCondition, workflowStepEntries, workflowStepContext, qualifyWorkflowStep, workflowAssert, workflowHash, workflowJson, workflowUnitHash, workflowUnitEnvelope, workflowView } from './workflow-model.js';
 import type { WorkflowAction, WorkflowDefinition, WorkflowJson, WorkflowNativeIdentity, WorkflowNativeOutcome,
   WorkflowNativePort, WorkflowReply, WorkflowRun, WorkflowService, WorkflowServiceOptions, WorkflowState,
-  WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus } from './workflow-model.js';
+  WorkflowBinding, WorkflowIterationRun, WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus } from './workflow-model.js';
 
 const settled = (status: WorkflowUnitStatus) => !['queued', 'running'].includes(status);
 const terminal = (run: WorkflowRun) => ['completed', 'failed', 'cancelled', 'needs-attention'].includes(run.status);
@@ -19,11 +19,25 @@ const owners = new WeakMap<ZergStateContainer, symbol>();
 /** Non-executing recovery. Unknown/corrupt ledgers are errors, never an empty replacement. */
 export function recoverWorkflowState(value: unknown): WorkflowState {
   const state = copy(value) as WorkflowState;
+  const recoveryMutations: Array<() => void> = [];
   workflowAssert(state && state.version === 1 && Array.isArray(state.definitions) && Array.isArray(state.runs) &&
     Object.keys(state).every(k => ['version', 'definitions', 'runs'].includes(k)), 'Invalid workflow ledger');
   workflowAssert(state.definitions.length <= 16 && state.runs.length <= 16, 'Workflow retention limit exceeded');
   workflowAssert(new Set(state.definitions.map(d => d.id)).size === state.definitions.length && new Set(state.runs.map(r => r.workflowRunId)).size === state.runs.length, 'Duplicate workflow identities');
   state.definitions = state.definitions.map(validateWorkflowDefinition);
+  // Cross-attempt evidence is checked while every retained attempt is still raw.
+  for (const run of state.runs.filter(r => r.definition?.version === 2)) {
+    workflowAssert(new Set(state.runs.filter(r => r.familyId === run.familyId).map(r => r.attemptNo)).size === state.runs.filter(r => r.familyId === run.familyId).length, 'Duplicate family attempt');
+    workflowAssert(run.attemptNo === 1 ? run.retryOf === undefined && run.familyId === run.workflowRunId : typeof run.retryOf === 'string' && run.retryOf !== run.workflowRunId, 'Invalid family lineage');
+    const previous = state.runs.find(r => r.workflowRunId === run.retryOf);
+    if (previous) {
+      workflowAssert(previous.familyId === run.familyId && previous.attemptNo + 1 === run.attemptNo && previous.supersededBy === run.workflowRunId && previous.cleanupSettled && ['failed', 'cancelled'].includes(previous.status) && previous.admissions <= run.admissions && previous.definitionHash === run.definitionHash && workflowHash(previous.inputs) === workflowHash(run.inputs) && workflowHash(previous.agents) === workflowHash(run.agents), 'Invalid previous attempt evidence');
+      for (const { step } of workflowStepEntries(run)) for (const unit of step.units) if (unit.reusedFrom) {
+        const old = workflowStepEntries(previous).flatMap(e => e.step.units).find(u => u.id === unit.id);
+        workflowAssert(old && old.status === 'completed' && old.cleanupSettled && old.inputHash === unit.inputHash && workflowHash(old.result) === workflowHash(unit.result) && workflowHash(old.native) === workflowHash(unit.native), 'Reused unit lacks exact settled prior evidence');
+      }
+    }
+  }
   for (const run of state.runs) {
     const def = validateWorkflowDefinition(run.definition);
     workflowAssert(Object.keys(run).every(k => ['workflowRunId', 'familyId', 'attemptNo', 'retryOf', 'supersededBy', 'definition', 'definitionHash', 'inputs', 'agents', 'concurrency', 'status', 'createdAt', 'updatedAt', 'admissions', 'cleanupSettled', 'recovered', 'steps', 'report', 'error'].includes(k)), 'Unknown run ledger field');
@@ -38,16 +52,17 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
     workflowAssert(run.agents && typeof run.agents === 'object' && Array.isArray(run.steps) && run.steps.length === def.steps.length, 'Invalid workflow steps/agents');
     if (def.id === 'read-only-review') validateReviewInputs(run.inputs);
     if (run.report !== undefined) workflowJson(run.report);
-    const expectedAgents = [...new Set(def.steps.filter(s => s.kind === 'native').map(s => s.agentId!))].sort();
+    const expectedAgents = [...new Set(def.steps.flatMap(s => s.body ?? [s]).filter(s => s.kind === 'native').map(s => s.agentId!))].sort();
     workflowAssert(Object.keys(run.agents).sort().join(',') === expectedAgents.join(','), 'Frozen agent set mismatch');
     for (const agent of Object.values(run.agents)) normalizeWorkflowAgent(agent);
     // Check fingerprints before recovery changes any dependency status.
-    for (const [i, step] of run.steps.entries()) for (const unit of step.units)
-      workflowAssert(unit.inputHash === workflowUnitHash(run, def.steps[i], unit.inputs), 'Recovered materialized input/dependency hash mismatch');
+    if (def.version === 2) validateV2Ledger(run);
+    for (const { spec, step, iterationId } of workflowStepEntries(run)) for (const unit of step.units)
+      workflowAssert(unit.inputHash === workflowUnitHash(run, qualifyWorkflowStep(spec, iterationId), unit.inputs), 'Recovered materialized input/dependency hash mismatch');
     const ids = new Set<string>(); let live = false;
-    for (const [i, step] of run.steps.entries()) {
-      const spec = def.steps[i];
-      workflowAssert(Object.keys(step).every(k => ['id', 'status', 'units', 'output', 'error'].includes(k)), 'Unknown step ledger field');
+    for (const entry of workflowStepEntries(run)) {
+      const { step } = entry, spec = qualifyWorkflowStep(entry.spec, entry.iterationId);
+      workflowAssert(Object.keys(step).every(k => ['id', 'status', 'units', 'output', 'error', ...(def.version === 2 ? ['condition', 'skipReason', 'iterations', 'termination'] : [])].includes(k)), 'Unknown step ledger field');
       if (step.output !== undefined) workflowJson(step.output);
       workflowAssert(step.id === spec.id && Array.isArray(step.units) && step.units.length <= (spec.fanout?.maxItems ?? 1) &&
         ['queued', 'running', 'completed', 'failed', 'cancelled', 'skipped', 'unverified'].includes(step.status), 'Invalid step ledger');
@@ -66,17 +81,130 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
           workflowAssert(unit.result !== undefined && identityValid(unit.native) && unit.cleanupSettled, 'Completed unit lacks validated result/identity/settlement');
           validateWorkflowValue(workflowJson(unit.result, WORKFLOW_LIMITS.resultBytes), spec.outputSchema!);
         }
-        if (unit.status === 'running') { live = true; unit.status = 'unverified'; unit.cleanupSettled = false; unit.error = 'Recovered native work is not reconnected; settlement unverified'; }
-        if (unit.status === 'queued') { unit.status = 'skipped'; unit.error = 'Recovery disables automatic admission'; }
+        if (unit.status === 'running') { live = true; recoveryMutations.push(() => { unit.status = 'unverified'; unit.cleanupSettled = false; unit.error = 'Recovered native work is not reconnected; settlement unverified'; }); }
+        if (unit.status === 'queued') recoveryMutations.push(() => { unit.status = 'skipped'; unit.error = 'Recovery disables automatic admission'; });
       }
-      if (['running', 'queued'].includes(step.status)) { live = true; step.status = 'unverified'; step.error = 'Recovered step requires attention; no replay'; }
+      if (['running', 'queued'].includes(step.status)) { live = true; recoveryMutations.push(() => { step.status = 'unverified'; step.error = 'Recovered step requires attention; no replay'; if (def.version === 2) { step.skipReason = 'recovery'; if (spec.kind === 'repeat') step.termination = 'recovery'; } }); }
     }
     if (!terminal(run) || live || !run.cleanupSettled) {
-      run.status = 'needs-attention'; run.cleanupSettled = false; run.error = 'Recovered work is not live or reconnected; no automatic admission';
+      recoveryMutations.push(() => { run.status = 'needs-attention'; run.cleanupSettled = false; run.error = 'Recovered work is not live or reconnected; no automatic admission'; });
     }
-    run.recovered = true;
+    recoveryMutations.push(() => { run.recovered = true; });
   }
+  recoveryMutations.forEach(mutate => mutate());
   return state;
+}
+
+/** Validate the raw v2 ledger before recovery changes statuses. Never repair malformed history. */
+function validateV2Ledger(run: WorkflowRun): void {
+  const exact = (value: object, keys: string[]) => workflowAssert(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k)), 'Unknown v2 ledger field');
+  const diagnostic = (value: unknown) => workflowAssert(value === undefined || (typeof value === 'string' && value.length <= 1024), 'Invalid bounded diagnostic');
+  diagnostic(run.error);
+  workflowAssert(run.steps.every((s, i) => s.id === run.definition.steps[i].id), 'Noncontiguous top-level ledger');
+  if (!run.recovered) workflowAssert(run.cleanupSettled === workflowStepEntries(run).every(({ step }) => step.units.every(u => u.cleanupSettled)), 'Run settlement disagrees with unit ledger');
+  let count = 0, admissions = 0;
+  const runIds = new Set<string>(), taskIds = new Set<string>();
+  for (const { spec, step, iterationId } of workflowStepEntries(run)) {
+    const qualified = qualifyWorkflowStep(spec, iterationId), context = workflowStepContext(run, step.id);
+    workflowAssert(step.id === qualified.id && Array.isArray(step.units), 'Invalid qualified step');
+    diagnostic(step.error);
+    workflowAssert(step.condition === undefined || (typeof step.condition === 'boolean' && !!spec.when), 'Invalid condition decision');
+    workflowAssert(step.skipReason === undefined || ['condition-false', 'dependency', 'cancelled', 'recovery'].includes(step.skipReason), 'Invalid skip reason');
+    workflowAssert(step.termination === undefined || (spec.kind === 'repeat' && ['converged', 'max-iterations', 'body-failed', 'invalid-transition', 'cancelled', 'recovery'].includes(step.termination)), 'Invalid repeat termination');
+    const outputs: Record<string, WorkflowJson> = {};
+    for (const dep of context.steps) {
+      const id = context.iteration ? dep.id.slice(context.iteration.id.length + 1) : dep.id;
+      if (dep.output !== undefined) outputs[id] = dep.output;
+      else if (spec.consumeSkips && dep.skipReason === 'condition-false') outputs[id] = workflowUnavailableEnvelope(dep);
+      else if (spec.consumeFailures && ['failed', 'unverified'].includes(dep.status)) outputs[id] = workflowUnavailableEnvelope(dep);
+    }
+    const resolve = (b: WorkflowBinding, item?: WorkflowJson) => 'value' in b ? b.value : resolveWorkflowRef(b.ref, run.inputs, outputs, item, context.iteration?.state);
+    if (step.condition !== undefined) workflowAssert(step.condition === evaluateWorkflowCondition(spec.when!, b => resolve(b)), 'Condition decision mismatch');
+    if (step.skipReason === 'dependency') workflowAssert(step.status === 'skipped' && step.units.length === 0 && step.output === undefined && step.iterations === undefined, 'Dependency skip materialized work');
+    if (step.condition === false || step.skipReason === 'condition-false') workflowAssert(step.condition === false && step.skipReason === 'condition-false' && step.status === 'skipped' && step.units.length === 0 && step.output === undefined && step.iterations === undefined, 'False condition must have no materialized work');
+    if (step.units.length || step.iterations?.length || step.status === 'completed') {
+      workflowAssert(!spec.when || step.condition === true, 'Materialized step lacks true condition');
+      for (const id of qualified.dependsOn) {
+        const dep = context.steps.find(d => d.id === id)!;
+        workflowAssert(dep.status === 'completed' || (spec.kind === 'aggregate' && (dep.skipReason === 'condition-false' ? spec.consumeSkips : spec.consumeFailures && ['failed', 'unverified'].includes(dep.status))), 'Invalid materialized dependency');
+      }
+    }
+    if (spec.kind === 'repeat') {
+      count++;
+      workflowAssert(step.units.length === 0 && (step.iterations === undefined || Array.isArray(step.iterations)), 'Repeat cannot own native units');
+      const iterations = step.iterations ?? [];
+      workflowAssert(iterations.length <= spec.maxIterations!, 'Iteration limit exceeded');
+      if (['running', 'completed'].includes(step.status)) workflowAssert(iterations.length > 0, 'Repeat missing iteration ledger');
+      for (const [index, iteration] of iterations.entries()) {
+        exact(iteration, ['id', 'index', 'state', 'steps', 'feedback', 'decision', 'error']); diagnostic(iteration.error);
+        if (iteration.error !== undefined) workflowAssert(index === iterations.length - 1 && step.status === 'failed' && ['invalid-transition', 'body-failed', 'max-iterations'].includes(step.termination!), 'Transition error contradicts repeat status');
+        workflowAssert(iteration.index === index && iteration.id === `${step.id}@${index}` && Array.isArray(iteration.steps) && iteration.steps.length === spec.body!.length, 'Invalid iteration identity/count');
+        workflowAssert(iteration.steps.every((s, i) => s.id === `${iteration.id}/${spec.body![i].id}`), 'Noncontiguous body ledger');
+        validateWorkflowValue(iteration.state, spec.stateSchema!);
+        const previous = iterations[index - 1];
+        if (previous) workflowAssert(previous.decision === false && previous.feedback !== undefined && !previous.error && previous.steps.every(s => (s.status === 'completed' || s.skipReason === 'condition-false') && s.units.every(u => u.cleanupSettled)), 'Iteration after failed/uncertain transition');
+        workflowAssert(workflowHash(iteration.state) === workflowHash(previous ? previous.feedback : resolve(spec.initial!)), 'Iteration state continuity mismatch');
+        const bodyOutputs = Object.fromEntries(iteration.steps.filter(s => s.status === 'completed' && s.output !== undefined).map(s => [s.id.slice(iteration.id.length + 1), s.output!]));
+        const boundary = (b: WorkflowBinding, state: WorkflowJson) => 'value' in b ? b.value : resolveWorkflowRef(b.ref, run.inputs, bodyOutputs, undefined, state);
+        if (iteration.feedback !== undefined) {
+          workflowAssert(iteration.steps.every(s => (s.status === 'completed' || s.skipReason === 'condition-false') && s.units.every(u => u.cleanupSettled)), 'Feedback after failed/uncertain body');
+          validateWorkflowValue(iteration.feedback, spec.stateSchema!);
+          workflowAssert(workflowHash(iteration.feedback) === workflowHash(boundary(spec.feedback!, iteration.state)), 'Feedback mismatch');
+        }
+        if (iteration.decision !== undefined) {
+          workflowAssert(typeof iteration.decision === 'boolean' && iteration.feedback !== undefined && iteration.decision === evaluateWorkflowCondition(spec.until!, b => boundary(b, iteration.feedback!)), 'Invalid transition decision');
+          if (iteration.decision) workflowAssert(index === iterations.length - 1, 'Iteration after convergence');
+        }
+      }
+      if (step.status === 'completed') {
+        const last = iterations.at(-1)!;
+        workflowAssert(last?.decision === true && last.error === undefined && step.error === undefined && step.output !== undefined && step.termination === 'converged', 'Completed repeat lacks convergence');
+        validateWorkflowValue(step.output, spec.outputSchema!);
+        const bodyOutputs = Object.fromEntries(last.steps.filter(s => s.status === 'completed' && s.output !== undefined).map(s => [s.id.slice(last.id.length + 1), s.output!]));
+        const expected = 'value' in spec.output! ? spec.output!.value : resolveWorkflowRef(spec.output!.ref, run.inputs, bodyOutputs, undefined, last.feedback);
+        workflowAssert(workflowHash(step.output) === workflowHash(expected), 'Repeat output mismatch');
+      } else workflowAssert(step.output === undefined, 'Unconverged repeat has output');
+      if (step.termination === 'converged') workflowAssert(step.status === 'completed', 'Convergence requires completed repeat');
+      if (step.termination === 'invalid-transition' || step.termination === 'body-failed') workflowAssert(step.status === 'failed', 'Failed termination requires failed repeat');
+      if (step.termination === 'cancelled') workflowAssert(step.status === 'cancelled', 'Cancelled termination requires cancelled repeat');
+      if (step.termination === 'recovery') workflowAssert(step.status === 'unverified', 'Recovery termination requires unverified repeat');
+      if (step.termination === 'max-iterations') workflowAssert(step.status === 'failed' && iterations.length === spec.maxIterations && iterations.at(-1)?.decision === false, 'Invalid nonconvergence');
+      continue;
+    }
+    workflowAssert(step.iterations === undefined, 'Nonrepeat has iterations');
+    let items: WorkflowJson[] = [null];
+    if (spec.fanout && (step.units.length || step.status === 'completed')) {
+      const source = resolveWorkflowRef(spec.fanout.from, run.inputs, outputs, undefined, context.iteration?.state);
+      workflowAssert(Array.isArray(source) && source.length <= spec.fanout.maxItems, 'Invalid recovered fanout'); items = source;
+    }
+    if (step.units.length || step.status === 'completed') workflowAssert(step.units.length === items.length, 'Materialized unit count mismatch');
+    count += step.units.length;
+    for (const [index, unit] of step.units.entries()) {
+      diagnostic(unit.error);
+      workflowAssert(unit.result === undefined || unit.status === 'completed', 'Uncompleted unit has result');
+      workflowAssert(unit.status !== 'running' || (spec.kind === 'native' && !unit.cleanupSettled), 'Running unit has invalid ownership');
+      const inputs = Object.fromEntries(Object.entries(spec.inputs!).map(([key, b]) => [key, resolve(b, spec.fanout ? items[index] : undefined)]));
+      workflowAssert(workflowHash(inputs) === workflowHash(unit.inputs), 'Materialized unit inputs mismatch');
+      if (unit.native) {
+        exact(unit.native, ['runId', 'taskId']);
+        workflowAssert(!runIds.has(unit.native.runId) && !taskIds.has(unit.native.taskId), 'Duplicate native identity');
+        runIds.add(unit.native.runId); taskIds.add(unit.native.taskId);
+        if (!unit.reusedFrom) admissions++;
+      }
+      if (unit.reusedFrom) { exact(unit.reusedFrom, ['workflowRunId', 'unitId', 'native']); exact(unit.reusedFrom.native, ['runId', 'taskId']); workflowAssert(unit.reusedFrom.workflowRunId === run.retryOf && unit.reusedFrom.unitId === unit.id && unit.status === 'completed' && unit.cleanupSettled && workflowHash(unit.reusedFrom.native) === workflowHash(unit.native), 'Invalid native reuse'); }
+      if (unit.result !== undefined && spec.kind === 'native') validateWorkflowValue(unit.result, spec.outputSchema!);
+      if (unit.status === 'completed') workflowAssert(unit.cleanupSettled && unit.result !== undefined, 'Completed unit lacks settled result');
+      if (spec.kind === 'aggregate' && unit.status === 'completed') workflowAssert(workflowHash(unit.result) === workflowHash(aggregateWorkflow(spec.operation!, inputs)), 'Aggregate result mismatch');
+    }
+    if (step.status === 'completed') {
+      workflowAssert(step.units.every(u => u.status === 'completed') && step.output !== undefined, 'Completed step inconsistent');
+      const expected = spec.fanout ? step.units.map(workflowUnitEnvelope) : step.units[0].result;
+      workflowAssert(workflowHash(expected) === workflowHash(step.output), 'Step output mismatch');
+    }
+  }
+  workflowAssert(count <= 256 && admissions <= run.admissions, 'Runtime expansion/admission mismatch');
+  if (run.report !== undefined) workflowAssert(run.steps.at(-1)?.output !== undefined && workflowHash(run.report) === workflowHash(run.steps.at(-1)!.output), 'Report does not match final output');
+  if (run.status === 'completed') workflowAssert(workflowStepEntries(run).every(({ step }) => step.status === 'completed' || step.skipReason === 'condition-false') && run.cleanupSettled, 'Completed workflow contains failure');
 }
 
 /** One owned scheduler; no SDK, tools, files, eval, arbitrary loops or automatic retries. */
@@ -129,7 +257,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   const freezeAgents = (def: WorkflowDefinition): Record<string, ZergAgentDefinition> => {
     const agents: Record<string, ZergAgentDefinition> = {};
-    for (const step of def.steps) if (step.kind === 'native' && !agents[step.agentId!]) {
+    for (const step of def.steps.flatMap(s => s.body ?? [s])) if (step.kind === 'native' && !agents[step.agentId!]) {
       const source = container.read().agentDefinitions[step.agentId!];
       workflowAssert(source, 'Workflow agent definition not found'); const agent = normalizeWorkflowAgent(source);
       workflowAssert(agent && typeof agent.model === 'string' && agent.model.trim().length > 0, 'Workflow agents require an explicit model');
@@ -142,10 +270,10 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   const cancelRun = (run: WorkflowRun) => {
     if (terminal(run) && run.cleanupSettled) return;
     run.status = 'cancelling'; stamp(run);
-    for (const step of run.steps) {
+    for (const { spec, step } of workflowStepEntries(run)) {
       for (const unit of step.units) if (unit.status === 'queued') { unit.status = 'cancelled'; unit.cleanupSettled = true; }
-      if (step.status === 'queued') { step.status = 'cancelled'; step.output = { status: 'cancelled', error: 'Workflow cancellation before admission' }; }
-      else if (step.units.length) outputStep(run.definition.steps.find(s => s.id === step.id)!, step);
+      if (step.status === 'queued' || (spec.kind === 'repeat' && step.status === 'running')) { step.status = 'cancelled'; if (run.definition.version === 2) { step.skipReason = 'cancelled'; if (spec.kind === 'repeat') step.termination = 'cancelled'; } else step.output = { status: 'cancelled', error: 'Workflow cancellation before admission' }; }
+      else if (step.units.length) outputStep(spec, step);
     }
     active.forEach(a => { if (a.run === run) a.controller.abort(); });
     finishRun(run); persist(); schedule();
@@ -157,10 +285,22 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     abortListeners.set(run.workflowRunId, () => signal.removeEventListener('abort', cancel));
     if (signal.aborted) cancel();
   };
-  const outputsFor = (run: WorkflowRun): Record<string, WorkflowJson> => Object.fromEntries(run.steps.filter(s => s.output !== undefined).map(s => [s.id, s.output!]));
+  const outputsFor = (run: WorkflowRun, spec?: WorkflowStep): Record<string, WorkflowJson> => {
+    const context = workflowStepContext(run, spec?.id ?? '');
+    const outputs: Record<string, WorkflowJson> = {};
+    for (const step of context.steps) {
+      const id = context.iteration ? step.id.slice(context.iteration.id.length + 1) : step.id;
+      if (step.output !== undefined) outputs[id] = step.output;
+      else if (spec?.consumeSkips && step.skipReason === 'condition-false') outputs[id] = workflowUnavailableEnvelope(step);
+      else if (spec?.consumeFailures && ['failed', 'unverified'].includes(step.status)) outputs[id] = workflowUnavailableEnvelope(step);
+    }
+    return outputs;
+  };
+  const bindingValue = (run: WorkflowRun, spec: WorkflowStep, binding: WorkflowBinding, item?: WorkflowJson): WorkflowJson =>
+    'value' in binding ? binding.value : resolveWorkflowRef(binding.ref, run.inputs, outputsFor(run, spec), item, workflowStepContext(run, spec.id).iteration?.state);
   const materialize = (run: WorkflowRun, spec: WorkflowStep, item?: WorkflowJson): Record<string, WorkflowJson> => {
-    const outputs = outputsFor(run), inputs: Record<string, WorkflowJson> = {};
-    for (const [key, binding] of Object.entries(spec.inputs)) inputs[key] = 'value' in binding ? binding.value : resolveWorkflowRef(binding.ref, run.inputs, outputs, item);
+    const inputs: Record<string, WorkflowJson> = {};
+    for (const [key, binding] of Object.entries(spec.inputs!)) inputs[key] = bindingValue(run, spec, binding, item);
     return freezeWorkflowData(inputs, WORKFLOW_LIMITS.promptBytes);
   };
   const hashUnit = workflowUnitHash;
@@ -178,13 +318,13 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   function finishRun(run: WorkflowRun) {
     if (terminal(run)) return;
-    if (run.steps.some(s => s.units.some(u => !u.cleanupSettled && settled(u.status)))) {
+    if (workflowStepEntries(run).some(({ step: s }) => s.units.some(u => !u.cleanupSettled && settled(u.status)))) {
       run.status = 'needs-attention'; run.cleanupSettled = false; stamp(run); return;
     }
-    if (run.steps.some(s => !settled(s.status))) {
-      run.cleanupSettled = run.steps.every(s => s.units.every(u => u.cleanupSettled)); return;
+    if (workflowStepEntries(run).some(({ step: s }) => !settled(s.status))) {
+      run.cleanupSettled = workflowStepEntries(run).every(({ step: s }) => s.units.every(u => u.cleanupSettled)); return;
     }
-    run.cleanupSettled = run.steps.every(s => s.units.every(u => u.cleanupSettled));
+    run.cleanupSettled = workflowStepEntries(run).every(({ step: s }) => s.units.every(u => u.cleanupSettled));
     if (!run.cleanupSettled) run.status = 'needs-attention';
     else if (run.status === 'cancelling') run.status = 'cancelled';
     else {
@@ -195,7 +335,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         catch (error) { delete run.report; run.error = errorText(error); run.status = 'failed'; stamp(run); return; }
       }
       const partial = run.report && typeof run.report === 'object' && !Array.isArray(run.report) && run.report.partial === true;
-      run.status = run.steps.every(s => s.status === 'completed') && !partial ? 'completed' : 'failed';
+      run.status = workflowStepEntries(run).every(({ step: s }) => s.status === 'completed' || (run.definition.version === 2 && s.skipReason === 'condition-false')) && !partial ? 'completed' : 'failed';
     }
     stamp(run); abortListeners.get(run.workflowRunId)?.(); abortListeners.delete(run.workflowRunId);
   }
@@ -205,7 +345,8 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   const reuse = (run: WorkflowRun, unit: WorkflowUnit, spec: WorkflowStep) => {
     if (!run.retryOf || spec.kind !== 'native') return;
-    const old = state.runs.find(r => r.workflowRunId === run.retryOf)?.steps.find(s => s.id === spec.id)?.units.find(u => u.index === unit.index && u.inputHash === unit.inputHash && u.status === 'completed' && u.cleanupSettled && u.native && u.result !== undefined);
+    const previous = state.runs.find(r => r.workflowRunId === run.retryOf);
+    const old = previous && workflowStepEntries(previous).find(e => e.step.id === spec.id)?.step.units.find(u => u.index === unit.index && u.inputHash === unit.inputHash && u.status === 'completed' && u.cleanupSettled && u.native && u.result !== undefined);
     if (!old) return;
     validateWorkflowValue(old.result!, spec.outputSchema!); budgetResult(unit, freezeWorkflowData(old.result!, WORKFLOW_LIMITS.resultBytes));
     unit.status = 'completed'; unit.native = copy(old.native!); unit.cleanupSettled = true;
@@ -213,9 +354,25 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   const prepare = (run: WorkflowRun, spec: WorkflowStep, step: WorkflowStepRun) => {
     try {
-      const failedDependencies = spec.dependsOn.some(id => run.steps.find(s => s.id === id)!.status !== 'completed');
-      if (failedDependencies && !(spec.kind === 'aggregate' && spec.consumeFailures)) {
-        step.status = 'skipped'; step.error = 'Dependency did not complete successfully'; step.output = workflowJson({ status: 'skipped', error: step.error }); return;
+      const scope = workflowStepContext(run, spec.id);
+      const failedDependencies = spec.dependsOn.some(id => {
+        const dependency = scope.steps.find(s => s.id === id)!;
+        if (dependency.status === 'completed') return false;
+        if (run.definition.version === 1) return !(spec.kind === 'aggregate' && spec.consumeFailures);
+        if (spec.kind !== 'aggregate') return true;
+        return dependency.skipReason === 'condition-false' ? !spec.consumeSkips : !(spec.consumeFailures && ['failed', 'unverified'].includes(dependency.status));
+      });
+      if (failedDependencies) {
+        step.status = 'skipped'; step.error = 'Dependency did not complete successfully';
+        if (run.definition.version === 2) step.skipReason = 'dependency'; else step.output = workflowJson({ status: 'skipped', error: step.error }); return;
+      }
+      if (spec.when) {
+        step.condition = evaluateWorkflowCondition(spec.when, b => bindingValue(run, spec, b));
+        if (!step.condition) { step.status = 'skipped'; step.skipReason = 'condition-false'; return; }
+      }
+      if (spec.kind === 'repeat') {
+        const initial = freezeWorkflowData(bindingValue(run, spec, spec.initial!)); validateWorkflowValue(initial, spec.stateSchema!);
+        step.iterations = []; step.status = 'running'; appendIteration(spec, step, initial); return;
       }
       if (spec.kind === 'aggregate') {
         const inputs = materialize(run, spec), unit: WorkflowUnit = { id: `${spec.id}:0`, stepId: spec.id, index: 0, status: 'running', inputHash: hashUnit(run, spec, inputs), inputs, cleanupSettled: true };
@@ -224,7 +381,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       }
       let items: WorkflowJson[] = [null];
       if (spec.fanout) {
-        const source = resolveWorkflowRef(spec.fanout.from, run.inputs, outputsFor(run));
+        const source = resolveWorkflowRef(spec.fanout.from, run.inputs, outputsFor(run, spec), undefined, workflowStepContext(run, spec.id).iteration?.state);
         workflowAssert(Array.isArray(source) && source.length <= spec.fanout.maxItems, 'Runtime fanout exceeds declared bound'); items = source;
       }
       step.units = items.map((item, index) => {
@@ -232,11 +389,55 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         const unit: WorkflowUnit = { id: `${spec.id}:${index}`, stepId: spec.id, index, status: 'queued', inputHash: hashUnit(run, spec, inputs), inputs, cleanupSettled: true };
         reuse(run, unit, spec); return unit;
       });
+      if (run.definition.version === 2) {
+        try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch (error) { step.units = []; throw error; }
+      }
       if (!step.units.length) { step.status = 'completed'; step.output = []; } else outputStep(spec, step);
     } catch (error) {
-      step.status = 'failed'; step.error = errorText(error); step.output = workflowJson({ status: 'failed', error: step.error });
+      step.status = 'failed'; step.error = errorText(error); if (spec.kind === 'repeat') step.termination = 'invalid-transition'; if (spec.kind !== 'repeat') step.output = workflowJson({ status: 'failed', error: step.error });
       step.units.forEach(u => { if (!settled(u.status)) { u.status = 'failed'; u.cleanupSettled = true; u.error = step.error; } });
+      if (run.definition.version === 2) {
+        try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch { step.units = []; delete step.output; }
+      }
     }
+  };
+  const lineage = (run: WorkflowRun, id: string) => {
+    const context = workflowStepContext(run, id);
+    return context.iteration ? { blockId: context.block!.id, iterationId: context.iteration.id, iterationNo: context.iteration.index + 1 } : {};
+  };
+  const appendIteration = (spec: WorkflowStep, step: WorkflowStepRun, value: WorkflowJson) => {
+    const index = step.iterations!.length, id = `${step.id}@${index}`;
+    const iteration: WorkflowIterationRun = { id, index, state: freezeWorkflowData(value), steps: spec.body!.map(s => ({ id: `${id}/${s.id}`, status: 'queued', units: [] })) };
+    step.iterations!.push(iteration);
+    try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch (error) { step.iterations!.pop(); throw error; }
+  };
+  const advanceRepeat = (run: WorkflowRun, spec: WorkflowStep, step: WorkflowStepRun): boolean => {
+    const iteration = step.iterations!.at(-1)!;
+    if (!iteration.steps.every(s => settled(s.status))) return false;
+    try {
+      workflowAssert(iteration.steps.every(s => s.units.every(u => u.cleanupSettled)), 'Repeat body cleanup is uncertain');
+      workflowAssert(iteration.steps.every(s => s.status === 'completed' || s.skipReason === 'condition-false'), 'Repeat body did not complete successfully');
+      const outputs = Object.fromEntries(iteration.steps.filter(s => s.status === 'completed' && s.output !== undefined).map(s => [s.id.slice(iteration.id.length + 1), s.output!]));
+      const resolve = (b: WorkflowBinding, value: WorkflowJson) => 'value' in b ? b.value : resolveWorkflowRef(b.ref, run.inputs, outputs, undefined, value);
+      if (iteration.decision === undefined) {
+        const feedback = freezeWorkflowData(resolve(spec.feedback!, iteration.state)); validateWorkflowValue(feedback, spec.stateSchema!);
+        iteration.feedback = feedback;
+        iteration.decision = evaluateWorkflowCondition(spec.until!, b => resolve(b, feedback));
+        try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch (error) { delete iteration.feedback; delete iteration.decision; throw error; }
+        // Publish the transition before admitting another iteration; observers may pause/cancel.
+        stamp(run); persist();
+      }
+      if (run.status !== 'running') return true;
+      try { authority(run); } catch (error) { run.status = 'paused'; run.error = errorText(error); return true; }
+      if (iteration.decision) {
+        const output = resolve(spec.output!, iteration.feedback!); validateWorkflowValue(output, spec.outputSchema!);
+        setOutput(step, output); step.status = 'completed'; step.termination = 'converged';
+      } else {
+        if (step.iterations!.length >= spec.maxIterations!) { step.termination = 'max-iterations'; throw new Error('Repeat did not converge within maxIterations'); }
+        appendIteration(spec, step, iteration.feedback!);
+      }
+    } catch (error) { iteration.error = errorText(error); step.error = iteration.error; step.termination ??= iteration.steps.some(s => !['completed', 'skipped'].includes(s.status)) ? 'body-failed' : 'invalid-transition'; step.status = 'failed'; delete step.output; }
+    return true;
   };
   const runActiveCount = (run: WorkflowRun) => [...active.values()].filter(a => a.run === run).length;
   const globalCap = () => Math.min(32, ...state.runs.filter(r => !terminal(r) || !r.cleanupSettled).map(r => r.concurrency));
@@ -257,10 +458,10 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       active.set(key, { run, unit, controller }); stamp(run); persist(); assertAdmission();
       const onIdentity = (identity: WorkflowNativeIdentity) => {
         workflowAssert(identityValid(identity) && !unit.native, 'Missing/duplicate/invalid native identity');
-        workflowAssert(!state.runs.some(r => r.steps.some(s => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === identity.runId || u.native.taskId === identity.taskId)))), 'Native identity collision');
+        workflowAssert(!state.runs.some(r => workflowStepEntries(r).some(({ step: s }) => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === identity.runId || u.native.taskId === identity.taskId)))), 'Native identity collision');
         unit.native = copy(identity); persist(); assertAdmission();
       };
-      const operation = Promise.resolve().then(() => { assertAdmission(); invoked = true; return port.execute({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash,
+      const operation = Promise.resolve().then(() => { assertAdmission(); invoked = true; return port.execute({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...lineage(run, spec.id), stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash,
         agent: freezeWorkflowData(run.agents[spec.agentId!], WORKFLOW_LIMITS.definitionBytes), prompt, signal: controller.signal, assertAdmission, onIdentity }); })
         .then(outcome => complete(outcome), error => complete({ status: invoked ? 'unverified' : 'cancelled', error: errorText(error), cleanupSettled: !invoked }))
         .finally(() => { pending.delete(operation); schedule(); });
@@ -327,12 +528,16 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         for (const run of state.runs) {
           if (run.status !== 'running') continue;
           try { authority(run); } catch (error) { run.status = 'paused'; run.error = errorText(error); stamp(run); persist(); continue; }
-          for (const [index, spec] of run.definition.steps.entries()) {
+          for (const entry of workflowStepEntries(run)) {
             if (run.status !== 'running') break;
-            const step = run.steps[index];
-            if (step.status === 'queued' && spec.dependsOn.every(id => settled(run.steps.find(s => s.id === id)!.status))) {
+            const spec = qualifyWorkflowStep(entry.spec, entry.iterationId), step = entry.step;
+            if (entry.blockId && run.steps.find(s => s.id === entry.blockId)!.status !== 'running') continue;
+            const scope = workflowStepContext(run, step.id);
+            if (step.status === 'queued' && spec.dependsOn.every(id => settled(scope.steps.find(s => s.id === id)!.status))) {
               prepare(run, spec, step); stamp(run); persist(); progress = true;
             }
+            if (run.status !== 'running') break;
+            if (spec.kind === 'repeat' && step.status === 'running' && advanceRepeat(run, spec, step)) { stamp(run); persist(); progress = true; }
             if (run.status !== 'running') break;
             for (const unit of step.units) {
               if (run.status !== 'running' || active.size >= globalCap() || runActiveCount(run) >= run.concurrency) break;
@@ -372,7 +577,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       workflowAssert(Object.keys(input).every(k => k === 'action' || (allowed[action] ?? ['workflowRunId']).includes(k)), 'Unknown workflow action field');
       if (action === 'workflows.list') {
         // Rich internal/UI views stay intact; default tool context carries attempts, not every unit identity.
-        const runs = list().map(({ correlations, ...summary }) => summary);
+        const runs = list().map(({ correlations, steps, ...summary }) => summary);
         return { ok: true, action, runs, definitions: state.definitions.map(d => ({ id: d.id, label: d.label, stepCount: d.steps.length })) };
       }
       if (input.action === 'workflows.show') {

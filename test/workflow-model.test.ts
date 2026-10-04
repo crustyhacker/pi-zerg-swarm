@@ -7,7 +7,7 @@ import type { WorkflowDefinition, WorkflowJson, WorkflowSchema } from '../workfl
 
 const text: WorkflowSchema = { type: 'string', maxLength: 100 };
 const closed: WorkflowSchema = { type: 'object', properties: {}, required: [], additionalProperties: false };
-function def(): WorkflowDefinition { return { id: 'test', version: 1, label: 'Test', inputSchema: closed, steps: [
+function def(): WorkflowDefinition { return { id: 'test', version: 1, label: 'Test', inputSchema: structuredClone(closed), steps: [
   { id: 'one', kind: 'native', agentId: 'reviewer', prompt: 'Readonly', dependsOn: [], inputs: {}, outputSchema: text },
 ] }; }
 
@@ -120,9 +120,78 @@ test('aggregate argument schemas and dependent finding expansion reject before a
     d => { d.steps[2].consumeFailures = false; },
     d => { d.steps[1].outputSchema!.properties!.findings.maxItems = 3; },
     d => { d.steps[3].fanout!.maxItems = 31; },
-    d => { d.steps[4].inputs.candidates = { value: 1 }; },
-    d => { d.steps[4].inputs.discovery = { ref: { source: 'step', stepId: 'review', path: [] } }; },
-    d => { d.steps[3].inputs.finding = { value: 'wrong source' }; },
+    d => { d.steps[4].inputs!.candidates = { value: 1 }; },
+    d => { d.steps[4].inputs!.discovery = { ref: { source: 'step', stepId: 'review', path: [] } }; },
+    d => { d.steps[3].inputs!.finding = { value: 'wrong source' }; },
   ];
   for (const mutate of variants) { const d = JSON.parse(JSON.stringify(createReadOnlyReviewDefinition())) as WorkflowDefinition; mutate(d); assert.throws(() => validateWorkflowDefinition(d)); }
+});
+
+test('v2 conditions evaluate every operator without hiding missing operands', async () => {
+  const { evaluateWorkflowCondition: evaluate } = await import('../workflow-model.js');
+  const resolve = (b: import('../workflow-model.js').WorkflowBinding) => 'value' in b ? b.value : resolveWorkflowRef(b.ref, {}, {});
+  for (const [op, expected] of [['eq', false], ['ne', true], ['lt', true], ['lte', true], ['gt', false], ['gte', false]] as const)
+    assert.equal(evaluate({ op, left: { value: 1 }, right: { value: 2 } }, resolve), expected);
+  for (const value of [null, true, 2, 's']) assert.equal(evaluate({ op: 'eq', left: { value }, right: { value } }, resolve), true);
+  for (const value of [[1], { a: 1 }]) assert.throws(() => evaluate({ op: 'eq', left: { value }, right: { value } }, resolve));
+  assert.throws(() => evaluate({ op: 'ne', left: { value: 1 }, right: { value: '1' } }, resolve));
+  assert.equal(evaluate({ op: 'not', condition: { op: 'boolean', value: { value: true } } }, resolve), false);
+  for (const op of ['all', 'any'] as const) {
+    assert.equal(evaluate({ op, conditions: [{ op: 'boolean', value: { value: true } }, { op: 'boolean', value: { value: false } }] }, resolve), op === 'any');
+    assert.throws(() => evaluate({ op, conditions: [{ op: 'boolean', value: { value: op === 'any' } }, { op: 'boolean', value: { ref: { source: 'inputs', path: ['missing'] } } }] }, resolve), /Missing/);
+  }
+  for (const value of [null, 1, 'true', [], {}]) assert.throws(() => evaluate({ op: 'boolean', value: { value } }, resolve));
+  for (const value of [null, true, '1', [], {}]) assert.throws(() => evaluate({ op: 'lt', left: { value }, right: { value: 2 } }, resolve));
+});
+
+test('v2 condition syntax, depth, nodes, children, refs and v1 opt-in remain strict', async () => {
+  const { validateWorkflowCondition } = await import('../workflow-model.js');
+  const leaf: import('../workflow-model.js').WorkflowCondition = { op: 'boolean', value: { value: true } };
+  let deep: import('../workflow-model.js').WorkflowCondition = leaf;
+  for (let i = 0; i < 7; i++) deep = { op: 'not', condition: deep };
+  validateWorkflowCondition(deep, () => {});
+  assert.throws(() => validateWorkflowCondition({ op: 'not', condition: deep }, () => {}));
+  assert.throws(() => validateWorkflowCondition({ op: 'all', conditions: Array(17).fill(leaf) }, () => {}));
+  assert.throws(() => validateWorkflowCondition({ op: 'all', conditions: Array(4).fill({ op: 'all', conditions: Array(16).fill(leaf) }) }, () => {}));
+  for (const when of [null, false, { ...leaf, extra: 1 }, { op: 'bogus' }]) { const d = def(); d.version = 2; d.steps[0].when = when as never; assert.throws(() => validateWorkflowDefinition(d)); }
+  const d = def(); d.steps[0].when = leaf; assert.throws(() => validateWorkflowDefinition(d)); d.version = 2; validateWorkflowDefinition(d);
+  d.steps[0].when = { op: 'boolean', value: { ref: { source: 'item', path: [] } } }; assert.throws(() => validateWorkflowDefinition(d));
+  d.steps[0].when = { op: 'boolean', value: { ref: { source: 'iteration', path: [] } } }; assert.throws(() => validateWorkflowDefinition(d));
+  d.steps[0].when = { op: 'boolean', value: { ref: { source: 'step', stepId: 'one', path: [] } } }; assert.throws(() => validateWorkflowDefinition(d));
+});
+
+function repeatDefinition(): WorkflowDefinition {
+  return { id: 'repeat', version: 2, label: 'Repeat', inputSchema: closed, steps: [{ id: 'loop', kind: 'repeat', dependsOn: [], initial: { value: 0 }, stateSchema: { type: 'integer' }, maxIterations: 3,
+    body: [{ id: 'body', kind: 'native', dependsOn: [], inputs: { state: { ref: { source: 'iteration', path: [] } } }, agentId: 'reviewer', prompt: 'Readonly', outputSchema: { type: 'integer' } }],
+    feedback: { ref: { source: 'step', stepId: 'body', path: [] } }, until: { op: 'gte', left: { ref: { source: 'iteration', path: [] } }, right: { value: 2 } }, output: { ref: { source: 'iteration', path: [] } }, outputSchema: { type: 'integer' } }] };
+}
+
+test('repeat boundary scopes, authored IDs, nesting and expansion budgets validate before admission', () => {
+  validateWorkflowDefinition(repeatDefinition());
+  const mutations: Array<(d: WorkflowDefinition) => void> = [
+    d => { d.steps[0].maxIterations = 0; }, d => { d.steps[0].maxIterations = 33; },
+    d => { d.steps[0].id = 'loop@0'; }, d => { d.steps[0].body![0].id = 'body:1'; },
+    d => { d.steps[0].initial = { ref: { source: 'iteration', path: [] } }; },
+    d => { d.steps[0].feedback = { ref: { source: 'inputs', path: [] } }; },
+    d => { d.steps[0].until = { op: 'boolean', value: { ref: { source: 'step', stepId: 'body', path: [] } } }; },
+    d => { d.steps[0].body = [repeatDefinition().steps[0]]; },
+    d => { d.steps[0].body![0].inputs = { value: { ref: { source: 'step', stepId: 'loop', path: [] } } }; },
+    d => { d.steps[0].body = Array.from({ length: 16 }, (_, i) => ({ ...d.steps[0].body![0], id: `body${i}` })); },
+    d => { d.steps[0].maxIterations = 32; d.steps[0].body = Array.from({ length: 3 }, (_, i) => ({ ...d.steps[0].body![0], id: `body${i}` })); d.steps[0].feedback = { value: 1 }; },
+    d => { d.steps[0].maxIterations = 32; d.steps[0].body = Array.from({ length: 8 }, (_, i) => ({ id: `body${i}`, kind: 'aggregate', operation: 'collect', dependsOn: [], inputs: {} })); d.steps[0].feedback = { value: 1 }; },
+  ];
+  for (const mutate of mutations) { const d = repeatDefinition(); mutate(d); assert.throws(() => validateWorkflowDefinition(d)); }
+});
+
+test('v1 preset hash golden and v2 primitive schema inference reject every mismatched operator before execution', () => {
+  assert.equal(workflowHash(createReadOnlyReviewDefinition()), 'ad28a859b04ed40a0577642d043a895ad4b41c46dfe484f254746b92dd191778');
+  for (const op of ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'] as const) {
+    const d = def(); d.version = 2; d.inputSchema = { type: 'integer' };
+    d.steps[0].when = { op, left: { ref: { source: 'inputs', path: [] } }, right: { value: '1' } }; assert.throws(() => validateWorkflowDefinition(d));
+    d.steps[0].when = { op, left: { ref: { source: 'inputs', path: [] } }, right: { value: 1 } }; validateWorkflowDefinition(d);
+    d.steps[0].when = { op: 'any', conditions: [{ op: 'boolean', value: { value: true } }, { op, left: { value: [] }, right: { value: [] } }] }; assert.throws(() => validateWorkflowDefinition(d));
+  }
+  const d = def(); d.version = 2; d.steps.unshift({ id: 'aggregate', kind: 'aggregate', operation: 'collect', dependsOn: [], inputs: {} }); d.steps[1].dependsOn = ['aggregate'];
+  d.steps[1].when = { op: 'eq', left: { ref: { source: 'step', stepId: 'aggregate', path: [] } }, right: { value: true } }; assert.throws(() => validateWorkflowDefinition(d));
+  const repeat = repeatDefinition(); repeat.steps[0].stateSchema = { type: 'boolean' }; assert.throws(() => validateWorkflowDefinition(repeat));
 });
