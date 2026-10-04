@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ZergAgentDefinition } from './types.js';
+import { validateCodingPolicy } from './workflow-coding.js';
+import type { WorkflowCodingPolicy, WorkflowCodingCapability, WorkflowCodingApprovalKind, WorkflowCodingApprovalRecord, WorkflowCodingApprovalRequest } from './workflow-coding.js';
 
 export type WorkflowJson = null | boolean | number | string | WorkflowJson[] | { [key: string]: WorkflowJson };
 export interface WorkflowSchema {
@@ -14,8 +16,9 @@ export type WorkflowCondition =
   | { op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte'; left: WorkflowBinding; right: WorkflowBinding }
   | { op: 'all' | 'any'; conditions: WorkflowCondition[] }
   | { op: 'not'; condition: WorkflowCondition };
+export interface WorkflowCodingStepSpec { operation: WorkflowCodingCapability; policy: unknown; checkProfileId?: string }
 export interface WorkflowStep {
-  id: string; dependsOn: string[]; kind: 'native' | 'aggregate' | 'repeat';
+  id: string; dependsOn: string[]; kind: 'native' | 'aggregate' | 'repeat' | 'coding';
   inputs?: Record<string, WorkflowBinding>;
   agentId?: string; prompt?: string; outputSchema?: WorkflowSchema;
   fanout?: { from: WorkflowRef; maxItems: number };
@@ -24,15 +27,30 @@ export interface WorkflowStep {
   consumeFailures?: boolean; consumeSkips?: boolean; when?: WorkflowCondition;
   initial?: WorkflowBinding; stateSchema?: WorkflowSchema; body?: WorkflowStep[]; feedback?: WorkflowBinding;
   until?: WorkflowCondition; output?: WorkflowBinding; maxIterations?: number;
+  /** v3 controlled staged coding step; executed only by a trusted native coding port, never model approval. */
+  coding?: WorkflowCodingStepSpec;
 }
-export interface WorkflowDefinition { id: string; version: 1 | 2; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[] }
+export interface WorkflowDefinition { id: string; version: 1 | 2 | 3; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[] }
 export interface WorkflowNativeIdentity { runId: string; taskId: string }
 export interface WorkflowNativeLineage {
   blockId?: string; iterationId?: string; iterationNo?: number;
   workflowRunId: string; familyId: string; attemptNo: number; stepId: string; unitId: string; inputHash: string;
 }
+export interface WorkflowControlledCodingContext {
+  operation: WorkflowCodingCapability;
+  policy: WorkflowCodingPolicy;
+  stageRoot?: string;
+  candidateHash?: string;
+  iteration: number;
+  readonly paths: string[];
+  read(path: string): string;
+  write(path: string, text: string): void;
+  inspect(): { candidateHash: string; changedPaths: string[]; files: Array<{ path: string; beforeText: string | null; afterText: string | null; beforeHash: string | null; afterHash: string | null }> };
+}
 export interface WorkflowNativeRequest extends WorkflowNativeLineage {
   agent: ZergAgentDefinition; prompt: string; signal: AbortSignal;
+  /** Present only for v3 controlled staged coding writer/reviewer requests; native SDK must not infer authority from prompts. */
+  coding?: WorkflowControlledCodingContext;
   onIdentity(identity: WorkflowNativeIdentity): void;
   /** Owner checks immediately before setup/publication/provider, including after async boundaries. */
   assertAdmission(): void;
@@ -55,6 +73,7 @@ export interface WorkflowUnit {
   id: string; stepId: string; index: number; status: WorkflowUnitStatus; inputHash: string;
   inputs: WorkflowJson; result?: WorkflowJson; error?: string; native?: WorkflowNativeIdentity;
   cleanupSettled: boolean; reusedFrom?: { workflowRunId: string; unitId: string; native: WorkflowNativeIdentity };
+  coding?: { phase: string; candidateHash?: string; evidenceHash?: string; approvalId?: string; approvalStatus?: string; consumedApprovalId?: string; appliedPaths?: string[]; rejectedPaths?: string[]; error?: string; workspace?: WorkflowJson; candidate?: WorkflowJson; evidence?: WorkflowJson; outcome?: WorkflowJson; baseline?: WorkflowJson };
 }
 export interface WorkflowIterationRun { id: string; index: number; state: WorkflowJson; steps: WorkflowStepRun[]; feedback?: WorkflowJson; decision?: boolean; error?: string }
 export interface WorkflowStepRun { id: string; status: WorkflowUnitStatus; units: WorkflowUnit[]; output?: WorkflowJson; error?: string; condition?: boolean; skipReason?: 'condition-false' | 'dependency' | 'cancelled' | 'recovery'; iterations?: WorkflowIterationRun[]; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery' }
@@ -88,13 +107,22 @@ export interface WorkflowReply {
   runs?: WorkflowRunSummary[]; definitions?: WorkflowDefinitionView[];
   definition?: WorkflowDefinitionView; report?: WorkflowJson;
 }
+export interface WorkflowTrustedApprovalApi {
+  grant(id: string, request: WorkflowCodingApprovalRequest): WorkflowCodingApprovalRecord;
+  grantFingerprint(id: string, requestHash: string): WorkflowCodingApprovalRecord;
+  reject(id: string, request: WorkflowCodingApprovalRequest, reason?: string): WorkflowCodingApprovalRecord;
+  revoke(id: string, request: WorkflowCodingApprovalRequest, reason?: string): WorkflowCodingApprovalRecord;
+  inspect(id?: string): Array<{ id: string; kind: WorkflowCodingApprovalKind; status: string; requestHash: string; consumed: boolean; createdAt: string; decidedAt?: string; reason?: string; request: Record<string, unknown>; scope: Record<string, unknown> }>;
+}
 export interface WorkflowService {
   execute(action: WorkflowAction, signal?: AbortSignal): Promise<WorkflowReply>;
   list(): WorkflowView[]; get(workflowRunId: string): WorkflowRun | undefined;
+  readonly approvals: WorkflowTrustedApprovalApi;
   subscribe(listener: (views: WorkflowView[]) => void): () => void;
   dispose(): void; drain(): Promise<void>;
 }
-export interface WorkflowServiceOptions { now?: () => Date; idFactory?: () => string }
+export interface WorkflowTrustedCodingConfig { projectRoot: string; stagingParent: string; writablePaths?: string[]; checkProfiles?: Record<string, unknown> }
+export interface WorkflowServiceOptions { now?: () => Date; idFactory?: () => string; coding?: WorkflowTrustedCodingConfig & { enabled?: boolean; approvalHost?: unknown } }
 export const WORKFLOW_LIMITS = Object.freeze({ steps: 16, fanout: 32, concurrency: 32, admissions: 256, attempts: 3,
   definitionBytes: 65536, inputBytes: 32768, resultBytes: 16384, promptBytes: 262144, aggregateBytes: 262144,
   ledgerBytes: 2097152, definitions: 16, runs: 16, depth: 24, nodes: 20000, keys: 256, stringLength: 262144 });
@@ -206,22 +234,31 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
 function validateDefinition(value: WorkflowDefinition, iterationSchema?: WorkflowSchema): WorkflowDefinition {
   const def = freezeWorkflowData(value, WORKFLOW_LIMITS.definitionBytes);
   keysOnly(def, ['id', 'version', 'label', 'inputSchema', 'steps']);
-  workflowAssert(identifier(def.id) && (def.version === 1 || def.version === 2) && typeof def.label === 'string' && def.label.length > 0 && def.label.length <= 160, 'Invalid workflow identity');
+  workflowAssert(identifier(def.id) && (def.version === 1 || def.version === 2 || def.version === 3) && typeof def.label === 'string' && def.label.length > 0 && def.label.length <= 160, 'Invalid workflow identity');
   validateWorkflowSchema(def.inputSchema);
   workflowAssert(Array.isArray(def.steps) && def.steps.length > 0 && def.steps.length <= WORKFLOW_LIMITS.steps, 'Workflow step limit exceeded');
   const byId = new Map(def.steps.map(s => [s.id, s]));
   workflowAssert(byId.size === def.steps.length, 'Duplicate step IDs');
   let nativeUnits = 0;
+  let codingChainPolicyHash: string | undefined;
   for (const s of def.steps) {
-    keysOnly(s, s.kind === 'repeat' && def.version === 2 ? ['id', 'kind', 'dependsOn', 'initial', 'stateSchema', 'body', 'feedback', 'until', 'output', 'outputSchema', 'maxIterations', 'when'] : ['id', 'dependsOn', 'kind', 'inputs', 'agentId', 'prompt', 'outputSchema', 'fanout', 'operation', 'consumeFailures', ...(def.version === 2 ? ['when', 'consumeSkips'] : [])]);
+    keysOnly(s, s.kind === 'repeat' && (def.version === 2 || def.version === 3) ? ['id', 'kind', 'dependsOn', 'initial', 'stateSchema', 'body', 'feedback', 'until', 'output', 'outputSchema', 'maxIterations', 'when'] : s.kind === 'coding' && def.version === 3 ? ['id', 'dependsOn', 'kind', 'inputs', 'outputSchema', 'coding', 'when'] : ['id', 'dependsOn', 'kind', 'inputs', 'agentId', 'prompt', 'outputSchema', 'fanout', 'operation', 'consumeFailures', ...(def.version === 2 || def.version === 3 ? ['when', 'consumeSkips'] : [])]);
     workflowAssert(identifier(s.id) && Array.isArray(s.dependsOn) && new Set(s.dependsOn).size === s.dependsOn.length && s.dependsOn.every(d => typeof d === 'string' && byId.has(d) && d !== s.id), 'Unknown/self/duplicate dependency');
     if (s.kind === 'repeat') {
-      workflowAssert(def.version === 2 && !iterationSchema && s.stateSchema && s.outputSchema && s.initial && s.feedback && s.until && s.output && Array.isArray(s.body) && Number.isSafeInteger(s.maxIterations) && s.maxIterations! >= 1 && s.maxIterations! <= 32, 'Invalid repeat');
+      workflowAssert((def.version === 2 || def.version === 3) && !iterationSchema && s.stateSchema && s.outputSchema && s.initial && s.feedback && s.until && s.output && Array.isArray(s.body) && Number.isSafeInteger(s.maxIterations) && s.maxIterations! >= 1 && s.maxIterations! <= 32, 'Invalid repeat');
       validateWorkflowSchema(s.stateSchema); validateWorkflowSchema(s.outputSchema);
-      validateDefinition({ id: def.id, version: 2, label: def.label, inputSchema: def.inputSchema, steps: s.body }, s.stateSchema);
+      validateDefinition({ id: def.id, version: def.version, label: def.label, inputSchema: def.inputSchema, steps: s.body }, s.stateSchema);
       continue;
     }
     workflowAssert(s.inputs && typeof s.inputs === 'object' && !Array.isArray(s.inputs), 'Invalid step inputs');
+    if (s.kind === 'coding') {
+      workflowAssert(def.version === 3 && s.coding && ['investigate', 'stage-write', 'check', 'review', 'apply'].includes(s.coding.operation) && s.outputSchema && s.agentId === undefined && s.prompt === undefined && s.fanout === undefined && s.operation === undefined && s.consumeFailures === undefined && s.consumeSkips === undefined, 'Invalid coding step');
+      const policy = validateCodingPolicy(s.coding.policy as WorkflowCodingPolicy); workflowAssert(policy.capabilities.includes(s.coding.operation), 'Coding step capability not granted by policy');
+      const policyHash = workflowHash(policy); workflowAssert(codingChainPolicyHash === undefined || codingChainPolicyHash === policyHash, 'All coding steps in a chain must use the exact same frozen policy'); codingChainPolicyHash = policyHash;
+      if (s.coding.operation === 'check') workflowAssert(typeof s.coding.checkProfileId === 'string' && policy.checkProfiles?.some(p => p.id === s.coding!.checkProfileId), 'Coding check step requires declared profile');
+      else workflowAssert(s.coding.checkProfileId === undefined, 'Coding profile only valid for check operation');
+      validateWorkflowSchema(s.outputSchema); continue;
+    }
     if (s.kind === 'native') {
       workflowAssert(identifier(s.agentId) && typeof s.prompt === 'string' && s.prompt.length > 0 && s.outputSchema && s.operation === undefined && s.consumeFailures === undefined && s.consumeSkips === undefined, 'Invalid native step');
       validateWorkflowSchema(s.outputSchema);
@@ -239,14 +276,14 @@ function validateDefinition(value: WorkflowDefinition, iterationSchema?: Workflo
   def.steps.forEach(s => visit(s.id));
   const refSchema = (r: WorkflowRef, s: WorkflowStep): WorkflowSchema | undefined => {
     workflowAssert(r && typeof r === 'object', 'Invalid reference'); keysOnly(r, ['source', 'stepId', 'path']);
-    workflowAssert(['inputs', 'step', 'item', ...(def.version === 2 ? ['iteration'] : [])].includes(r.source) && Array.isArray(r.path) && r.path.length <= 24 && r.path.every(p => typeof p === 'string' && !['__proto__', 'constructor', 'prototype'].includes(p)), 'Invalid reference path');
+    workflowAssert(['inputs', 'step', 'item', ...((def.version === 2 || def.version === 3) ? ['iteration'] : [])].includes(r.source) && Array.isArray(r.path) && r.path.length <= 24 && r.path.every(p => typeof p === 'string' && !['__proto__', 'constructor', 'prototype'].includes(p)), 'Invalid reference path');
     let schema: WorkflowSchema | undefined;
     if (r.source === 'iteration') { workflowAssert(iterationSchema && r.stepId === undefined, 'Iteration reference outside repeat'); schema = iterationSchema; }
     if (r.source === 'inputs') { workflowAssert(r.stepId === undefined, 'Input reference has stepId'); schema = def.inputSchema; }
     if (r.source === 'step') {
       workflowAssert(typeof r.stepId === 'string' && s.dependsOn.includes(r.stepId), 'Reference must name an explicit dependency');
       const dep = byId.get(r.stepId)!;
-      if ((s.consumeSkips && dep.when !== undefined) || (def.version === 2 && s.consumeFailures)) workflowAssert(r.path.length === 0, 'Skip consumption requires whole unavailable envelope');
+      if ((s.consumeSkips && dep.when !== undefined) || ((def.version === 2 || def.version === 3) && s.consumeFailures)) workflowAssert(r.path.length === 0, 'Skip consumption requires whole unavailable envelope');
       if ((dep.kind === 'native' && !dep.fanout) || dep.kind === 'repeat') schema = dep.outputSchema;
       else workflowAssert(r.path.length === 0, 'Envelope/aggregate references require whole output');
     }
@@ -282,7 +319,7 @@ function validateDefinition(value: WorkflowDefinition, iterationSchema?: Workflo
     if (s.kind === 'repeat') {
       validateBindingCompatibility(s.initial!, binding(s.initial!, s), s.stateSchema!);
       const boundary = { ...s, dependsOn: s.body!.map(b => b.id) };
-      const bodyDef: WorkflowDefinition = { id: def.id, version: 2, label: def.label, inputSchema: def.inputSchema, steps: s.body! };
+      const bodyDef: WorkflowDefinition = { id: def.id, version: def.version, label: def.label, inputSchema: def.inputSchema, steps: s.body! };
       // Boundary bindings see current body outputs and state, never outer dependencies.
       validateBindingCompatibility(s.feedback!, validateBoundaryBinding(s.feedback!, bodyDef, s.stateSchema!, boundary), s.stateSchema!);
       validateBindingCompatibility(s.output!, validateBoundaryBinding(s.output!, bodyDef, s.stateSchema!, boundary), s.outputSchema!);
@@ -320,7 +357,7 @@ function validateDefinition(value: WorkflowDefinition, iterationSchema?: Workflo
       if ('ref' in b) { keysOnly(b, ['ref']); refSchema(b.ref, s); } else { keysOnly(b, ['value']); workflowAssert(Object.hasOwn(b, 'value'), 'Binding requires value or ref'); }
     }
   }
-  if (!iterationSchema && def.version === 2) {
+  if (!iterationSchema && (def.version === 2 || def.version === 3)) {
     let authored = 0, expanded = 0, native = 0;
     for (const s of def.steps) {
       authored++; expanded += s.kind === 'repeat' ? 1 : s.fanout?.maxItems ?? 1;
@@ -440,7 +477,7 @@ export function workflowView(run: WorkflowRun): WorkflowView {
   const counts: WorkflowView['counts'] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unverified: 0 };
   const correlations: WorkflowView['correlations'] = [];
   for (const { step, blockId, iterationId, iterationNo } of workflowStepEntries(run)) for (const unit of step.units) { counts[unit.status]++; correlations.push({ ...(blockId ? { blockId, iterationId, iterationNo } : {}), stepId: step.id, unitId: unit.id, status: unit.status, ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}) }); }
-  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...(run.definition.version === 2 ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
+  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...((run.definition.version === 2 || run.definition.version === 3) ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
 }
 
 const stringSchema = (maxLength: number): WorkflowSchema => ({ type: 'string', maxLength });

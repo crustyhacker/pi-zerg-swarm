@@ -1,11 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { ZergAgentDefinition, ZergStateContainer } from './types.js';
 import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, aggregateWorkflow, createReadOnlyReviewDefinition,
   freezeWorkflowData, normalizeWorkflowAgent, resolveWorkflowRef, validateReviewInputs, validateWorkflowDefinition, validateWorkflowValue,
   workflowUnavailableEnvelope, evaluateWorkflowCondition, workflowStepEntries, workflowStepContext, qualifyWorkflowStep, workflowAssert, workflowHash, workflowJson, workflowUnitHash, workflowUnitEnvelope, workflowView } from './workflow-model.js';
+import { approvalRequestHash, codingBaselineHash, codingGatesPassed, codingPolicyHash, createCodingApprovalRequest, resolveCodingBounds, validateCodingPolicy } from './workflow-coding.js';
+import type { WorkflowCodingGateEvidence, WorkflowCodingReviewEvidence } from './workflow-coding.js';
+import { createWorkflowApprovalRegistry } from './workflow-approvals.js';
+import { captureCodingBaseline, createCodingWorkspace } from './workflow-workspace.js';
+import { runCodingCheck } from './workflow-checks.js';
 import type { WorkflowAction, WorkflowDefinition, WorkflowJson, WorkflowNativeIdentity, WorkflowNativeOutcome,
   WorkflowNativePort, WorkflowReply, WorkflowRun, WorkflowService, WorkflowServiceOptions, WorkflowState,
-  WorkflowBinding, WorkflowIterationRun, WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus } from './workflow-model.js';
+  WorkflowBinding, WorkflowIterationRun, WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus, WorkflowTrustedApprovalApi } from './workflow-model.js';
 
 const settled = (status: WorkflowUnitStatus) => !['queued', 'running'].includes(status);
 const terminal = (run: WorkflowRun) => ['completed', 'failed', 'cancelled', 'needs-attention'].includes(run.status);
@@ -14,7 +20,7 @@ const identityValid = (identity: WorkflowNativeIdentity | undefined): identity i
   typeof identity.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(identity.runId) &&
   typeof identity.taskId === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(identity.taskId);
 const copy = <T>(value: T): T => workflowJson(value, WORKFLOW_LIMITS.ledgerBytes) as T;
-
+type RuntimeCodingWorkspace = { stageRoot: string; read(path: string): string; write(path: string, text: string): void; inspect(): { hash: string; changedPaths: string[]; files: Array<{ path: string; before: Buffer | null; after: Buffer | null; beforeHash: string | null; afterHash: string | null; preview?: string; clippedBytes?: number }>; totalBytes?: number; clippedBytes?: number }; assertFreshDestination(): void; apply(candidateHash: string): { status: 'applied' | 'partial' | 'rejected'; appliedPaths: string[]; error?: string }; cleanup?(): void; settle?(): void };
 const owners = new WeakMap<ZergStateContainer, symbol>();
 /** Non-executing recovery. Unknown/corrupt ledgers are errors, never an empty replacement. */
 export function recoverWorkflowState(value: unknown): WorkflowState {
@@ -26,7 +32,7 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
   workflowAssert(new Set(state.definitions.map(d => d.id)).size === state.definitions.length && new Set(state.runs.map(r => r.workflowRunId)).size === state.runs.length, 'Duplicate workflow identities');
   state.definitions = state.definitions.map(validateWorkflowDefinition);
   // Cross-attempt evidence is checked while every retained attempt is still raw.
-  for (const run of state.runs.filter(r => r.definition?.version === 2)) {
+  for (const run of state.runs.filter(r => r.definition?.version === 2 || r.definition?.version === 3)) {
     workflowAssert(new Set(state.runs.filter(r => r.familyId === run.familyId).map(r => r.attemptNo)).size === state.runs.filter(r => r.familyId === run.familyId).length, 'Duplicate family attempt');
     workflowAssert(run.attemptNo === 1 ? run.retryOf === undefined && run.familyId === run.workflowRunId : typeof run.retryOf === 'string' && run.retryOf !== run.workflowRunId, 'Invalid family lineage');
     const previous = state.runs.find(r => r.workflowRunId === run.retryOf);
@@ -52,17 +58,17 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
     workflowAssert(run.agents && typeof run.agents === 'object' && Array.isArray(run.steps) && run.steps.length === def.steps.length, 'Invalid workflow steps/agents');
     if (def.id === 'read-only-review') validateReviewInputs(run.inputs);
     if (run.report !== undefined) workflowJson(run.report);
-    const expectedAgents = [...new Set(def.steps.flatMap(s => s.body ?? [s]).filter(s => s.kind === 'native').map(s => s.agentId!))].sort();
+    const expectedAgents = [...new Set(def.steps.flatMap(s => s.body ?? [s]).flatMap(s => s.kind === 'native' ? [s.agentId!] : s.kind === 'coding' ? [validateCodingPolicy(s.coding!.policy as import('./workflow-coding.js').WorkflowCodingPolicy).identity.workerAgentId, validateCodingPolicy(s.coding!.policy as import('./workflow-coding.js').WorkflowCodingPolicy).identity.rootAgentId] : []))].sort();
     workflowAssert(Object.keys(run.agents).sort().join(',') === expectedAgents.join(','), 'Frozen agent set mismatch');
     for (const agent of Object.values(run.agents)) normalizeWorkflowAgent(agent);
     // Check fingerprints before recovery changes any dependency status.
-    if (def.version === 2) validateV2Ledger(run);
+    if (def.version === 2 || def.version === 3) validateV2Ledger(run);
     for (const { spec, step, iterationId } of workflowStepEntries(run)) for (const unit of step.units)
       workflowAssert(unit.inputHash === workflowUnitHash(run, qualifyWorkflowStep(spec, iterationId), unit.inputs), 'Recovered materialized input/dependency hash mismatch');
     const ids = new Set<string>(); let live = false;
     for (const entry of workflowStepEntries(run)) {
       const { step } = entry, spec = qualifyWorkflowStep(entry.spec, entry.iterationId);
-      workflowAssert(Object.keys(step).every(k => ['id', 'status', 'units', 'output', 'error', ...(def.version === 2 ? ['condition', 'skipReason', 'iterations', 'termination'] : [])].includes(k)), 'Unknown step ledger field');
+      workflowAssert(Object.keys(step).every(k => ['id', 'status', 'units', 'output', 'error', ...((def.version === 2 || def.version === 3) ? ['condition', 'skipReason', 'iterations', 'termination'] : [])].includes(k)), 'Unknown step ledger field');
       if (step.output !== undefined) workflowJson(step.output);
       workflowAssert(step.id === spec.id && Array.isArray(step.units) && step.units.length <= (spec.fanout?.maxItems ?? 1) &&
         ['queued', 'running', 'completed', 'failed', 'cancelled', 'skipped', 'unverified'].includes(step.status), 'Invalid step ledger');
@@ -70,7 +76,7 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
         const agent = run.agents[spec.agentId!]; workflowAssert(agent && agent.id === spec.agentId && typeof agent.model === 'string' && agent.model.length > 0, 'Missing frozen agent');
       }
       for (const [index, unit] of step.units.entries()) {
-        workflowAssert(Object.keys(unit).every(k => ['id', 'stepId', 'index', 'status', 'inputHash', 'inputs', 'result', 'error', 'native', 'cleanupSettled', 'reusedFrom'].includes(k)), 'Unknown unit ledger field');
+        workflowAssert(Object.keys(unit).every(k => ['id', 'stepId', 'index', 'status', 'inputHash', 'inputs', 'result', 'error', 'native', 'cleanupSettled', 'reusedFrom', ...(def.version === 3 ? ['coding'] : [])].includes(k)), 'Unknown unit ledger field');
         workflowAssert(unit.stepId === step.id && unit.id === `${step.id}:${index}` && !ids.has(unit.id) && unit.index === index &&
           typeof unit.inputHash === 'string' && /^[a-f0-9]{64}$/.test(unit.inputHash) && typeof unit.cleanupSettled === 'boolean' &&
           ['queued', 'running', 'completed', 'failed', 'cancelled', 'skipped', 'unverified'].includes(unit.status), 'Invalid unit ledger');
@@ -81,10 +87,14 @@ export function recoverWorkflowState(value: unknown): WorkflowState {
           workflowAssert(unit.result !== undefined && identityValid(unit.native) && unit.cleanupSettled, 'Completed unit lacks validated result/identity/settlement');
           validateWorkflowValue(workflowJson(unit.result, WORKFLOW_LIMITS.resultBytes), spec.outputSchema!);
         }
+        if (unit.status === 'completed' && spec.kind === 'coding') {
+          workflowAssert(unit.result !== undefined && unit.cleanupSettled, 'Completed coding unit lacks result/settlement');
+          validateWorkflowValue(workflowJson(unit.result, WORKFLOW_LIMITS.resultBytes), spec.outputSchema!);
+        }
         if (unit.status === 'running') { live = true; recoveryMutations.push(() => { unit.status = 'unverified'; unit.cleanupSettled = false; unit.error = 'Recovered native work is not reconnected; settlement unverified'; }); }
         if (unit.status === 'queued') recoveryMutations.push(() => { unit.status = 'skipped'; unit.error = 'Recovery disables automatic admission'; });
       }
-      if (['running', 'queued'].includes(step.status)) { live = true; recoveryMutations.push(() => { step.status = 'unverified'; step.error = 'Recovered step requires attention; no replay'; if (def.version === 2) { step.skipReason = 'recovery'; if (spec.kind === 'repeat') step.termination = 'recovery'; } }); }
+      if (['running', 'queued'].includes(step.status)) { live = true; recoveryMutations.push(() => { step.status = 'unverified'; step.error = 'Recovered step requires attention; no replay'; if (def.version === 2 || def.version === 3) { step.skipReason = 'recovery'; if (spec.kind === 'repeat') step.termination = 'recovery'; } }); }
     }
     if (!terminal(run) || live || !run.cleanupSettled) {
       recoveryMutations.push(() => { run.status = 'needs-attention'; run.cleanupSettled = false; run.error = 'Recovered work is not live or reconnected; no automatic admission'; });
@@ -101,7 +111,7 @@ function validateV2Ledger(run: WorkflowRun): void {
   const diagnostic = (value: unknown) => workflowAssert(value === undefined || (typeof value === 'string' && value.length <= 1024), 'Invalid bounded diagnostic');
   diagnostic(run.error);
   workflowAssert(run.steps.every((s, i) => s.id === run.definition.steps[i].id), 'Noncontiguous top-level ledger');
-  if (!run.recovered) workflowAssert(run.cleanupSettled === workflowStepEntries(run).every(({ step }) => step.units.every(u => u.cleanupSettled)), 'Run settlement disagrees with unit ledger');
+  if (!run.recovered && terminal(run)) workflowAssert(run.cleanupSettled === workflowStepEntries(run).every(({ step }) => step.units.every(u => u.cleanupSettled)), 'Run settlement disagrees with unit ledger');
   let count = 0, admissions = 0;
   const runIds = new Set<string>(), taskIds = new Set<string>();
   for (const { spec, step, iterationId } of workflowStepEntries(run)) {
@@ -182,7 +192,7 @@ function validateV2Ledger(run: WorkflowRun): void {
     for (const [index, unit] of step.units.entries()) {
       diagnostic(unit.error);
       workflowAssert(unit.result === undefined || unit.status === 'completed', 'Uncompleted unit has result');
-      workflowAssert(unit.status !== 'running' || (spec.kind === 'native' && !unit.cleanupSettled), 'Running unit has invalid ownership');
+      workflowAssert(unit.status !== 'running' || spec.kind === 'native' || spec.kind === 'coding', 'Running unit has invalid ownership');
       const inputs = Object.fromEntries(Object.entries(spec.inputs!).map(([key, b]) => [key, resolve(b, spec.fanout ? items[index] : undefined)]));
       workflowAssert(workflowHash(inputs) === workflowHash(unit.inputs), 'Materialized unit inputs mismatch');
       if (unit.native) {
@@ -195,6 +205,7 @@ function validateV2Ledger(run: WorkflowRun): void {
       if (unit.result !== undefined && spec.kind === 'native') validateWorkflowValue(unit.result, spec.outputSchema!);
       if (unit.status === 'completed') workflowAssert(unit.cleanupSettled && unit.result !== undefined, 'Completed unit lacks settled result');
       if (spec.kind === 'aggregate' && unit.status === 'completed') workflowAssert(workflowHash(unit.result) === workflowHash(aggregateWorkflow(spec.operation!, inputs)), 'Aggregate result mismatch');
+      if (spec.kind === 'coding' && unit.status === 'completed') validateWorkflowValue(unit.result!, spec.outputSchema!);
     }
     if (step.status === 'completed') {
       workflowAssert(step.units.every(u => u.status === 'completed') && step.output !== undefined, 'Completed step inconsistent');
@@ -215,6 +226,9 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   const state: WorkflowState = existing === undefined ? { version: 1, definitions: [createReadOnlyReviewDefinition()], runs: [] } : recoverWorkflowState(existing);
   const owner = Symbol('workflow-owner'); owners.set(container, owner);
   const listeners = new Set<(views: ReturnType<typeof workflowView>[]) => void>();
+  const approvalRegistry = createWorkflowApprovalRegistry(now);
+  const codingCfg = options.coding ? freezeWorkflowData({ ...(options.coding.enabled !== undefined ? { enabled: options.coding.enabled } : {}), projectRoot: options.coding.projectRoot, stagingParent: options.coding.stagingParent, ...(options.coding.writablePaths !== undefined ? { writablePaths: options.coding.writablePaths } : {}), ...(options.coding.checkProfiles !== undefined ? { checkProfiles: options.coding.checkProfiles } : {}) }, WORKFLOW_LIMITS.definitionBytes) as WorkflowServiceOptions['coding'] : undefined;
+  const codingWorkspaces = new Map<string, { workspace?: RuntimeCodingWorkspace; candidateHash?: string; evidence?: WorkflowCodingGateEvidence; implApprovalId?: string; implRequestHash?: string; baseline?: ReturnType<typeof captureCodingBaseline> }>();
   const active = new Map<string, { run: WorkflowRun; unit: WorkflowUnit; controller: AbortController }>();
   const pending = new Set<Promise<void>>();
   const abortListeners = new Map<string, () => void>();
@@ -257,8 +271,13 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   const freezeAgents = (def: WorkflowDefinition): Record<string, ZergAgentDefinition> => {
     const agents: Record<string, ZergAgentDefinition> = {};
-    for (const step of def.steps.flatMap(s => s.body ?? [s])) if (step.kind === 'native' && !agents[step.agentId!]) {
-      const source = container.read().agentDefinitions[step.agentId!];
+    const agentIds = new Set<string>();
+    for (const step of def.steps.flatMap(s => s.body ?? [s])) {
+      if (step.kind === 'native') agentIds.add(step.agentId!);
+      if (step.kind === 'coding') { const p = validateCodingPolicy(step.coding!.policy as import('./workflow-coding.js').WorkflowCodingPolicy); agentIds.add(p.identity.workerAgentId); if (p.reviewRequired || p.capabilities.includes('review')) agentIds.add(p.identity.rootAgentId); }
+    }
+    for (const agentId of agentIds) if (!agents[agentId]) {
+      const source = container.read().agentDefinitions[agentId];
       workflowAssert(source, 'Workflow agent definition not found'); const agent = normalizeWorkflowAgent(source);
       workflowAssert(agent && typeof agent.model === 'string' && agent.model.trim().length > 0, 'Workflow agents require an explicit model');
       workflowAssert(agent.maxTurns === undefined && (!agent.fallbackModels || agent.fallbackModels.length === 0) &&
@@ -272,7 +291,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     run.status = 'cancelling'; stamp(run);
     for (const { spec, step } of workflowStepEntries(run)) {
       for (const unit of step.units) if (unit.status === 'queued') { unit.status = 'cancelled'; unit.cleanupSettled = true; }
-      if (step.status === 'queued' || (spec.kind === 'repeat' && step.status === 'running')) { step.status = 'cancelled'; if (run.definition.version === 2) { step.skipReason = 'cancelled'; if (spec.kind === 'repeat') step.termination = 'cancelled'; } else step.output = { status: 'cancelled', error: 'Workflow cancellation before admission' }; }
+      if (step.status === 'queued' || (spec.kind === 'repeat' && step.status === 'running')) { step.status = 'cancelled'; if (run.definition.version === 2 || run.definition.version === 3) { step.skipReason = 'cancelled'; if (spec.kind === 'repeat') step.termination = 'cancelled'; } else step.output = { status: 'cancelled', error: 'Workflow cancellation before admission' }; }
       else if (step.units.length) outputStep(spec, step);
     }
     active.forEach(a => { if (a.run === run) a.controller.abort(); });
@@ -334,8 +353,8 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); }
         catch (error) { delete run.report; run.error = errorText(error); run.status = 'failed'; stamp(run); return; }
       }
-      const partial = run.report && typeof run.report === 'object' && !Array.isArray(run.report) && run.report.partial === true;
-      run.status = workflowStepEntries(run).every(({ step: s }) => s.status === 'completed' || (run.definition.version === 2 && s.skipReason === 'condition-false')) && !partial ? 'completed' : 'failed';
+      const partial = run.report && typeof run.report === 'object' && !Array.isArray(run.report) && (run.report.partial === true || run.report.passed === false);
+      run.status = workflowStepEntries(run).every(({ step: s }) => s.status === 'completed' || ((run.definition.version === 2 || run.definition.version === 3) && s.skipReason === 'condition-false')) && !partial ? 'completed' : 'failed';
     }
     stamp(run); abortListeners.get(run.workflowRunId)?.(); abortListeners.delete(run.workflowRunId);
   }
@@ -364,7 +383,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       });
       if (failedDependencies) {
         step.status = 'skipped'; step.error = 'Dependency did not complete successfully';
-        if (run.definition.version === 2) step.skipReason = 'dependency'; else step.output = workflowJson({ status: 'skipped', error: step.error }); return;
+        if (run.definition.version === 2 || run.definition.version === 3) step.skipReason = 'dependency'; else step.output = workflowJson({ status: 'skipped', error: step.error }); return;
       }
       if (spec.when) {
         step.condition = evaluateWorkflowCondition(spec.when, b => bindingValue(run, spec, b));
@@ -379,6 +398,10 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         step.units = [unit];
         budgetResult(unit, freezeWorkflowData(aggregateWorkflow(spec.operation!, inputs))); unit.status = 'completed'; outputStep(spec, step); return;
       }
+      if (spec.kind === 'coding') {
+        const inputs = materialize(run, spec), unit: WorkflowUnit = { id: `${spec.id}:0`, stepId: spec.id, index: 0, status: 'queued', inputHash: hashUnit(run, spec, inputs), inputs, cleanupSettled: true, coding: { phase: spec.coding!.operation } };
+        step.units = [unit]; outputStep(spec, step); return;
+      }
       let items: WorkflowJson[] = [null];
       if (spec.fanout) {
         const source = resolveWorkflowRef(spec.fanout.from, run.inputs, outputsFor(run, spec), undefined, workflowStepContext(run, spec.id).iteration?.state);
@@ -389,14 +412,14 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         const unit: WorkflowUnit = { id: `${spec.id}:${index}`, stepId: spec.id, index, status: 'queued', inputHash: hashUnit(run, spec, inputs), inputs, cleanupSettled: true };
         reuse(run, unit, spec); return unit;
       });
-      if (run.definition.version === 2) {
+      if (run.definition.version === 2 || run.definition.version === 3) {
         try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch (error) { step.units = []; throw error; }
       }
       if (!step.units.length) { step.status = 'completed'; step.output = []; } else outputStep(spec, step);
     } catch (error) {
       step.status = 'failed'; step.error = errorText(error); if (spec.kind === 'repeat') step.termination = 'invalid-transition'; if (spec.kind !== 'repeat') step.output = workflowJson({ status: 'failed', error: step.error });
       step.units.forEach(u => { if (!settled(u.status)) { u.status = 'failed'; u.cleanupSettled = true; u.error = step.error; } });
-      if (run.definition.version === 2) {
+      if (run.definition.version === 2 || run.definition.version === 3) {
         try { workflowJson(state, WORKFLOW_LIMITS.ledgerBytes); } catch { step.units = []; delete step.output; }
       }
     }
@@ -441,6 +464,209 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
   const runActiveCount = (run: WorkflowRun) => [...active.values()].filter(a => a.run === run).length;
   const globalCap = () => Math.min(32, ...state.runs.filter(r => !terminal(r) || !r.cleanupSettled).map(r => r.concurrency));
+  const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+  const codingKey = (run: WorkflowRun) => run.workflowRunId;
+  const latestCodingSession = (run: WorkflowRun) => codingWorkspaces.get(codingKey(run));
+  const codingOutput = (unit: WorkflowUnit, result: WorkflowJson) => { budgetResult(unit, freezeWorkflowData(result, WORKFLOW_LIMITS.resultBytes)); unit.status = 'completed'; unit.cleanupSettled = true; };
+  const boundedJson = (value: unknown): WorkflowJson => workflowJson(JSON.parse(JSON.stringify(value)), WORKFLOW_LIMITS.resultBytes);
+  const candidateJson = (workspace: RuntimeCodingWorkspace) => { const c = workspace.inspect(); return freezeWorkflowData({ candidateHash: c.hash, changedPaths: c.changedPaths, files: c.files.map(f => ({ path: f.path, beforeText: f.before?.toString('utf8') ?? null, afterText: f.after?.toString('utf8') ?? null, beforeHash: f.beforeHash, afterHash: f.afterHash })) }, WORKFLOW_LIMITS.resultBytes); };
+  const requiredChecksPassed = (policy: ReturnType<typeof validateCodingPolicy>, evidence: WorkflowCodingGateEvidence | undefined, candidateHash: string) => {
+    const expected = sha256(candidateHash);
+    return (policy.checkProfiles ?? []).every(profile => evidence?.checks.some(check => {
+      const detail = check as unknown as Record<string, unknown>;
+      const cleanup = detail.cleanup as { outcome?: unknown } | undefined;
+      return check.profileId === profile.id && check.status === 'passed' && detail.expectedCandidateHash === expected && detail.candidateHashBefore === expected && detail.candidateHashAfter === expected && detail.timedOut !== true && detail.cancelled !== true && cleanup?.outcome !== 'uncertain';
+    }) ?? false);
+  };
+  const assertRuntimeApplyEvidence = (run: WorkflowRun, policy: ReturnType<typeof validateCodingPolicy>, evidence: WorkflowCodingGateEvidence, candidateHash: string) => {
+    workflowAssert(policy.reviewRequired === true && policy.capabilities.includes('review'), 'Apply requires mandatory native independent review');
+    workflowAssert(requiredChecksPassed(policy, evidence, candidateHash), 'Required checks are not fresh/passed for current candidate');
+    const entries = workflowStepEntries(run);
+    const writer = entries.flatMap(({ spec, step }) => spec.kind === 'coding' && spec.coding?.operation === 'stage-write' ? step.units : [])
+      .find(u => u.status === 'completed' && u.cleanupSettled && u.native && u.coding?.candidateHash === candidateHash);
+    workflowAssert(!!writer?.native, 'Apply requires settled native writer evidence for current candidate');
+    for (const profile of policy.checkProfiles ?? []) {
+      const checkUnit = entries.flatMap(({ spec, step }) => spec.kind === 'coding' && spec.coding?.operation === 'check' && spec.coding.checkProfileId === profile.id ? step.units : [])
+        .find(u => u.status === 'completed' && u.cleanupSettled && u.coding?.candidateHash === candidateHash && typeof u.result === 'object' && u.result !== null && !Array.isArray(u.result) && (u.result as Record<string, WorkflowJson>).passed === true && (u.result as Record<string, WorkflowJson>).profileId === profile.id);
+      workflowAssert(!!checkUnit, 'Apply requires settled native check evidence for every approved profile');
+    }
+    const review = evidence.review;
+    workflowAssert(review?.status === 'passed', 'Apply requires passed review evidence');
+    const reviewUnit = entries.flatMap(({ spec, step }) => spec.kind === 'coding' && spec.coding?.operation === 'review' ? step.units : [])
+      .find(u => u.status === 'completed' && u.cleanupSettled && u.native && u.coding?.candidateHash === candidateHash && review.reviewerIdentity === `${u.native.runId}:${u.native.taskId}`);
+    workflowAssert(!!reviewUnit?.native, 'Apply requires genuine current native review evidence');
+    workflowAssert(reviewUnit.native.runId !== writer.native.runId && reviewUnit.native.taskId !== writer.native.taskId, 'Reviewer native identity must be distinct from writer');
+    workflowAssert(reviewUnit.native.runId !== policy.identity.workerAgentId && reviewUnit.native.taskId !== policy.identity.workerAgentId, 'Reviewer native identity must not be the worker agent id');
+  };
+  const baselineSnapshotJson = (baseline: ReturnType<typeof captureCodingBaseline>) => freezeWorkflowData({ baselineHash: baseline.hash, inputPaths: baseline.inputPaths, writablePaths: baseline.writablePaths, files: baseline.entries.map(e => ({ path: e.path, exists: e.exists, text: e.text ?? null, sha256: e.sha256 ?? null, bytes: e.bytes ?? 0 })) }, WORKFLOW_LIMITS.resultBytes);
+  const assertFreshBaseline = (baseline: ReturnType<typeof captureCodingBaseline>, projectRoot: string, inputPaths: string[], writablePaths: string[], limits: unknown) => {
+    const fresh = captureCodingBaseline({ projectRoot, inputPaths, writablePaths, limits: limits as Parameters<typeof captureCodingBaseline>[0]['limits'] });
+    const comparable = (b: ReturnType<typeof captureCodingBaseline>) => ({ inputPaths: b.inputPaths, writablePaths: b.writablePaths, entries: b.entries.map(e => ({ path: e.path, exists: e.exists, bytes: e.bytes ?? 0, sha256: e.sha256 ?? null, text: e.text ?? null })) });
+    workflowAssert(workflowHash(comparable(fresh)) === workflowHash(comparable(baseline)), 'Reviewed coding baseline changed before grant');
+    return fresh;
+  };
+  const assertRunnable = (run: WorkflowRun, controller: AbortController, unit: WorkflowUnit) => { authority(run); workflowAssert(!controller.signal.aborted && (run.status === 'running' || run.status === 'paused') && !terminal(run), 'Workflow unit cancelled/closed'); workflowAssert(!settled(unit.status), 'Workflow unit is terminal'); };
+  const launchCoding = (run: WorkflowRun, spec: WorkflowStep, step: WorkflowStepRun, unit: WorkflowUnit): boolean => {
+    const rawPolicy = spec.coding!.policy as import('./workflow-coding.js').WorkflowCodingPolicy;
+    const op = spec.coding!.operation, policy = validateCodingPolicy({ ...rawPolicy, identity: { ...rawPolicy.identity, workflowRunId: run.workflowRunId, attemptNo: run.attemptNo } });
+    const cfg = codingCfg;
+    const inputPaths = [...(policy.scope.readonlyPaths ?? []), ...policy.scope.writablePaths];
+    const writablePaths = cfg?.writablePaths ?? policy.scope.writablePaths;
+    const sealedToolPolicyHash = workflowHash({ capabilities: policy.capabilities, writablePaths, readonlyPaths: policy.scope.readonlyPaths ?? [], protectedPaths: policy.scope.protectedPaths ?? [] });
+    const checkProfilesForReview = () => (policy.checkProfiles ?? []).map(p => ({ id: p.id, executable: p.executable, argv: p.argv, cwd: p.cwd, env: p.env ?? {}, timeoutMs: p.timeoutMs, outputBytes: resolveCodingBounds(policy).maxOutputBytes, profileHash: p.profileHash, allowGeneratedOutputs: false as const }));
+    const approvalPayload = (kind: 'implementation' | 'application', baseline: ReturnType<typeof captureCodingBaseline>, application?: unknown) => freezeWorkflowData({ summary: `${kind} approval for ${op} ${run.workflowRunId}`, workflow: { workflowRunId: run.workflowRunId, parentRunId: policy.identity.parentRunId, taskId: policy.identity.taskId, attemptNo: run.attemptNo, operation: op, task: policy.scope.task }, trust: { projectRoot: cfg!.projectRoot, stagingParent: cfg!.stagingParent, writablePaths, inputPaths, networkSandbox: 'none' as const, warning: 'No network sandbox is provided by the workflow runtime; approval relies on deterministic local checks and sealed coding tools.' }, agent: { rootAgentId: policy.identity.rootAgentId, workerAgentId: policy.identity.workerAgentId, model: policy.identity.model, sealedToolPolicyHash, effectivePolicyHash: codingPolicyHash(policy) }, limits: { bounds: resolveCodingBounds(policy), corrections: { maxIterations: resolveCodingBounds(policy).maxIterations, admissionLimit: WORKFLOW_LIMITS.admissions } }, baseline, checkProfiles: checkProfilesForReview(), ...(application !== undefined ? { application } : {}), disclosures: ['Payload is bounded and JSON-escaped for display.', 'Full retained file contents are addressed by sha256 hashes and stage/workspace locators.', 'Approval is valid only for this exact request fingerprint.'] }, WORKFLOW_LIMITS.promptBytes) as import('./workflow-coding.js').WorkflowCodingHumanReviewPayload;
+    const implementationRequest = (baseline: ReturnType<typeof captureCodingBaseline>) => createCodingApprovalRequest('implementation', policy, { humanReview: approvalPayload('implementation', baseline) });
+    try { authority(run); workflowAssert(cfg?.enabled !== false && cfg?.projectRoot && cfg?.stagingParent, 'Trusted coding host config missing'); workflowAssert(unit.inputHash === hashUnit(run, spec, unit.inputs), 'Materialized dependency/input identity changed'); }
+    catch (error) { unit.status = 'failed'; unit.error = errorText(error); outputStep(spec, step); stamp(run); finishRun(run); persist(); return true; }
+    if (unit.status === 'running' && unit.coding?.approvalStatus === 'pending') {
+      const inspections = approvalRegistry.inspect(unit.coding.approvalId);
+      if (!inspections[0] || inspections[0].status === 'pending') return false;
+      unit.coding.approvalStatus = inspections[0].status;
+      if (inspections[0].status !== 'granted') {
+        if (op === 'apply') latestCodingSession(run)?.workspace?.settle?.();
+        unit.status = 'failed'; unit.error = `Coding approval ${inspections[0].status}`; unit.cleanupSettled = true; outputStep(spec, step); stamp(run); finishRun(run); persist(); return true;
+      }
+    }
+    if (unit.status === 'queued') {
+      unit.status = 'running'; unit.cleanupSettled = true; unit.coding = { ...(unit.coding ?? {}), phase: op }; outputStep(spec, step); stamp(run); persist();
+      if (op === 'stage-write' || op === 'apply') {
+        const session = latestCodingSession(run);
+        const reviewedBaseline = op === 'stage-write' ? session?.baseline ?? captureCodingBaseline({ projectRoot: cfg!.projectRoot, inputPaths, writablePaths, limits: policy.bounds }) : session?.baseline;
+        const appCandidate = op === 'apply' && session?.candidateHash && session?.evidence && session?.workspace ? session.workspace.inspect() : undefined;
+        if (op === 'apply') {
+          try {
+            workflowAssert(session?.workspace && session.candidateHash && session.evidence, 'No staged candidate/evidence for apply');
+            assertRuntimeApplyEvidence(run, policy, session.evidence, session.candidateHash);
+            workflowAssert(codingGatesPassed(policy, session.evidence, { candidateHash: session.candidateHash, policyHash: codingPolicyHash(policy), baselineHash: codingBaselineHash(policy), changedPaths: session.workspace.inspect().changedPaths, files: [], bytes: 0, id: session.candidateHash.slice(0, 32), iteration: run.attemptNo }), 'Required checks/review have not passed');
+          } catch (error) { unit.status = 'failed'; unit.error = errorText(error); unit.cleanupSettled = true; outputStep(spec, step); stamp(run); finishRun(run); persist(); return true; }
+        }
+        const appData = appCandidate && session?.candidateHash && session?.evidence && session?.workspace ? { candidate: candidateJson(session.workspace), stats: { totalBytes: appCandidate.totalBytes ?? 0, clippedBytes: appCandidate.clippedBytes ?? 0 }, retained: { stageRoot: session.workspace.stageRoot, candidateHash: session.candidateHash }, evidence: session.evidence, targetBaselineHash: reviewedBaseline?.hash, beforeAfter: appCandidate.files.map(f => ({ path: f.path, beforeHash: f.beforeHash, afterHash: f.afterHash, beforeBytes: f.before?.length ?? 0, afterBytes: f.after?.length ?? 0, preview: f.preview ?? f.after?.toString('utf8') ?? '', clippedBytes: f.clippedBytes ?? 0 })) } : undefined;
+        const req = op === 'stage-write'
+          ? implementationRequest(reviewedBaseline!)
+          : createCodingApprovalRequest('application', policy, appData && reviewedBaseline && session ? { candidateHash: session.candidateHash!, evidenceHash: workflowHash(session.evidence!), targetHash: workflowHash({ baseline: reviewedBaseline.hash, candidate: session.candidateHash, changedPaths: appCandidate!.changedPaths }), humanReview: approvalPayload('application', reviewedBaseline, appData) } : {});
+        const record = approvalRegistry.request(req); unit.coding = { phase: op === 'stage-write' ? 'awaiting-implementation-approval' : 'awaiting-application-approval', approvalId: record.id, approvalStatus: record.status, ...(latestCodingSession(run)?.candidateHash ? { candidateHash: latestCodingSession(run)!.candidateHash } : {}), ...(latestCodingSession(run)?.evidence ? { evidenceHash: workflowHash(latestCodingSession(run)!.evidence!) } : {}), ...(reviewedBaseline ? { baseline: boundedJson(reviewedBaseline) } : {}) }; stamp(run); persist();
+        if (record.status !== 'granted') return true;
+      }
+    }
+    if (active.size >= globalCap() || runActiveCount(run) >= run.concurrency) return false;
+    workflowAssert(run.admissions < WORKFLOW_LIMITS.admissions, 'Workflow family admission budget exhausted');
+    const controller = new AbortController(); const activeKey = `${run.workflowRunId}/${unit.id}`; active.set(activeKey, { run, unit, controller }); run.admissions++; run.cleanupSettled = false; unit.cleanupSettled = false; stamp(run); persist();
+    let operationBegan = false;
+    const operation = Promise.resolve().then(async () => {
+      assertRunnable(run, controller, unit);
+      if (op === 'investigate') {
+        const baseline = captureCodingBaseline({ projectRoot: cfg!.projectRoot, inputPaths, writablePaths, limits: policy.bounds });
+        codingWorkspaces.set(codingKey(run), { ...(latestCodingSession(run) ?? {}), baseline });
+        const entries = new Map(baseline.entries.map(e => [e.path, e]));
+        const readPaths = baseline.inputPaths;
+        const agent = run.agents[policy.identity.rootAgentId]; workflowAssert(agent, 'Coding investigation agent missing');
+        const promptPayload = freezeWorkflowData({ identity: { role: 'readonly-investigation', rootAgentId: policy.identity.rootAgentId, workerAgentId: policy.identity.workerAgentId, parentRunId: policy.identity.parentRunId, workflowRunId: run.workflowRunId, taskId: policy.identity.taskId, attemptNo: run.attemptNo }, task: policy.scope.task, outputSchema: spec.outputSchema, availablePaths: readPaths, baselineHash: baseline.hash, instructions: ['Investigate only by reading the exact availablePaths through workflow_stage_read or workflow_stage_inspect.', 'Do not request or perform writes. Return only JSON matching outputSchema.'] }, WORKFLOW_LIMITS.promptBytes);
+        const inspectDetails = () => ({ candidateHash: baseline.hash, changedPaths: [], files: baseline.entries.map(e => ({ path: e.path, beforeText: e.text ?? null, afterText: e.text ?? null, beforeHash: e.sha256 ?? null, afterHash: e.sha256 ?? null })) });
+        operationBegan = true;
+        const outcome = await port.execute({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...lineage(run, spec.id), stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash, agent: freezeWorkflowData(agent, WORKFLOW_LIMITS.definitionBytes), prompt: `Readonly workflow coding investigation. Return only JSON matching WORKFLOW_INVESTIGATION_OUTPUT_SCHEMA.\nWORKFLOW_INVESTIGATION_REQUEST_JSON\n${JSON.stringify(promptPayload)}\nEND_WORKFLOW_INVESTIGATION_REQUEST_JSON`, signal: controller.signal, assertAdmission: () => assertRunnable(run, controller, unit), onIdentity: (native: WorkflowNativeIdentity) => { workflowAssert(identityValid(native) && !unit.native, 'Missing/duplicate/invalid investigation identity'); workflowAssert(!state.runs.some(r => workflowStepEntries(r).some(({ step: s }) => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === native.runId || u.native.taskId === native.taskId)))), 'Native identity collision'); unit.native = copy(native); }, coding: { operation: op, policy, candidateHash: baseline.hash, iteration: run.attemptNo, paths: readPaths, read: (p: string) => { assertRunnable(run, controller, unit); const entry = entries.get(p); workflowAssert(!!entry && readPaths.includes(p), 'investigation path is outside exact readonly snapshot'); workflowAssert(entry.exists && typeof entry.text === 'string', 'investigation path is unavailable in readonly snapshot'); return entry.text; }, write: () => { throw new Error('investigation context is read-only'); }, inspect: () => { assertRunnable(run, controller, unit); return inspectDetails(); } } });
+        unit.cleanupSettled = outcome.cleanupSettled === true; assertRunnable(run, controller, unit);
+        workflowAssert(unit.cleanupSettled && outcome.status === 'completed' && typeof outcome.text === 'string' && unit.native, 'Investigation did not complete with settled exact identity');
+        if (outcome.identity) workflowAssert(workflowHash(outcome.identity) === workflowHash(unit.native), 'Investigation native identity mismatch');
+        const result = workflowJson(JSON.parse(outcome.text), WORKFLOW_LIMITS.resultBytes); validateWorkflowValue(result, spec.outputSchema!);
+        unit.coding = { phase: 'investigated', candidateHash: baseline.hash, baseline: baselineSnapshotJson(baseline), evidence: boundedJson({ investigation: { identity: unit.native, baselineHash: baseline.hash, paths: readPaths } }) };
+        codingOutput(unit, result);
+      } else if (op === 'stage-write') {
+        const reviewed = unit.coding?.approvalId ? approvalRegistry.inspect(unit.coding.approvalId)[0] : undefined;
+        const baseline = (reviewed?.request?.humanReview as any)?.baseline ?? captureCodingBaseline({ projectRoot: cfg!.projectRoot, inputPaths, writablePaths, limits: policy.bounds });
+        const req = reviewed?.request ? reviewed.request as ReturnType<typeof implementationRequest> : implementationRequest(baseline);
+        let record = reviewed ? reviewed as any : approvalRegistry.request(req); unit.coding = { phase: 'awaiting-implementation-approval', approvalId: record.id, approvalStatus: record.status, baseline: boundedJson(baseline) }; unit.status = 'running'; unit.cleanupSettled = true; outputStep(spec, step); stamp(run); persist();
+        if (record.status !== 'granted') return;
+        let workspaceBaseline: ReturnType<typeof captureCodingBaseline>;
+        try { workspaceBaseline = assertFreshBaseline(baseline as ReturnType<typeof captureCodingBaseline>, cfg!.projectRoot, inputPaths, writablePaths, policy.bounds); }
+        catch (error) { approvalRegistry.invalidate(r => r.kind === 'implementation' && r.id === unit.coding!.approvalId, 'reviewed baseline changed before implementation grant'); throw error; }
+        const requestHash = approvalRegistry.inspect(unit.coding!.approvalId)[0].requestHash;
+        const grant = unit.coding?.approvalId ? approvalRegistry.requireLiveFingerprint('implementation', unit.coding.approvalId, requestHash) : approvalRegistry.requireLive('implementation', req); unit.coding.consumedApprovalId = grant.approvalId;
+        const assertCodingAuthority = () => { authority(run); approvalRegistry.requireLiveFingerprint('implementation', grant.approvalId, grant.requestHash); };
+        const previousSession = codingWorkspaces.get(codingKey(run));
+        const workspace = previousSession?.workspace ?? createCodingWorkspace({ workflowRunId: run.workflowRunId, projectRoot: cfg!.projectRoot, stagingParent: cfg!.stagingParent, inputPaths, writablePaths, assertAuthority: assertCodingAuthority, limits: policy.bounds, reviewedBaseline: workspaceBaseline }) as RuntimeCodingWorkspace;
+        const previousCandidate = previousSession?.workspace ? candidateJson(previousSession.workspace) : undefined;
+        const previousFeedback = workflowStepContext(run, spec.id).iteration?.state;
+        codingWorkspaces.set(codingKey(run), { workspace, implApprovalId: grant.approvalId, implRequestHash: grant.requestHash, baseline: baseline as ReturnType<typeof captureCodingBaseline>, ...(previousSession?.candidateHash ? { candidateHash: previousSession.candidateHash } : {}), ...(previousSession?.evidence ? { evidence: previousSession.evidence } : {}) });
+        const agent = run.agents[policy.identity.workerAgentId]; workflowAssert(agent, 'Coding worker agent missing');
+        const correctionContext = freezeWorkflowData({ ...(previousFeedback !== undefined ? { previousFeedback } : {}), ...(previousCandidate !== undefined ? { previousCandidate } : {}), ...(previousSession?.evidence !== undefined ? { previousEvidence: previousSession.evidence } : {}) }, WORKFLOW_LIMITS.promptBytes);
+        const writerPrompt = `${policy.scope.task}\n\nWORKFLOW_CORRECTION_CONTEXT_JSON\n${JSON.stringify(correctionContext)}\nEND_WORKFLOW_CORRECTION_CONTEXT_JSON`;
+        const reqNative = { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...lineage(run, spec.id), stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash, agent: freezeWorkflowData(agent, WORKFLOW_LIMITS.definitionBytes), prompt: writerPrompt, signal: controller.signal, assertAdmission: () => assertRunnable(run, controller, unit), onIdentity: (native: WorkflowNativeIdentity) => { workflowAssert(identityValid(native) && !unit.native, 'Missing/duplicate/invalid native identity'); workflowAssert(!state.runs.some(r => workflowStepEntries(r).some(({ step: s }) => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === native.runId || u.native.taskId === native.taskId)))), 'Native identity collision'); unit.native = copy(native); }, coding: { operation: op, policy, stageRoot: workspace.stageRoot, iteration: run.attemptNo, paths: policy.scope.writablePaths, read: (p: string) => { assertRunnable(run, controller, unit); assertCodingAuthority(); return workspace.read(p); }, write: (p: string, text: string) => { assertRunnable(run, controller, unit); assertCodingAuthority(); workspace.write(p, text); const session = latestCodingSession(run); if (session) { delete session.candidateHash; delete session.evidence; } approvalRegistry.invalidate(r => r.kind === 'application' && r.attemptKey === req.attemptKey, 'writer mutation invalidated application request'); }, inspect: () => { assertRunnable(run, controller, unit); assertCodingAuthority(); return candidateJson(workspace); } } };
+        operationBegan = true;
+        const outcome = await port.execute(reqNative);
+        unit.cleanupSettled = outcome.cleanupSettled === true;
+        if ((controller.signal.aborted || run.status === 'cancelling') && unit.cleanupSettled) { workspace.settle?.(); unit.status = 'cancelled'; return; }
+        assertRunnable(run, controller, unit); assertCodingAuthority();
+        workflowAssert(unit.cleanupSettled && outcome.status === 'completed' && unit.native, 'Coding writer did not complete with settled exact identity');
+        if (outcome.identity) workflowAssert(workflowHash(outcome.identity) === workflowHash(unit.native), 'Coding native identity mismatch');
+        const candidate = workspace.inspect(); workflowAssert(candidate.changedPaths.length > 0, 'Coding writer produced no candidate changes'); latestCodingSession(run)!.candidateHash = candidate.hash;
+        approvalRegistry.invalidate(r => r.kind === 'application' && r.attemptKey === req.attemptKey, 'writer invalidated previous gate evidence');
+        unit.coding = { phase: 'staged', candidateHash: candidate.hash, consumedApprovalId: grant.approvalId, workspace: { stageRoot: workspace.stageRoot }, candidate: candidateJson(workspace) }; codingOutput(unit, { candidateHash: candidate.hash, changedPaths: candidate.changedPaths });
+      } else if (op === 'check') {
+        const session = latestCodingSession(run); workflowAssert(session?.workspace && session.candidateHash && session.implApprovalId && session.implRequestHash, 'No staged candidate for check'); const workspace = session.workspace; approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash);
+        const profile = policy.checkProfiles?.find(p => p.id === spec.coding!.checkProfileId); workflowAssert(profile, 'Check profile not selected');
+        const bounds = resolveCodingBounds(policy);
+        const approvedHostProfile = { id: profile.id, executable: profile.executable, argv: profile.argv, cwd: profile.cwd, env: profile.env ?? {}, timeoutMs: profile.timeoutMs, outputBytes: bounds.maxOutputBytes, generatedOutputs: [] };
+        const trustedProfile = cfg!.checkProfiles?.[profile.id];
+        const trustedOutputBytes = trustedProfile && typeof trustedProfile === 'object' && Number.isSafeInteger((trustedProfile as Record<string, unknown>).outputBytes) ? (trustedProfile as Record<string, number>).outputBytes : bounds.maxOutputBytes;
+        workflowAssert(trustedOutputBytes > 0 && trustedOutputBytes <= bounds.maxOutputBytes, 'Trusted check output bound exceeds approved policy');
+        const comparableTrustedProfile = trustedProfile && typeof trustedProfile === 'object' ? { ...(trustedProfile as Record<string, unknown>), outputBytes: bounds.maxOutputBytes, generatedOutputs: (trustedProfile as Record<string, unknown>).generatedOutputs ?? [] } : trustedProfile;
+        if (!trustedProfile || workflowHash(comparableTrustedProfile) !== workflowHash(approvedHostProfile)) { unit.cleanupSettled = true; active.delete(activeKey); throw new Error('Trusted check profile does not exactly match approved profile'); }
+        operationBegan = true;
+        const result = await runCodingCheck({ profile: trustedProfile, stageRoot: workspace.stageRoot, expectedCandidateHash: sha256(session.candidateHash), captureCandidate: () => workspace.inspect().hash, signal: controller.signal, assertAuthority: () => { if (controller.signal.aborted || run.status === 'cancelling') { authority(run); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId!, session.implRequestHash!); return; } assertRunnable(run, controller, unit); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId!, session.implRequestHash!); } });
+        const evidenceComparable = { profileId: profile.id, status: result.passed ? 'passed' as const : 'failed' as const, ...(result.exitCode !== null ? { exitCode: result.exitCode } : {}), ...(result.signal !== null ? { signal: String(result.signal) } : {}), stdout: result.stdout, stderr: result.stderr, startedAt: result.startedAt, completedAt: result.finishedAt, outcome: result.outcome, reason: result.reason, timedOut: result.timedOut, cancelled: result.cancelled, stdoutTruncated: result.stdoutTruncated, stderrTruncated: result.stderrTruncated, stdoutDroppedBytes: result.stdoutDroppedBytes, stderrDroppedBytes: result.stderrDroppedBytes, cleanup: result.cleanup, candidateHashBefore: result.candidateHashBefore, candidateHashAfter: result.candidateHashAfter, expectedCandidateHash: result.expectedCandidateHash, checkProfileHash: result.profileHash };
+        const evidence = { ...evidenceComparable, evidenceHash: workflowHash(evidenceComparable) };
+        session.evidence = { checks: [...(session.evidence?.checks ?? []).filter(c => c.profileId !== profile.id), evidence], ...(session.evidence?.review ? { review: session.evidence.review } : {}) };
+        unit.coding = { phase: result.passed ? 'check-passed' : 'check-failed', candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence), evidence: boundedJson(session.evidence) };
+        unit.cleanupSettled = result.cleanup.outcome === 'ok' || result.cleanup.outcome === 'not_needed';
+        if (controller.signal.aborted || run.status === 'cancelling') { if (!unit.cleanupSettled) throw new Error(`Required coding check failed: ${result.reason}`); unit.status = 'cancelled'; return; }
+        assertRunnable(run, controller, unit); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash);
+        if (!result.passed) {
+          const corrective = result.outcome === 'failed' && !result.timedOut && !result.cancelled && (result.cleanup.outcome === 'ok' || result.cleanup.outcome === 'not_needed');
+          if (!corrective) throw new Error(`Required coding check failed: ${result.reason}`);
+          codingOutput(unit, { passed: false, profileId: profile.id, candidateHash: session.candidateHash });
+        } else codingOutput(unit, { passed: true, profileId: profile.id, candidateHash: session.candidateHash });
+      } else if (op === 'review') {
+        const session = latestCodingSession(run); workflowAssert(session?.workspace && session.candidateHash && session.implApprovalId && session.implRequestHash, 'No staged candidate for review'); const workspace = session.workspace; approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash);
+        const agent = run.agents[policy.identity.rootAgentId]; workflowAssert(agent && agent.id !== policy.identity.workerAgentId, 'Independent reviewer agent missing');
+        const reviewPayload = freezeWorkflowData({ task: policy.scope.task, writablePaths: policy.scope.writablePaths, candidate: candidateJson(workspace), checks: session.evidence?.checks ?? [] }, WORKFLOW_LIMITS.promptBytes);
+        operationBegan = true;
+        const outcome = await port.execute({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...lineage(run, spec.id), stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash, agent: freezeWorkflowData(agent, WORKFLOW_LIMITS.definitionBytes), prompt: `Review exact staged candidate and return only JSON {\"verdict\":\"pass|fail\",\"findings\":[]}.\n${JSON.stringify(reviewPayload)}`, signal: controller.signal, assertAdmission: () => assertRunnable(run, controller, unit), onIdentity: (native) => { workflowAssert(identityValid(native) && !unit.native, 'Missing/duplicate/invalid reviewer identity'); workflowAssert(!state.runs.some(r => workflowStepEntries(r).some(({ step: s }) => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === native.runId || u.native.taskId === native.taskId)))), 'Native identity collision'); unit.native = copy(native); }, coding: { operation: op, policy, stageRoot: workspace.stageRoot, candidateHash: session.candidateHash, iteration: run.attemptNo, paths: policy.scope.writablePaths, read: (p) => { assertRunnable(run, controller, unit); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId!, session.implRequestHash!); return workspace.read(p); }, write: () => { throw new Error('review context is read-only'); }, inspect: () => { assertRunnable(run, controller, unit); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId!, session.implRequestHash!); return candidateJson(workspace); } } });
+        workflowAssert(outcome.cleanupSettled && outcome.status === 'completed' && typeof outcome.text === 'string' && unit.native, 'Review did not complete with settled identity'); unit.cleanupSettled = true;
+        workflowAssert(unit.native.runId !== policy.identity.workerAgentId && unit.native.taskId !== policy.identity.workerAgentId, 'Reviewer identity is not distinct');
+        assertRunnable(run, controller, unit); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash);
+        const parsed = workflowJson(JSON.parse(outcome.text), WORKFLOW_LIMITS.resultBytes) as Record<string, WorkflowJson>; workflowAssert(Object.keys(parsed).every(k => ['verdict','findings'].includes(k)) && (parsed.verdict === 'pass' || parsed.verdict === 'fail' || parsed.verdict === 'passed' || parsed.verdict === 'failed') && Array.isArray(parsed.findings), 'Invalid bounded review schema'); const scriptedVerdict = parsed.verdict === 'pass' || parsed.verdict === 'passed';
+        const checksReady = requiredChecksPassed(policy, session.evidence, session.candidateHash);
+        const verdict = scriptedVerdict && checksReady;
+        const findings = parsed.findings;
+        const reviewBase = { status: verdict ? 'passed' as const : 'failed' as const, reviewerIdentity: `${unit.native.runId}:${unit.native.taskId}`, findings };
+        const review = { ...reviewBase, evidenceHash: workflowHash(reviewBase) } as unknown as WorkflowCodingReviewEvidence;
+        session.evidence = { checks: session.evidence?.checks ?? [], review };
+        unit.coding = { phase: verdict ? 'review-passed' : 'review-failed', candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence), evidence: boundedJson(session.evidence) };
+        codingOutput(unit, { passed: verdict, candidateHash: session.candidateHash, reviewer: review.reviewerIdentity, findings });
+      } else if (op === 'apply') {
+        const session = latestCodingSession(run); workflowAssert(session?.workspace && session.candidateHash && session.evidence && session.implApprovalId && session.implRequestHash, 'No staged candidate/evidence for apply'); const workspace = session.workspace; approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash);
+        assertRuntimeApplyEvidence(run, policy, session.evidence, session.candidateHash);
+        workflowAssert(codingGatesPassed(policy, session.evidence, { candidateHash: session.candidateHash, policyHash: codingPolicyHash(policy), baselineHash: codingBaselineHash(policy), changedPaths: session.workspace.inspect().changedPaths, files: [], bytes: 0, id: session.candidateHash.slice(0, 32), iteration: run.attemptNo }), 'Required checks/review have not passed');
+        try { session.workspace.assertFreshDestination(); }
+        catch (error) { if (unit.coding?.approvalId) approvalRegistry.invalidate(r => r.kind === 'application' && r.id === unit.coding!.approvalId, 'target changed before application'); session.workspace.settle?.(); throw error; }
+        const candidateForApproval = session.workspace.inspect(); const baseline = session.baseline ?? captureCodingBaseline({ projectRoot: cfg!.projectRoot, inputPaths, writablePaths, limits: policy.bounds }); const targetHash = workflowHash({ baseline: baseline.hash, candidate: session.candidateHash, changedPaths: candidateForApproval.changedPaths });
+        const applicationPayload = { candidate: candidateJson(session.workspace), stats: { totalBytes: candidateForApproval.totalBytes ?? 0, clippedBytes: candidateForApproval.clippedBytes ?? 0 }, retained: { stageRoot: session.workspace.stageRoot, candidateHash: session.candidateHash }, evidence: session.evidence, targetBaselineHash: baseline.hash, beforeAfter: candidateForApproval.files.map(f => ({ path: f.path, beforeHash: f.beforeHash, afterHash: f.afterHash, beforeBytes: f.before?.length ?? 0, afterBytes: f.after?.length ?? 0, preview: f.preview ?? f.after?.toString('utf8') ?? '', clippedBytes: f.clippedBytes ?? 0 })) };
+        const req = createCodingApprovalRequest('application', policy, { candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence), targetHash, humanReview: approvalPayload('application', baseline, applicationPayload) });
+        const record = approvalRegistry.request(req); unit.coding = { phase: 'awaiting-application-approval', approvalId: record.id, approvalStatus: record.status, candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence) }; unit.status = 'running'; unit.cleanupSettled = true; outputStep(spec, step); stamp(run); persist();
+        if (record.status !== 'granted') return;
+        const beforeApply = session.workspace.inspect(); workflowAssert(beforeApply.hash === session.candidateHash, 'Workspace candidate changed after review/check gates');
+        const grant = unit.coding?.approvalId ? approvalRegistry.consumeFingerprint('application', unit.coding.approvalId, approvalRegistry.inspect(unit.coding.approvalId)[0].requestHash) : approvalRegistry.consume('application', req); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash); assertRunnable(run, controller, unit); operationBegan = true; const applied = session.workspace.apply(session.candidateHash);
+        const outcome = { status: applied.status, candidateHash: session.candidateHash, appliedPaths: applied.appliedPaths, rejectedPaths: applied.status === 'applied' ? [] : session.workspace.inspect().changedPaths.filter(p => !applied.appliedPaths.includes(p)), diagnostics: applied.error ? [applied.error] : [], outcomeHash: workflowHash(applied) };
+        unit.coding = { phase: applied.status === 'applied' ? 'applied' : applied.status === 'partial' ? 'apply-partial-uncertain' : 'apply-rejected', candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence), consumedApprovalId: grant.approvalId, appliedPaths: applied.appliedPaths, rejectedPaths: outcome.rejectedPaths, ...(applied.error ? { error: applied.error } : {}), outcome: boundedJson(outcome), evidence: boundedJson(session.evidence), workspace: { stageRoot: session.workspace.stageRoot } };
+        if (applied.status !== 'applied') { budgetResult(unit, freezeWorkflowData(outcome as unknown as WorkflowJson, WORKFLOW_LIMITS.resultBytes)); unit.status = 'failed'; unit.cleanupSettled = true; throw new Error(applied.error ?? 'Apply rejected'); }
+        session.workspace.settle?.();
+        codingOutput(unit, outcome as unknown as WorkflowJson);
+      } else throw new Error(`Unsupported coding operation ${op}`);
+    }).then(() => { if (!unit.cleanupSettled) unit.cleanupSettled = true; active.delete(activeKey); outputStep(spec, step); stamp(run); finishRun(run); persist(); }, error => { if (!operationBegan) { unit.cleanupSettled = true; active.delete(activeKey); if (unit.status !== 'cancelled') unit.status = 'failed'; }
+      else if (!unit.cleanupSettled) { unit.status = 'unverified'; cleanupUncertain = true; }
+      else if (unit.status !== 'failed') unit.status = 'failed'; unit.error = errorText(error); if (unit.cleanupSettled) active.delete(activeKey); outputStep(spec, step); stamp(run); finishRun(run); persist(); }).finally(() => { pending.delete(operation); schedule(); });
+    pending.add(operation); return true;
+  };
   const launch = (run: WorkflowRun, spec: WorkflowStep, step: WorkflowStepRun, unit: WorkflowUnit) => {
     const controller = new AbortController();
     const key = `${run.workflowRunId}/${unit.id}`;
@@ -540,7 +766,9 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
             if (spec.kind === 'repeat' && step.status === 'running' && advanceRepeat(run, spec, step)) { stamp(run); persist(); progress = true; }
             if (run.status !== 'running') break;
             for (const unit of step.units) {
-              if (run.status !== 'running' || active.size >= globalCap() || runActiveCount(run) >= run.concurrency) break;
+              if (run.status !== 'running') break;
+              if (spec.kind === 'coding') { if (unit.status === 'queued' || (unit.status === 'running' && unit.coding?.approvalStatus === 'pending')) progress = launchCoding(run, spec, step, unit) || progress; continue; }
+              if (active.size >= globalCap() || runActiveCount(run) >= run.concurrency) break;
               if (unit.status === 'queued') { launch(run, spec, step, unit); progress = true; }
             }
           }
@@ -619,7 +847,14 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     } catch (error) { return { ok: false, action, error: errorText(error) }; }
   };
   persist();
-  return { execute, list, get: id => { const run = state.runs.find(r => r.workflowRunId === id); return run ? copy(run) : undefined; },
+  const approvals: WorkflowTrustedApprovalApi = {
+    grant(id, request) { const record = approvalRegistry.grant(id, request); schedule(); return record; },
+    grantFingerprint(id, requestHash) { const record = approvalRegistry.grantFingerprint(id, requestHash); schedule(); return record; },
+    reject(id, request, reason) { const record = approvalRegistry.reject(id, request, reason); schedule(); return record; },
+    revoke(id, request, reason) { const record = approvalRegistry.revoke(id, request, reason); schedule(); return record; },
+    inspect: id => approvalRegistry.inspect(id) as unknown as ReturnType<WorkflowTrustedApprovalApi['inspect']>,
+  };
+  return { execute, list, get: id => { const run = state.runs.find(r => r.workflowRunId === id); return run ? copy(run) : undefined; }, approvals,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     dispose() {
       if (disposed) return; disposed = true;

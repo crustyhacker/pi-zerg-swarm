@@ -6,7 +6,7 @@ import { sanitizeUiText, styleText, uiErrorText, visibleSlice, type UiThemeLike 
 import { matchesKey } from './state.js';
 
 export interface ZergWorkflowOverlayOptions {
-  service: Pick<WorkflowService, 'list' | 'get' | 'subscribe' | 'execute'>;
+  service: Pick<WorkflowService, 'list' | 'get' | 'subscribe' | 'execute' | 'approvals'>;
   workflowRunId?: string;
   onOpenNative?(identity: WorkflowNativeIdentity): void | Promise<void>;
 }
@@ -31,6 +31,53 @@ function identity(run: WorkflowRun, stepId?: string, unitId?: string): string {
   return JSON.stringify([run.workflowRunId, run.familyId, run.attemptNo, run.retryOf, run.definition.id, run.definitionHash, run.createdAt,
     stepId, entry?.blockId, entry?.iterationId, entry?.iterationNo, unitId, unit?.inputHash, unit?.native?.runId, unit?.native?.taskId,
     unit?.reusedFrom?.workflowRunId, unit?.reusedFrom?.unitId, unit?.reusedFrom?.native.runId, unit?.reusedFrom?.native.taskId]);
+}
+const clipped = (value: unknown, max = 80): string => {
+  const text = sanitizeUiText(typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value));
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 28))}… [clipped ${text.length - Math.max(0, max - 28)} chars]` : text;
+};
+const hash8 = (value?: string) => value ? clipped(value, 16) : 'none';
+const statusWord = (value?: string) => value ? clipped(value, 24) : 'missing';
+function codingApprovalLines(service: ZergWorkflowOverlayOptions['service'], approvalId?: string, limit = 2): string[] {
+  if (!approvalId) return [];
+  try {
+    const rows = service.approvals.inspect(approvalId).slice(0, limit);
+    if (!rows.length) return [`approval ${clipped(approvalId, 48)} · missing/revoked from registry`];
+    return rows.map((row) => {
+      const scope = (row as { scope?: Record<string, unknown>; request?: Record<string, unknown> }).scope ?? (row as { request?: Record<string, unknown> }).request ?? {};
+      const fields = ['attemptKey', 'baselineHash', 'candidateHash', 'evidenceHash', 'targetHash', 'expiresAt']
+        .map((key) => scope[key] ? `${key}:${hash8(String(scope[key]))}` : undefined).filter(Boolean).join(' ');
+      return `approval ${clipped(row.id, 48)} · ${row.kind}/${row.status}${row.consumed ? '/consumed' : ''} · request ${hash8(row.requestHash)}${fields ? ` · ${fields}` : ''}${row.reason ? ` · ${clipped(row.reason, 80)}` : ''}`;
+    }).concat(rows.length >= limit ? [`Approval detail clipped: showing ${limit}.`] : []);
+  } catch (error) { return [`approval ${clipped(approvalId, 48)} · inspect unavailable: ${uiErrorText(error)}`]; }
+}
+function jsonRecord(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
+function codingSummary(unit: WorkflowUnit): string {
+  const coding = unit.coding;
+  if (!coding) return '';
+  const result = jsonRecord(unit.result);
+  const changed = Array.isArray(result?.changedPaths) ? result.changedPaths.map(String) : [];
+  const applied = coding.appliedPaths ?? (Array.isArray(result?.appliedPaths) ? result.appliedPaths.map(String) : []);
+  const outcome = typeof result?.status === 'string' ? ` · application:${statusWord(result.status)}${['partial','uncertain'].includes(result.status) ? '!' : ''}` : '';
+  return ` · coding phase:${statusWord(coding.phase)} approval:${statusWord(coding.approvalStatus)} candidate:${hash8(coding.candidateHash ?? (typeof result?.candidateHash === 'string' ? result.candidateHash : undefined))} paths:${changed.length || applied.length}`
+    + `${coding.evidenceHash ? ` checks/review:${hash8(coding.evidenceHash)}` : ' checks/review:missing'}${applied.length ? ` applied:${applied.length}` : ''}${outcome}`;
+}
+function codingDetailLines(unit: WorkflowUnit, service: ZergWorkflowOverlayOptions['service']): string[] {
+  if (!unit.coding) return [];
+  const coding = unit.coding, result = jsonRecord(unit.result);
+  const changed = Array.isArray(result?.changedPaths) ? result.changedPaths.map(String) : [];
+  const applied = coding.appliedPaths ?? (Array.isArray(result?.appliedPaths) ? result.appliedPaths.map(String) : []);
+  const paths = changed.length ? changed : applied;
+  const visible = paths.slice(0, 6).map(p => clipped(p, 72)).join(', ');
+  const omitted = paths.length > 6 ? ` [${paths.length - 6} omitted]` : '';
+  const lines = [
+    `coding monitor · phase ${statusWord(coding.phase)} · attempt unit ${clipped(unit.id, 64)} · writer ${nativeOf(unit)?.runId ?? 'unlinked'}/${nativeOf(unit)?.taskId ?? 'unlinked'}`,
+    `prepared≠checked≠reviewed≠approved≠applied · candidate ${hash8(coding.candidateHash ?? (typeof result?.candidateHash === 'string' ? result.candidateHash : undefined))} · changed/applied paths ${paths.length}: ${visible}${omitted}`,
+    `freshness · checks/review evidence ${coding.evidenceHash ? hash8(coding.evidenceHash) : 'missing/stale until matching gate completes'} · approval ${statusWord(coding.approvalStatus)} · consumed ${coding.consumedApprovalId ? clipped(coding.consumedApprovalId, 48) : 'none'}`,
+  ];
+  if (typeof result?.status === 'string' && ['partial','uncertain','rejected'].includes(result.status)) lines.push(`application outcome requires attention: ${statusWord(result.status)} · partial/uncertain is not applied`);
+  lines.push(...codingApprovalLines(service, coding.approvalId));
+  return lines;
 }
 /** Report the recorded transition, never infer exhaustion from a generic failure. */
 function repeatOutcome(step: WorkflowStepRun, recovered: boolean): string {
@@ -171,7 +218,7 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
     const repeatStatus = block && blockSpec?.kind === 'repeat'
       ? ` · ${block.id} iteration ${block.iterations?.length ?? 0}/${blockSpec.maxIterations} · ${block.status} · ${repeatOutcome(block, run!.recovered)}${block.skipReason ? ` · ${block.skipReason}` : ''}${block.error ? ` · ${block.error}` : ''}` : '';
     const header = [`zerg workflows · ${this.state.level} · ${label}`, `${this.state.runId ?? 'all retained runs'} · attempt ${run?.attemptNo ?? '?'} · ${status}${repeatStatus}`,
-      `${this.pending ? 'Control pending. ' : ''}${this.notice} ${this.observerNotice} ${run?.error ? `Workflow error: ${sanitizeUiText(run.error)} · ` : ''}Pause closes admission only; admitted workers continue. UI bounds: 16 runs/16 phases/32 iterations/32 units.`];
+      `${this.pending ? 'Control pending. ' : ''}${this.notice} ${this.observerNotice} ${run?.error ? `Workflow error: ${sanitizeUiText(run.error)} · ` : ''}Pause closes admission only; admitted workers continue. UI bounds: 16 runs/16 phases/32 iterations/32 units; approval monitor is inspect-only.`];
     const headerCount = Math.min(3, Math.max(0, h - 2)); const footerCount = h >= 3 ? 1 : 0;
     const capacity = Math.max(1, h - headerCount - footerCount); this.viewport = capacity;
     const selected = this.selectedId();
@@ -182,9 +229,10 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
       body = [`Retry NEW attempt for ${this.confirmation.runId}? Enter confirms · Esc cancels (current policy rechecked).`];
       shown = false;
     } else if (this.state.level === 'result' && unit) {
-      const values = [`unit ${unit.id} · ${unit.status}${!unit.cleanupSettled ? ' · cleanup-pending' : ''}`,
+      const values = [`unit ${unit.id} · ${unit.status}${!unit.cleanupSettled ? ' · cleanup-pending' : ''}${codingSummary(unit)}`,
         unit.reusedFrom ? `reused from workflow ${unit.reusedFrom.workflowRunId} / unit ${unit.reusedFrom.unitId} / native ${unit.reusedFrom.native.runId}` : 'Original attempt result; no inferred replies.',
-        `native run ${nativeOf(unit)?.runId ?? 'unlinked'} · task ${nativeOf(unit)?.taskId ?? 'unlinked'}`, `error: ${unit.error ?? '(none)'}`, resultPreview(unit.result), 'Local structured result preview only; no transcript copy.'];
+        `native run ${nativeOf(unit)?.runId ?? 'unlinked'} · task ${nativeOf(unit)?.taskId ?? 'unlinked'}`, `error: ${unit.error ?? '(none)'}`,
+        ...codingDetailLines(unit, this.options.service), resultPreview(unit.result), 'Local structured result preview only; no transcript copy.'];
       const lines: string[] = [];
       for (const value of values) {
         const wrapped = new Text(sanitizeUiText(value), 0, 0).render(w);
@@ -212,7 +260,7 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
           return `${mark} phase ${id} · ${row.status} · ${row.units.length} units${entry.spec.kind === 'repeat' ? ` · iteration ${row.iterations?.length ?? 0}/${entry.spec.maxIterations}` : ''} · ${row.skipReason ?? ''} ${row.error ?? ''}${entry.spec.kind === 'repeat' ? ` · ${repeatOutcome(row, run!.recovered)}` : ''}`;
         }
         const row = selectedStep!.units.find((entry) => entry.id === id)!;
-        return `${mark} unit ${id} · ${row.status}${row.cleanupSettled ? '' : ' · cleanup-pending'}${row.reusedFrom ? ` · reused from ${row.reusedFrom.workflowRunId}/${row.reusedFrom.unitId} native:${row.reusedFrom.native.runId}` : ''} · ${row.error ?? ''}`;
+        return `${mark} unit ${id} · ${row.status}${row.cleanupSettled ? '' : ' · cleanup-pending'}${row.reusedFrom ? ` · reused from ${row.reusedFrom.workflowRunId}/${row.reusedFrom.unitId} native:${row.reusedFrom.native.runId}` : ''}${codingSummary(row)} · ${row.error ?? ''}`;
       });
       shown = index >= 0 && slice.rows.includes(selected!);
       if (!body.length) body = ['No retained selection. Missing IDs never select another run/unit.'];

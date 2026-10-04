@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.17] - 2026-10-04
+
+### Added
+
+- Opt-in version-3 coding workflows with separate trusted implementation and application approvals, exact attempt/policy/baseline/candidate binding, revocation, and no model-facing approval action. Existing version-1 and version-2 workflows remain read-only.
+- Bounded, owned text-file staging; a single controlled writer; deterministic approved checks; independent read-only native review; and corrections using the existing repeat scheduler. Application rechecks freshness, preserves unrelated changes, and records per-file partial outcomes without automatic rollback or Git operations.
+- Sealed native coding tools, compact exact-attempt approval inspection, trusted interactive confirmation, coding monitor evidence, and a compile-tested disposable-project example.
+- A bundled Linux/Python check supervisor with subreaper and pidfd support, bounded output/timeouts, cancellation and descendant cleanup. Project checks run with host permissions, not a filesystem or network sandbox; no dependencies are installed automatically.
+- Regression and actual isolated SDK plus regular/fullscreen Pi-host acceptance for real staged edits/checks/review/correction/application, denial, stale-target rejection, cancellation, and fresh-process recovery with zero replay. Scripted loopback acceptance is not manual visual or real-model coding-quality evidence.
+
+### Changed
+
+- Package allowlist and explicit subpath exports include the public workflow modules, example, and check supervisor; private transfer artifacts remain excluded.
+- Coding recovery retains inspectable evidence but restores no approval authority. Mutating retries and unsafe forgetting are refused; durable execution resumption remains outside this release.
+
 ## [1.1.16] - 2026-10-04
 
 ### Added

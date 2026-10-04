@@ -195,3 +195,20 @@ test('v1 preset hash golden and v2 primitive schema inference reject every misma
   d.steps[1].when = { op: 'eq', left: { ref: { source: 'step', stepId: 'aggregate', path: [] } }, right: { value: true } }; assert.throws(() => validateWorkflowDefinition(d));
   const repeat = repeatDefinition(); repeat.steps[0].stateSchema = { type: 'boolean' }; assert.throws(() => validateWorkflowDefinition(repeat));
 });
+
+test('v3 coding definitions validate opt-in controlled steps without changing v1/v2 defaults', async () => {
+  const { createHash } = await import('node:crypto');
+  const fileText = 'old\n'; const sha256 = createHash('sha256').update(fileText).digest('hex');
+  const profileBase = { id: 'unit', executable: '/usr/bin/node', argv: ['--test'], cwd: 'repo', env: {}, timeoutMs: 1000, allowGeneratedOutputs: false as const };
+  const policy = { version: 3 as const, capabilities: ['stage-write','check','review','apply'], identity: { parentRunId: 'parent', taskId: 'task', attemptNo: 1, rootAgentId: 'root', workerAgentId: 'worker', model: 'model' }, scope: { task: 'bounded edit', writablePaths: ['src/a.ts'], baseline: { projectRootId: 'root', stateHash: 'base' }, manifest: [{ path: 'src/a.ts', text: fileText, bytes: Buffer.byteLength(fileText), sha256 }] }, checkProfiles: [{ ...profileBase, profileHash: workflowHash(profileBase) }], reviewRequired: true };
+  const v3: WorkflowDefinition = { id: 'coding', version: 3, label: 'Coding', inputSchema: closed, steps: [{ id: 'stage', kind: 'coding', dependsOn: [], inputs: {}, outputSchema: { type: 'object', properties: { candidateHash: text }, required: ['candidateHash'], additionalProperties: false }, coding: { operation: 'stage-write', policy } }] };
+  validateWorkflowDefinition(v3);
+  for (const mutate of [
+    (d: WorkflowDefinition) => { d.version = 2; },
+    (d: WorkflowDefinition) => { d.steps[0].kind = 'native'; },
+    (d: WorkflowDefinition) => { d.steps[0].coding!.operation = 'investigate'; },
+    (d: WorkflowDefinition) => { d.steps[0].coding!.checkProfileId = 'unit'; },
+    (d: WorkflowDefinition) => { (d.steps[0] as any).prompt = 'model approves apply'; },
+  ]) { const copy = structuredClone(v3); mutate(copy); assert.throws(() => validateWorkflowDefinition(copy)); }
+  const check = structuredClone(v3); check.steps[0].coding!.operation = 'check'; check.steps[0].coding!.checkProfileId = 'unit'; validateWorkflowDefinition(check);
+});

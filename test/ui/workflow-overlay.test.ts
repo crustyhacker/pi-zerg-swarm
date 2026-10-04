@@ -28,7 +28,8 @@ function fixture(initial = [run()], optionsPatch: Partial<ZergWorkflowOverlayOpt
   const service: ZergWorkflowOverlayOptions['service'] = {
     list: () => runs.map(view), get: (id) => { reads++; return runs.find((row) => row.workflowRunId === id); },
     subscribe: (next) => { listener = next; return () => { unsubscribed++; }; },
-    execute: async (action) => { actions.push(action); return { ok: true, action: action.action }; }, ...servicePatch,
+    execute: async (action) => { actions.push(action); return { ok: true, action: action.action }; },
+    approvals: { grant: (id, request) => ({ id, status: 'granted', createdAt: 'now', ...request }), grantFingerprint: (id) => { throw new Error(`unexpected grant ${id}`); }, reject: (id, request, reason) => ({ id, status: 'rejected', createdAt: 'now', reason, ...request }), revoke: (id, request, reason) => ({ id, status: 'revoked', createdAt: 'now', reason, ...request }), inspect: () => [] }, ...servicePatch,
   };
   const options = { service, onOpenNative: async () => undefined, ...optionsPatch };
   const component = new ZergWorkflowComponent({ requestRender: () => { renders++; } }, undefined, (value) => { done++; result = value; }, options);
@@ -189,6 +190,34 @@ test('public Kitty/CSI keys work; key release and mixed suffix packets cannot tr
   out(f.component); f.component.handleInput('\x1b[13u'); assert.match(out(f.component), /· steps ·/);
   f.component.handleInput('\x1b[13u'); out(f.component); f.component.handleInput('\x1b[99u');
   assert.deepEqual(f.result?.native, { runId: 'native-unit-a', taskId: 'task-unit-a' }); assert.equal(f.unsubscribed, 1);
+});
+
+function codingRun(status = 'pending', patch: Partial<WorkflowUnit> = {}): WorkflowRun {
+  const source = run('workflow-coding'); source.definition.version = 3;
+  source.definition.steps = [{ id: 'stage', kind: 'coding', dependsOn: [], inputs: {}, outputSchema: { type: 'object', properties: {}, additionalProperties: false }, coding: { operation: 'stage-write', policy: {} } } as never];
+  source.steps = [{ id: 'stage', status: 'running', units: [{ ...unit('stage:0', 'running'), stepId: 'stage', id: 'stage:0', result: { candidateHash: 'c'.repeat(64), changedPaths: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts', 'src/f.ts', 'src/g.ts'] }, coding: { phase: 'awaiting-implementation-approval', approvalId: 'approval-1', approvalStatus: status }, ...patch }] }];
+  return source;
+}
+
+test('coding monitor inspects approval states and clipped candidate scope without approval controls', () => {
+  for (const status of ['pending', 'granted', 'revoked', 'expired'] as const) {
+    const f = fixture([codingRun(status)], {}, { approvals: { grant: undefined as never, grantFingerprint: undefined as never, reject: undefined as never, revoke: undefined as never, inspect: (id?: string) => [{ id: id ?? 'approval-1', kind: 'implementation', status, requestHash: 'a'.repeat(64), consumed: false, createdAt: '2026-10-04T00:00:00Z', request: { kind: 'implementation', attemptKey: 'parent:task:1', taskHash: 'b'.repeat(64), policyHash: 'p'.repeat(64), scopeHash: 's'.repeat(64), agentHash: 'g'.repeat(64), model: 'model-x', baselineHash: 'd'.repeat(64) }, scope: { attemptKey: 'parent:task:1', baselineHash: 'd'.repeat(64) } }] as never } });
+    units(f.component); assert.match(out(f.component), new RegExp(`approval:${status}`));
+    f.component.handleInput('enter'); const text = out(f.component);
+    assert.match(text, new RegExp(`implementation/${status}`));
+    assert.match(text, /prepared≠checked≠reviewed≠approved≠applied/);
+    assert.match(text, /\[1 omitted\]/);
+    assert.doesNotMatch(text, /confirm=true|grantFingerprint|grant\(/);
+    f.component.handleInput('escape'); f.component.handleInput('escape'); f.component.dispose();
+  }
+});
+
+test('coding monitor reports stale selection and partial uncertain application as not applied', () => {
+  const f = fixture([codingRun('granted', { status: 'completed', result: { status: 'partial', candidateHash: 'e'.repeat(64), appliedPaths: ['src/a.ts'] }, coding: { phase: 'applied', candidateHash: 'e'.repeat(64), evidenceHash: 'f'.repeat(64), appliedPaths: ['src/a.ts'] } })]);
+  units(f.component); assert.match(out(f.component), /application:partial!/);
+  f.component.handleInput('enter'); assert.match(out(f.component), /partial\/uncertain is not applied/);
+  const replacement = codingRun('granted'); replacement.steps[0]!.units[0]!.inputHash = 'changed'; f.update([replacement]); f.component.handleInput('c');
+  assert.equal(f.done, 0); assert.equal(f.actions.length, 0); f.component.dispose();
 });
 
 function loopRun(): WorkflowRun {

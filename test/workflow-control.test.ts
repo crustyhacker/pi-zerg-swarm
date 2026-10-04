@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { registerHooks } from 'node:module';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createZergState, createZergStateContainer } from '../state.js';
 import type { WorkflowReply, WorkflowState } from '../workflow-model.js';
 import type { WorkflowDefinition, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from '../index.js';
@@ -74,6 +78,22 @@ async function start(control: ZergControl, steps = 1) {
   return reply(await control.execute({ action: 'workflows.start', definitionId: 'control-test', inputs: {}, concurrency: 1 })).view!.workflowRunId;
 }
 async function view(control: ZergControl, workflowRunId: string) { return reply(await control.execute({ action: 'workflows.show', workflowRunId })).view!; }
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+function codingDefinition(id: string, root: string): WorkflowDefinition {
+  const policy = { version: 3 as const, capabilities: ['stage-write'] as ['stage-write'], identity: { parentRunId: 'parent', taskId: id, attemptNo: 1, rootAgentId: 'safe', workerAgentId: 'safe', model: 'fake/model' },
+    scope: { task: `large approval payload ${id}`, writablePaths: ['src/a.txt'], readonlyPaths: ['src/readonly.txt'], baseline: { projectRootId: root, stateHash: sha('old\n') }, manifest: [{ path: 'src/a.txt', text: 'old\n', bytes: 4, sha256: sha('old\n') }] } };
+  return { id, version: 3, label: id, inputSchema: { type: 'object', properties: {}, additionalProperties: false }, steps: [
+    { id: 'stage', kind: 'coding', dependsOn: [], inputs: {}, outputSchema: { type: 'object', properties: { candidateHash: { type: 'string', maxLength: 80 }, changedPaths: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 128 } } }, required: ['candidateHash','changedPaths'], additionalProperties: false }, coding: { operation: 'stage-write', policy } },
+  ] };
+}
+function codingControl(root: string, staging: string) {
+  return createZergControl(container(), { coding: { enabled: true, projectRoot: root, stagingParent: staging } });
+}
+function makeCodingRoot(label: string) {
+  const root = mkdtempSync(join(tmpdir(), `wf-control-${label}-root-`)); const staging = mkdtempSync(join(tmpdir(), `wf-control-${label}-stage-`));
+  mkdirSync(join(root, 'src')); writeFileSync(join(root, 'src/a.txt'), 'old\n'); writeFileSync(join(root, 'src/readonly.txt'), `${'x'.repeat(5000)}\n`);
+  return { root, staging };
+}
 
 test('workflow control does not trust fabricated native adapter kind or authority metadata', async () => {
   reset(); let launched = 0;
@@ -170,6 +190,45 @@ test('restart recovery does not execute or reconnect any workflow native unit', 
   const next = createZergControl(createZergStateContainer(recovered)); const summary = await view(next, id);
   assert.equal(summary.status, 'needs-attention'); assert.equal(summary.recovered, true); assert.equal(summary.counts.unverified, 1);
   assert.equal((await next.execute({ action: 'workflows.resume', workflowRunId: id })).ok, false); assert.equal(host.loads, 0); next.dispose();
+});
+
+test('workflows.show exposes only compact exact-run approval summaries while trusted operator inspect stays full', async () => {
+  reset(); const a = makeCodingRoot('a');
+  const control = codingControl(a.root, a.staging);
+  reply(await control.execute({ action: 'workflows.define', definition: codingDefinition('coding-a', a.root) }));
+  reply(await control.execute({ action: 'workflows.define', definition: codingDefinition('coding-b', a.root) }));
+  const runA = reply(await control.execute({ action: 'workflows.start', definitionId: 'coding-a', inputs: {}, concurrency: 1 })).view!.workflowRunId;
+  const runB = reply(await control.execute({ action: 'workflows.start', definitionId: 'coding-b', inputs: {}, concurrency: 1 })).view!.workflowRunId;
+  await until(() => control.workflowApprovals!.inspect().length === 2);
+  const full = control.workflowApprovals!.inspect();
+  assert.equal(full.length, 2);
+  assert.ok(JSON.stringify(full[0]!.request.humanReview).includes('x'.repeat(1000)), 'trusted operator API retains full bounded review payload');
+  const shown = await control.execute({ action: 'workflows.show', workflowRunId: runA }); assert.equal(shown.ok, true, shown.error?.message);
+  const approvals = (shown.data as any).approvals;
+  assert.equal(approvals.workflowRunId, runA);
+  assert.equal(approvals.requests.length, 1);
+  assert.equal(approvals.requests[0].kind, 'implementation');
+  assert.equal(approvals.requests[0].scope.task, 'large approval payload coding-a');
+  assert.deepEqual(approvals.requests[0].scope.paths.writable, ['src/a.txt']);
+  assert.equal(approvals.requests[0].request, undefined);
+  assert.equal(approvals.requests[0].action, undefined);
+  assert.ok(!JSON.stringify(shown.data).includes('x'.repeat(1000)), 'compact show omits full file payload');
+  assert.equal(JSON.stringify(shown.data).includes(runB), false, 'selected run does not expose other run approval identity');
+  assert.equal((await control.execute({ action: 'workflows.show', workflowRunId: 'forged-run' })).ok, false);
+  control.dispose();
+});
+
+test('workflow approval grant is not exposed through zerg_control tool actions and slash path requires trusted UI', async () => {
+  reset(); const commands = new Map<string, StructuralPiCommandOptions>(); let tool: any;
+  const extension = registerZergSwarmExtension({ registerCommand(name, command) { commands.set(name, command); }, registerTool(value) { tool = value; } });
+  try {
+    const modelResult = await tool.execute('fake-call', { action: 'workflows.approve', workflowRunId: 'wf', approvalId: 'approval-1', confirm: true });
+    assert.equal(modelResult.details.ok, false);
+    assert.match(modelResult.details.error.message, /Unknown zerg_control action/);
+    const notices: string[] = [];
+    await commands.get('zerg')!.handler('workflows approve wf approval-1', { mode: 'print', hasUI: false, ui: { notify(text: string) { notices.push(text); } } });
+    assert.match(notices.at(-1) ?? '', /interactive UI confirmation is required/);
+  } finally { extension.dispose(); }
 });
 
 test('registered workflow aliases and structured tool share one service; nonterminal monitor never requires TUI', async () => {

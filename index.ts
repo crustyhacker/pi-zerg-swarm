@@ -6,12 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
 import { createWorkflowService } from './workflow-runtime.js';
-import { WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService } from './workflow-model.js';
+import { WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowTrustedApprovalApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
 export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
 import { createNativeContinuationService, captureNativeContinuationPolicy, captureNativeContinuationPolicySync, validateContinuationSourceImmediate, importNativeContinuation, appendNativeContinuationMarker, nativeSourceIdentity, strictContinuationFields, continuationDeclaredDefinition, continuationDigest, type NativeContinuationService, type NativeContinuationAdmission } from './native-continuation.js';
+import { createSealedWorkflowResourceLoader, createWorkflowNativeCodingTools, WORKFLOW_NATIVE_CODING_TOOL_NAMES } from './workflow-native-tools.js';
 export type { NativeContinuationPrepare, NativeContinuationReview, NativeContinuationPolicy, NativeContinuationService } from './native-continuation.js';
 import { openZergAgentOverlay } from './ui/agent-overlay.js';
 import { openZergWorkflowOverlay } from './ui/workflow-overlay.js';
@@ -37,6 +38,8 @@ export interface ZergCommandHandlerOptions {
   /** Exact owner capability; independent of the strictly read-only observer. */
   sessionMessageService?: SessionMessageService;
   nativeContinuationService?: NativeContinuationService;
+  /** Trusted host-only v3 workflow coding configuration; never supplied by model/tool actions. */
+  coding?: WorkflowTrustedCodingConfig & { enabled?: boolean };
 }
 
 type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService };
@@ -441,12 +444,12 @@ export function createZergControl(
     if (initializing) throw new Error('Workflow service initializing; nested request refused.');
     initializing = true;
     try {
-      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now });
+      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding: options.coding });
     } finally { initializing = false; }
   };
   const workflowService: WorkflowService = {
     execute: (action, signal) => getService().execute(action, signal), list: () => getService().list(),
-    get: (id) => getService().get(id), subscribe: (listener) => getService().subscribe(listener),
+    get: (id) => getService().get(id), get approvals() { return getService().approvals; }, subscribe: (listener) => getService().subscribe(listener),
     dispose: () => service?.dispose(), drain: async () => { await service?.drain(); },
   };
   runtimeOptions.workflowService = workflowService;
@@ -457,6 +460,9 @@ export function createZergControl(
     },
     getState() {
       return container.snapshot();
+    },
+    get workflowApprovals() {
+      return workflowService.approvals;
     },
     async drain() {
       const settled = await Promise.allSettled([workflowService.drain(), owner?.drain()]);
@@ -480,6 +486,62 @@ export function createZergControl(
   return control;
 }
 
+const COMPACT_APPROVAL_LIMIT = 32;
+const COMPACT_APPROVAL_PREVIEW = 160;
+
+function compactString(value: unknown, max = COMPACT_APPROVAL_PREVIEW): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return value.length <= max ? value : `${value.slice(0, max)}…`;
+}
+
+function compactStringArray(value: unknown, maxItems = 32): { values?: string[]; truncated?: boolean } {
+  if (!Array.isArray(value)) return {};
+  const strings = value.filter((entry): entry is string => typeof entry === 'string');
+  return { values: strings.slice(0, maxItems).map((entry) => compactString(entry, COMPACT_APPROVAL_PREVIEW)!), ...(strings.length > maxItems ? { truncated: true } : {}) };
+}
+
+function compactWorkflowApprovalInspections(records: ReturnType<WorkflowTrustedApprovalApi['inspect']>, workflowRunId: string) {
+  const selected = records.filter((record) => (record.request?.humanReview as { workflow?: { workflowRunId?: unknown } } | undefined)?.workflow?.workflowRunId === workflowRunId);
+  const omitted = records.length - selected.length;
+  const limited = selected.slice(0, COMPACT_APPROVAL_LIMIT);
+  return {
+    workflowRunId,
+    requests: limited.map((record) => {
+      const humanReview = record.request.humanReview as { workflow?: Record<string, unknown>; trust?: Record<string, unknown>; application?: Record<string, unknown>; baseline?: Record<string, unknown> } | undefined;
+      const workflow = humanReview?.workflow ?? {};
+      const trust = humanReview?.trust ?? {};
+      const inputPaths = compactStringArray(trust.inputPaths);
+      const writablePaths = compactStringArray(trust.writablePaths);
+      return {
+        id: record.id,
+        kind: record.kind,
+        status: record.status,
+        consumed: record.consumed,
+        requestHash: record.requestHash,
+        scope: {
+          task: compactString(workflow.task),
+          operation: compactString(workflow.operation, 64),
+          attemptNo: typeof workflow.attemptNo === 'number' ? workflow.attemptNo : undefined,
+          paths: { input: inputPaths.values ?? [], writable: writablePaths.values ?? [], ...(inputPaths.truncated || writablePaths.truncated ? { truncated: true } : {}) },
+          candidate: {
+            candidateHash: compactString(record.scope.candidateHash ?? record.request.candidateHash, 80),
+            targetHash: compactString(record.scope.targetHash ?? record.request.targetHash, 80),
+          },
+          evidenceFingerprints: {
+            baselineHash: compactString(record.scope.baselineHash ?? record.request.baselineHash, 80),
+            evidenceHash: compactString(record.scope.evidenceHash ?? record.request.evidenceHash, 80),
+            policyHash: compactString(record.scope.policyHash ?? record.request.policyHash, 80),
+            scopeHash: compactString(record.scope.scopeHash ?? record.request.scopeHash, 80),
+          },
+        },
+        omissions: ['request', 'humanReview', 'grant/reject/revoke actions', 'file contents and full candidate changes'],
+      };
+    }),
+    omitted: { nonMatchingWorkflowRunId: omitted, beyondLimit: Math.max(0, selected.length - COMPACT_APPROVAL_LIMIT) },
+    truncated: selected.length > COMPACT_APPROVAL_LIMIT,
+  };
+}
+
 async function executeZergControlAction(
   container: ZergStateContainer,
   action: ZergControlAction,
@@ -490,7 +552,10 @@ async function executeZergControlAction(
     if (WORKFLOW_ACTION_NAMES.has(action.action)) {
       if (!options.workflowService) return controlError(action.action, 'invalid_request', 'Workflow service unavailable.', container.read().revision);
       const reply = await options.workflowService.execute(action as WorkflowAction, signal);
-      return reply.ok ? controlOk(action.action, reply, JSON.stringify(reply), container.read().revision)
+      const data = action.action === 'workflows.show' && 'workflowRunId' in action && action.workflowRunId
+        ? { ...reply, approvals: compactWorkflowApprovalInspections(options.workflowService.approvals.inspect(), action.workflowRunId) }
+        : reply;
+      return reply.ok ? controlOk(action.action, data, JSON.stringify(data), container.read().revision)
         : controlError(action.action, 'invalid_request', reply.error ?? 'Workflow action refused.', container.read().revision);
     }
     switch (action.action) {
@@ -4877,7 +4942,8 @@ async function createPiNativeSession(
     throw new Error(`Native Pi runner does not support agent permissionMode ${definition.permissionMode}; use inherit/default or automatic for native runs.`);
   }
   const agentDir = sdk.getAgentDir();
-  if ((continuation || workflow) && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for reviewed native execution.');
+  const workflowCoding = workflow?.request.coding && ['investigate', 'stage-write', 'review'].includes(workflow.request.coding.operation);
+  if ((continuation || (workflow && !workflowCoding)) && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for reviewed native execution.');
   workflow?.assert();
   if (continuation) await continuation.assert();
   const modelRuntime = await sdk.ModelRuntime.create({
@@ -4889,7 +4955,13 @@ async function createPiNativeSession(
   workflow?.assert();
   const { modelId, thinkingLevel } = splitModelAndThinking(modelSpec);
   const declaredPolicy = resolvePiNativeToolPolicy(definition.tools, definition.disallowedTools);
-  const toolPolicy = workflow ? { ...declaredPolicy, tools: [...workflow.tools], activeTools: [...workflow.tools], customTools: [] } : declaredPolicy;
+  const codingTools = workflow?.request.coding && ['investigate', 'stage-write', 'review'].includes(workflow.request.coding.operation)
+    ? createWorkflowNativeCodingTools(workflow.request, { assert: () => workflow.assert() })
+    : undefined;
+  const toolPolicy = workflow ? codingTools
+    ? { tools: codingTools.toolNames, excludeTools: [], customTools: codingTools.toolNames, activeTools: codingTools.toolNames }
+    : { ...declaredPolicy, tools: [...workflow.tools], activeTools: [...workflow.tools], customTools: [] }
+    : declaredPolicy;
   const tools = toolPolicy.activeTools;
   const settingsManager = sdk.SettingsManager.create(cwd, agentDir);
   // Package discovery reads scoped settings, not applyOverrides(), and reloads
@@ -4914,11 +4986,17 @@ async function createPiNativeSession(
   settingsManager.applyOverrides({
     compaction: { enabled: false },
     retry: { enabled: !workflow, maxRetries: workflow ? 0 : 2 },
+    ...(codingTools ? { packages: [], extensions: [] } : {}),
     defaultTools: tools,
   });
   if (continuation) await continuation.assert();
   const loaderDefinition = continuation ? { ...definition, prompt: `${definition.prompt}\n\n${continuation.admission.review.policy.authorityInstruction}` } : definition;
-  const resourceLoader = await createPiNativeResourceLoader(sdk, loaderDefinition, task, cwd, settingsManager, workflow);
+  const resourceLoader = codingTools
+    ? createSealedWorkflowResourceLoader(sdk, createPiNativeSystemPrompt(loaderDefinition, task), [(pi) => {
+      for (const tool of codingTools.tools) pi.registerTool(tool);
+      pi.on('tool_call', (event) => { workflow?.assert(); codingTools.assertToolCall(event.toolName); return undefined; });
+    }])
+    : await createPiNativeResourceLoader(sdk, loaderDefinition, task, cwd, settingsManager, workflow);
   workflow?.assert();
   if (continuation) await continuation.assert();
   const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
@@ -4936,7 +5014,7 @@ async function createPiNativeSession(
     tools: toolPolicy.tools ?? [],
     ...(toolPolicy.noTools ? { noTools: toolPolicy.noTools } : {}),
     excludeTools: toolPolicy.excludeTools,
-    customTools: workflow ? [] : createPiNativeCustomTools(toolPolicy.customTools) as never,
+    customTools: codingTools ? codingTools.tools as never : workflow ? [] : createPiNativeCustomTools(toolPolicy.customTools) as never,
     sessionManager,
     settingsManager,
   });
@@ -4961,7 +5039,8 @@ async function createPiNativeSession(
       session.agent.beforeToolCall = async (call, signal) => {
         const result = await beforeToolCall?.(call, signal);
         assertWorkflowSession(workflow, session);
-        if (!workflow.tools.includes(call.toolCall.name)) return { block: true, reason: 'Workflow read-only tool boundary.' };
+        if (codingTools) codingTools.assertToolCall(call.toolCall.name);
+        else if (!workflow.tools.includes(call.toolCall.name)) return { block: true, reason: 'Workflow read-only tool boundary.' };
         return result;
       };
     } catch (error) { await cleanupWorkflowSession(workflow, session, sdk, []); throw error; }
@@ -4983,6 +5062,17 @@ function resolvePiNativeRunModel(definition: Pick<ZergAgentDefinition, 'id' | 'm
   return definition.id === request.agent ? request.model ?? definition.model : definition.model ?? request.model;
 }
 
+function createPiNativeSystemPrompt(definition: ZergAgentDefinition, task: string): string {
+  return [
+    definition.prompt || `You are ${definition.label ?? definition.id}, a zerg coding agent.`,
+    '',
+    'You are running inside pi-zerg-swarm native execution, not pi-subagents.',
+    'Use available project intelligence tools, including Larra, when the task or project instructions require them.',
+    'Coordinate through project files when asked to work in a team.',
+    `Current assigned task:\n${task}`,
+  ].join('\n');
+}
+
 async function createPiNativeResourceLoader(
   sdk: {
     createExtensionRuntime(): unknown;
@@ -4995,14 +5085,7 @@ async function createPiNativeResourceLoader(
   settingsManager: unknown,
   workflow?: WorkflowAdmission,
 ): Promise<unknown> {
-  const systemPrompt = [
-    definition.prompt || `You are ${definition.label ?? definition.id}, a zerg coding agent.`,
-    '',
-    'You are running inside pi-zerg-swarm native execution, not pi-subagents.',
-    'Use available project intelligence tools, including Larra, when the task or project instructions require them.',
-    'Coordinate through project files when asked to work in a team.',
-    `Current assigned task:\n${task}`,
-  ].join('\n');
+  const systemPrompt = createPiNativeSystemPrompt(definition, task);
 
   if (sdk.DefaultResourceLoader && typeof sdk.getAgentDir === 'function') {
     const loader = new sdk.DefaultResourceLoader({ cwd, agentDir: sdk.getAgentDir(), settingsManager, systemPrompt,
@@ -5519,6 +5602,11 @@ export function createPiZergCommandHandler(
       const service = runtimeOptions.workflowService;
       try {
         if (!container || !service) throw new Error('Workflow service unavailable; use an owner-registered Pi command/control.');
+        const approve = /^workflows\s+approve\s+(\S+)\s+(\S+)\s*$/i.exec(routed);
+        if (approve) {
+          const message = await approveWorkflowInteractively(service.approvals, approve[1]!, approve[2]!, context);
+          context.ui?.notify?.(message, message.startsWith('approved') ? 'info' : 'error'); return;
+        }
         const monitor = /^workflows\s+monitor(?:\s+(\S+))?\s*$/i.exec(routed);
         if (monitor) {
           if (context.hasUI === false || (context.mode !== undefined && context.mode !== 'tui') || !context.ui?.custom) {
@@ -5539,7 +5627,7 @@ export function createPiZergCommandHandler(
           } }); return;
         }
         const parsed = parseWorkflowCommand(routed);
-        if (!parsed) throw new Error('Usage: /zerg workflows list|define <JSON>|start <JSON>|show <JSON>|pause|resume|cancel|retry|report|forget <workflowRunId>|monitor [workflowRunId]');
+        if (!parsed) throw new Error('Usage: /zerg workflows list|define <JSON>|start <JSON>|show <JSON>|pause|resume|cancel|retry|report|forget <workflowRunId>|monitor [workflowRunId]|approve <workflowRunId> <approvalId>');
         const reply = await executeZergControlAction(container, parsed, runtimeOptions);
         context.ui?.notify?.(reply.output ?? reply.error?.message ?? 'Workflow outcome unavailable.', reply.ok ? 'info' : 'error');
       } catch (error) { context.ui?.notify?.(workflowFailure(error), 'error'); }
@@ -6240,7 +6328,13 @@ function createOwnedWorkflowNative(
 function assertWorkflowSession(admission: WorkflowAdmission, session: import('@earendil-works/pi-coding-agent').AgentSession): void {
   admission.assert();
   if (`${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(admission.request.agent.model).modelId) throw new Error('Workflow effective model drifted.');
+  const coding = admission.request.coding;
   const active = session.getActiveToolNames();
+  if (coding && ['investigate', 'stage-write', 'review'].includes(coding.operation)) {
+    const expected = coding.operation === 'stage-write' ? [...WORKFLOW_NATIVE_CODING_TOOL_NAMES] : WORKFLOW_NATIVE_CODING_TOOL_NAMES.filter((name) => name !== 'workflow_stage_write');
+    if (active.length !== expected.length || active.some((name) => !expected.includes(name))) throw new Error('Workflow coding tool allowlist drifted.');
+    return;
+  }
   if (active.length !== admission.tools.length || active.some((name) => !admission.tools.includes(name))) throw new Error('Workflow effective tool allowlist drifted.');
   const all = session.getAllTools();
   for (const name of admission.tools) {
@@ -6266,6 +6360,38 @@ async function cleanupWorkflowSession(
   await attempt(() => unsubscribeErrors?.());
   await attempt(() => session.dispose());
   admission.cleanupSettled = admission.failures.length === 0;
+}
+
+async function approveWorkflowInteractively(approvals: WorkflowTrustedApprovalApi, workflowRunId: string, approvalId: string, context: StructuralPiCommandContext): Promise<string> {
+  if (context.hasUI === false || !context.ui?.confirm) return 'workflow approval refused: interactive UI confirmation is required.';
+  const before = approvals.inspect(approvalId)[0];
+  if (!before) return `workflow approval refused: unknown approval ${approvalId}`;
+  if (before.status !== 'pending') return `workflow approval refused: approval ${approvalId} is ${before.status}`;
+  const payload = JSON.stringify(before.request?.humanReview ?? before.request, null, 2) ?? '{}';
+  const maxPayload = 24_000;
+  const clipped = Buffer.byteLength(payload, 'utf8') > maxPayload;
+  const safePayload = payload.replace(/[\u0000-\u001f\u007f]/g, (ch) => ch === '\n' ? '\n' : ch === '\t' ? '\t' : `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  const manifest = [
+    `workflowRunId: ${workflowRunId}`,
+    `approvalId: ${before.id}`,
+    `kind: ${before.kind}`,
+    `status: ${before.status}`,
+    `requestFingerprint: ${before.requestHash}`,
+    `createdAt: ${before.createdAt}`,
+    `consumed: ${before.consumed}`,
+    '',
+    'Exact bounded human-review payload (JSON escaped; grant only if it matches the intended workflow, baseline, files, tools, checks, evidence, and target):',
+    safePayload.slice(0, maxPayload),
+    clipped ? `\n[omitted ${Buffer.byteLength(safePayload, 'utf8') - maxPayload} bytes from modal; inspect approval request for full retained bounded payload by fingerprint ${before.requestHash}]` : '',
+    '',
+    'This trusted host confirmation is not exposed through zerg_control and cannot be triggered by a model tool action.',
+  ].join('\n');
+  const confirmed = await context.ui.confirm(`Grant ${before.kind} workflow approval ${approvalId}?`, manifest);
+  const after = approvals.inspect(approvalId)[0];
+  if (!after || after.requestHash !== before.requestHash || after.status !== 'pending' || after.kind !== before.kind) return 'workflow approval refused: approval fingerprint changed during confirmation.';
+  if (!confirmed) return 'workflow approval refused by operator.';
+  approvals.grantFingerprint(approvalId, before.requestHash);
+  return `approved ${approvalId} for workflow ${workflowRunId} (${before.requestHash})`;
 }
 
 function parseWorkflowCommand(input: string): WorkflowAction | undefined {

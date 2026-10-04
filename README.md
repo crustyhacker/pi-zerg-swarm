@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.16 release status**
-> Adds typed conditions and bounded repeat-until body graphs to declarative **read-only workflows**, using the existing native runner, scheduler, and progress monitor.
-> Restart restores inspectable history, not execution or authority. There is no automatic replay, second transcript store, workspace restoration, or OS sandbox.
+> **v1.1.17 release status**
+> Adds opt-in, explicitly authorized staged coding workflows with independent review and separate implementation/application approvals. Existing read-only workflows stay read-only.
+> Restart restores inspectable history, not execution or authority. Checks execute trusted project code with host permissions; there is no filesystem/network sandbox or automatic Git operation.
 
 ## Release status
 
-- Current release: **v1.1.16** (typed conditions and bounded read-only workflow loops).
+- Current release: **v1.1.17** (authorized staged coding workflows and approval gates).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -152,6 +152,70 @@ The first iteration always runs from validated `initial` state. Body nodes suppo
 After **all body work and native cleanup settle successfully** (allowing intentional skips), `feedback` selects current-body data or iteration state and validates it against `stateSchema`. `until` then reads only literals and the validated **next feedback state** through `source: 'iteration'`. If true, `output` selects that next state or current-body data and validates it against `outputSchema`. Otherwise the next iteration may start only after fresh authority, pause/cancellation, and budget checks. No previous conversation history is copied between iterations.
 
 Failure, invalid feedback, missing termination data, cancellation, or uncertain cleanup prevents another iteration. A false condition at `maxIterations` is **non-convergence**, not success. Earlier structured observations remain bounded diagnostic history, not a verified final result. Explicit failure-consuming aggregates receive an unavailable envelope with termination and diagnostic iteration provenance; feedback larger than 16 KiB is represented there by its hash, while the bounded iteration ledger retains the feedback. `workflows.report` includes the orchestration view: use its repeat termination reason alongside report data, rather than treating a model's `done` field as independent proof of correctness.
+
+### Trusted-host staged coding workflows (version 3, Stage 8B)
+
+Version 3 is an explicit opt-in for trusted-host staged coding. Existing version-1 and version-2 workflow definitions remain read-only; adding a coding policy is rejected unless the definition itself uses `version: 3`. Defining or starting a workflow, inputs, prompts, and model output do **not** grant coding authority. A trusted owner must supply project/staging/check configuration through `registerZergSwarmExtension(..., { coding: { ... } })` or `createZergControl(..., { coding: { ... } })`, and the operator must grant each distinct approval. Applied-source validation passes build, package checks, and 630 tests with zero skips, including isolated actual SDK and regular/fullscreen Pi-host acceptance. This is scripted loopback evidence, not manual visual acceptance or real-model coding-quality evidence.
+
+The default extension has no trusted coding project/staging/check configuration. Supplying ordinary `zerg_control` workflow actions can define/start/show/pause/cancel/retry/report workflows, but it cannot approve coding gates. The host-only API is `control.workflowApprovals` (or `workflowService.approvals` inside an owner integration). Interactive slash approval is deliberately human mediated:
+
+```text
+/zerg workflows show {"workflowRunId":"<exact-run-id>"}
+/zerg workflows approve <exact-run-id> <approval-id>
+```
+
+The approve command requires `ui.confirm`, displays the exact bounded approval payload/fingerprint, rechecks the pending request after the modal, and then grants that exact fingerprint. There is no model-facing `confirm=true` path and ordinary `zerg_control` is no-approve.
+
+The coding journey is:
+
+1. `investigate`: read-only snapshot investigation through staged read/inspect tools only.
+2. Operator reviews the implementation approval payload: full task, identity, bounded file scope, baseline, writable/readonly paths, check profiles, hashes, limits, and disclosures.
+3. `stage-write`: writer receives only staged writable files and produces a candidate in a private stage.
+4. `check`: runtime executes the approved deterministic profile (`executable` + `argv` + `cwd` + env) against the stage.
+5. `review`: an independent read-only native reviewer receives the exact candidate, scope, task, and actual check evidence, including failures; it cannot write or approve application.
+6. A bounded Stage 8A `repeat` can feed findings and settled failed-check evidence into another correction, retaining the candidate. Each change invalidates affected checks/review. Reviewer approval cannot turn a failed check into success; unresolved failures or iteration exhaustion block application.
+7. Operator reviews the exact application approval payload bound to candidate hash, evidence hash, target baseline, and changed paths.
+8. `apply`: runtime applies the exact approved candidate deterministically to the real project files.
+
+Remember: **Prepared != checked != reviewed != approved != applied**. Application-capable policies require staged writing, checking, independent review, `reviewRequired: true`, and at least one approved check profile. A candidate may be prepared but fail gates, await application approval, or fail/partially apply after approval if destination state changes. Implementation authorization covers only its reviewed bounds; new scope, commands, or capabilities need a new request.
+
+Supported file handling is intentionally narrow. Explicit UTF-8 text inputs and exact writable relative paths have hard limits of 32 files, 256 KiB per file, and 1 MiB total; workflow definition, evidence, and ledger budgets may impose smaller limits. Symlink components, hardlinks, hidden/protected paths, special files, executable inputs, and path escapes are rejected. Text-file edits and creation under existing real parent directories are supported. Generated outputs, dependency installation, binaries, deletion, renames, permission changes, and directory creation are unsupported. Workflow leases detect other workflow owners; they do not exclude unrelated editors or processes.
+
+Dependency preparation is explicit: only manifested read-only text inputs are copied into the owned stage, with no automatic repository/dependency-tree copy or shared writable dependency link. Checks require Linux, an existing `/usr/bin/python3` with subreaper and pidfd support, and the bundled `workflow-check-supervisor.py`; unsupported or unverified cleanup fails closed. Exact executable/argv, working directory, minimal environment, time/output bounds, and actual candidate identity are recorded. Checks execute trusted project code with host permissions, **not** a filesystem or network sandbox. Command allowlisting and descendant supervision do not confine arbitrary project code. No downloads or external services are enabled automatically.
+
+Cancellation stops subsequent admissions and writes where possible; it cannot undo a completed write. Apply is per file, not atomic across all files, and there is no automatic rollback or Git operation. Partial/uncertain outcomes retain evidence for inspection; settled ownership release does not delete retained candidates. Cleanup is restricted to provably owned artifacts, and uncertain application cannot be erased through generic forget. Restart is inspect-only: no live grants, native reconnection, automatic checks/application/rollback, or mutating retry. Stage 8C must design explicit reconciliation and fresh authority before any durable execution resumption; retained paths alone prove neither ownership nor integrity.
+
+A compile-tested disposable-project builder is exported directly from `workflow-coding-example.ts` (not from the package index):
+
+```ts
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createZergControl } from 'pi-zerg-swarm';
+import { buildTrustedCodingWorkflowExample } from 'pi-zerg-swarm/workflow-coding-example.ts';
+
+const projectRoot = mkdtempSync(join(tmpdir(), 'zerg-coding-project-'));
+const stagingParent = mkdtempSync(join(tmpdir(), 'zerg-coding-staging-'));
+mkdirSync(join(projectRoot, 'src'));
+const example = buildTrustedCodingWorkflowExample({ projectRoot, stagingParent, model: 'provider/model' });
+for (const [path, text] of Object.entries(example.initialFiles)) {
+  writeFileSync(join(projectRoot, path), text, { flag: 'wx' });
+}
+
+const control = createZergControl({}, { coding: example.coding });
+await control.execute({ action: 'agents.create', id: 'worker', prompt: 'Use workflow coding tools only.', model: 'provider/model' });
+await control.execute({ action: 'agents.create', id: 'reviewer', prompt: 'Independently review staged coding candidates.', model: 'provider/model' });
+await control.execute({ action: 'workflows.define', definition: example.definition });
+const started = await control.execute({ action: 'workflows.start', definitionId: example.definition.id, inputs: {}, concurrency: 1 });
+
+// Wait for investigation to finish and inspect the exact pending request.
+// Only trusted operator code may grant it after reviewing the full payload.
+const pending = control.workflowApprovals.inspect().filter(r => r.status === 'pending');
+// control.workflowApprovals.grantFingerprint(pending[0].id, pending[0].requestHash);
+// Application has its own later request: never auto-grant it from model output.
+```
+
+For packaged consumers, the package allowlist includes the public workflow TypeScript modules, `workflow-check-supervisor.py`, and `workflow-coding-example.ts`; private agent artifacts remain excluded.
 
 #### Read-only refinement example
 

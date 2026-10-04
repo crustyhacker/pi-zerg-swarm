@@ -2,7 +2,7 @@ import type { WorkflowAction } from './workflow-model.js';
 export type { WorkflowAction, WorkflowDefinition, WorkflowRun, WorkflowView, WorkflowReply, WorkflowNativeLineage } from './workflow-model.js';
 
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.16' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.17' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -389,6 +389,8 @@ export interface ZergControlResult<T = unknown> {
 export interface ZergControl {
   execute(action: ZergControlAction, signal?: AbortSignal): Promise<ZergControlResult>;
   getState(): ZergState;
+  /** Trusted host-only workflow approval API; not exposed through zerg_control actions. */
+  readonly workflowApprovals?: import('./workflow-model.js').WorkflowTrustedApprovalApi;
   dispose(): void;
   /** Wait for owner-local workflow settlement; disposal never frees uncertain permits. */
   drain?(): Promise<void>;
@@ -726,6 +728,7 @@ export interface StructuralPiCommandContext {
       render: StructuralPiCustomFactory | ((width: number) => string),
       options?: StructuralPiCustomOptions | Record<string, unknown>,
     ): Promise<unknown> | { close?(): void; dispose?(): void } | unknown;
+    confirm?(message: string, details?: string): Promise<boolean> | boolean;
   };
 }
 
