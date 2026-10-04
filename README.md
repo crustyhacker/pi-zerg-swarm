@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.14 release status**
-> Hardens launch/cancellation admission, observer and UI cleanup, retained-text rendering, and snapshot recovery. Explicit reviewed continuation still creates a **new task and Pi session** under current authority; preparation remains non-executing and confirmation authorizes normal Pi resources and hooks.
-> Restart restores inspectable history and quarantines pending receipts; it never reconnects, automatically continues, or resends. Historical permissions remain unknown. Continuation is not in-place resume, workspace restoration, or a sandbox.
+> **v1.1.15 release status**
+> Adds bounded declarative **read-only workflows** on the existing native runner: dependency scheduling, parallel reviews, verification/reporting, explicit retries, and a separate progress monitor.
+> Restart restores inspectable history, not execution or authority. There is no automatic replay, second transcript store, workspace restoration, or OS sandbox.
 
 ## Release status
 
-- Current release: **v1.1.14** (runtime, history, UI, and persistence hardening).
+- Current release: **v1.1.15** (minimal declarative read-only workflows).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -53,6 +53,82 @@ Snapshots have a **64 MiB serialized UTF-8 byte limit**. Loading uses a verified
 Valid snapshot symlinks to regular files retain their existing load behavior; missing/dangling links behave as missing snapshots. Saving still atomically replaces the configured path itself, **not the symlink target**. This is not filesystem confinement, multi-writer coordination, or fsync/power-loss protection; use one owner per snapshot file. The separate native JSONL viewer limits remain unchanged.
 
 If an external adapter throws during launch, execution may already have started. Zerg preserves observed terminal state or reports `needs-attention` with the original run/task identities; inspect manually rather than automatically retrying. Admission checks do not revoke capabilities from an already-running external adapter.
+
+## Declarative read-only workflows
+
+Workflows coordinate native single-agent units outside the parent conversation. They reuse existing agent definitions, run/task/Pi identities, logs, coding views, cancellation, and opt-in snapshots. There is no separate agent runtime, transcript mirror, daemon, or model-driven scheduler. Background execution lasts only while its owning Pi process is alive.
+
+### Start the review preset
+
+The built-in `read-only-review` performs discovery → parallel reviews → finding collection → independent verification → deduplicated report. It uses the existing `generalist` definition for discovery and `reviewer` for review/verification. First configure **explicit, available provider/model IDs** on those definitions; replace the placeholders below. Unsupported turn limits, fallback models, and permission overrides must be cleared.
+
+```text
+/zerg agents update generalist --model provider/model
+/zerg agents update reviewer --model provider/model
+/zerg workflows start {"definitionId":"read-only-review","inputs":{"candidatePaths":["index.ts"],"scope":"Review the supplied source without changing files"},"concurrency":8}
+/zerg workflows monitor
+```
+
+The preset accepts 1–16 unique normalized relative candidate paths and a nonempty scope. Discovery may select only those candidates; each target produces at most two findings, with at most 32 verifications. Failed reviews, missing/mismatched/duplicate verifier IDs, disagreement, and unselected coverage remain visible. Partial coverage is **not** overall success. Verdicts are model evidence, not proof that findings are true.
+
+Use structured `zerg_control` or `control.execute(...)` for automation:
+
+| Action | Required fields / meaning |
+| --- | --- |
+| `workflows.list` | Compact definition/attempt summaries; no intermediate results or per-unit identity dump |
+| `workflows.define` | `definition`: validated version-1 graph; replaces a name only when its prior work is settled |
+| `workflows.show` | Exactly one of `definitionId` or `workflowRunId`; attempt view includes exact unit/native correlations |
+| `workflows.start` | `definitionId`, `inputs`, optional `concurrency`; returns a fresh `data.view.workflowRunId` |
+| `workflows.pause` / `workflows.resume` | `workflowRunId`; pause blocks new admission, not already-admitted work |
+| `workflows.cancel` | `workflowRunId`; requests owned cancellation promptly, even after control becomes read-only |
+| `workflows.retry` | `workflowRunId`; explicit new attempt in the same family, not in-place replay |
+| `workflows.report` | `workflowRunId`; explicitly retrieves the final report, when available |
+| `workflows.forget` | `workflowRunId`; explicitly removes a terminal, cleanup-settled workflow record, not its native history |
+
+Slash equivalents use `/zerg workflows list`, `define <JSON>`, `start <JSON>`, `show {"workflowRunId":"..."}` (or `definitionId`), and `pause|resume|cancel|retry|report|forget <workflow-run-id>`. `/zerg workflows monitor [workflow-run-id]` adds the interactive view; aliases remain supported and noninteractive inspection does not require a TUI.
+
+In the monitor, **Enter** drills from attempts to steps to units to an explicitly selected bounded result. **p** pauses/resumes, **x** cancels the whole selected workflow, and **r**, then **Enter on the rendered confirmation**, starts a new retry attempt. **c** opens the selected unit's exact native coding view; returning creates a fresh monitor instance. **q/Esc/Ctrl+C** closes the view, not the workflow. Stale selection cannot retarget an action. Active workflow units reject steer/follow-up messages to preserve frozen inputs; ordinary native messaging is unchanged.
+
+### Define a small graph
+
+Definitions are plain JSON, never executable code. For example, with an explicitly configured `reviewer`:
+
+```ts
+import type { WorkflowDefinition } from 'pi-zerg-swarm';
+
+const definition: WorkflowDefinition = {
+  id: 'review-one', version: 1, label: 'One read-only review',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['target'],
+    properties: { target: { type: 'string', maxLength: 512 } },
+  },
+  steps: [{
+    id: 'review', kind: 'native', agentId: 'reviewer', dependsOn: [],
+    prompt: 'Read target without changes. Return ONLY a JSON string summarizing evidence.',
+    inputs: { target: { ref: { source: 'inputs', path: ['target'] } } },
+    outputSchema: { type: 'string', maxLength: 8192 },
+  }],
+};
+await control.execute({ action: 'workflows.define', definition });
+await control.execute({ action: 'workflows.start', definitionId: definition.id, inputs: { target: 'index.ts' } });
+```
+
+- Steps have unique IDs and explicit `dependsOn` edges. Cycles, unknown references, unsupported fields, and excessive graphs are rejected before admission.
+- Input bindings are `{ value: <JSON> }` or `{ ref: { source: 'inputs' | 'step' | 'item', path: [...], stepId?: 'dependency-id' } }`. Step references must name explicit dependencies. Paths into single native results are schema-checked; fan-out/aggregate results are referenced as whole envelopes.
+- Native steps may declare `fanout: { from: <reference>, maxItems: N }` over a bounded array. There are no arbitrary loops, conditions, JavaScript, shell steps, teams, forks, or nested delegation.
+- Deterministic aggregate steps use `kind: 'aggregate'`, `operation: 'collect' | 'collect-findings' | 'review-report'`, and input bindings. Only aggregates can explicitly set `consumeFailures: true`; otherwise unsuccessful dependencies skip downstream work. Review-specific aggregates expect the preset's envelope shapes.
+- The schema subset supports closed objects, required properties, bounded arrays/strings, numbers/integers, booleans, null, and finite enums. No external references or regex/evaluation language. `maxLength` uses JavaScript string length; independent UTF-8 byte limits also apply.
+
+### Authority, bounds, retries, and recovery
+
+- Each attempt freezes its definition, declared JSON inputs, agent definitions, and explicit model selections. Relevant current-agent/model/tool drift fails closed. Effective tools are the definition's expanded tools minus denials, **intersected with `read`, `grep`, `find`, `ls`**; an empty intersection is refused. Broad definitions are restricted, not silently granted new tools. Replacement builtins and dynamically activated gateways are refused.
+- Starting work authorizes normal current Pi resources and hooks. Outputs/source text remain data, not permission. Read-only tools are not filesystem confinement or an OS sandbox, and trusted extensions are not universally certified. Zerg's read-only **control mode** blocks new workflow execution; it is separate from the workflow's read-only tool policy.
+- Limits: **16 steps**, **32 fan-out items**, concurrency **1–32** (default **8**), **3 attempts** and at most **256 native admissions per family**. Graph validation budgets all three attempts. An owner also shares a conservative ceiling no greater than its most restrictive unsettled workflow's concurrency; this is not a provider-wide limit.
+- A permit covers native setup, execution, and owned cleanup—not just the final answer. Pause does not free active permits; cancel may remain `cancelling`. Missing/uncertain cleanup is `needs-attention`, blocks further admission/retry, and is not represented as successful disposal. Unit states distinguish completed, failed, cancelled, skipped, and unverified work.
+- UTF-8 limits: definition **64 KiB**, start inputs **32 KiB**, resolved workflow prompt/input **256 KiB**, raw native unit result **16 KiB before JSON parsing**, aggregate **256 KiB**. The **entire workflow namespace** (registry plus retained runs) is capped at **2 MiB**, with at most **16 definitions / 16 retained attempts**. Complexity limits also apply. Overflow is explicit; results are not silently clipped and history is not automatically pruned. Normal Pi resource context and native JSONL have separate limits; these are not token budgets.
+- Retry requires a fully settled failed/cancelled latest attempt and unchanged frozen identities. It creates a new workflow run with the same family, incremented attempt number, and `retryOf`; only matching completed units are reused, retaining their original native identities. Newly executed units receive fresh task/run/Pi identities. There is no automatic retry, permission replay, or exactly-once guarantee.
+- Frozen inputs are **not a filesystem snapshot**. Reused results describe their original observations; after workspace changes, start a new workflow rather than assume cached results are fresh. Retry cannot replace inputs; changed inputs require a new run.
+- Workflow state uses the existing `extensions.workflows` snapshot namespace. Without opt-in persistence it is process-local. Recovery never starts work, reconnects SDK sessions, or replays messages; interrupted work is marked unverified/`needs-attention` and cannot simply resume or retry with unknown cleanup. Corrupt workflow data is retained and workflow actions fail closed without suppressing unrelated run recovery. Snapshot persistence retains its existing error/durability limitations.
 
 ## Native session reference foundation
 
@@ -257,6 +333,9 @@ The TypeScript modules are intentionally small:
 - `ui/agent-overlay.ts` — exact-session chooser, bounded transcript display, explicit composer, and local branch inspection
 - `ui/continuation-review.ts` — separate literal-task editor, current-authority disclosure, and explicit continuation confirmation
 - `ui/team-timeline.ts` — exact filters, bounded timeline/details, and identity-checked coding-view round trips
+- `workflow-model.ts` — bounded declarative contracts, validation, immutable identities, and review aggregation
+- `workflow-runtime.ts` — dependency scheduling, explicit attempts, owned permits, and non-executing recovery
+- `ui/workflow-overlay.ts` — progress/step/unit/result views and exact native coding-view navigation
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
 
@@ -272,6 +351,14 @@ npm run check:version
 `npm run build` performs strict TypeScript no-emit checking. `npm test` runs parser plus command-surface coverage, direct control API/tool registration coverage, state/container behavior, registration snapshot semantics, internal-patch event-bus wrapping/duplicate/rollback/dispose paths, render/lifecycle/mode/permission/log regressions, and focused M9 UI coverage for management overlay lifecycle, tree navigation, settings/actions, chat delivery semantics, and fake-Pi shared-state parity checks using Node's built-in test runner and `tsx`.
 `npm run check:package` validates MIT/license metadata, package/build private-path guards, package-lock↔package version sync, and repository metadata fields for release discoverability and consistency.
 `npm run check:version` confirms that the package release tag matching `package.json` is at `HEAD` in post-tag state. During explicit pre-tag release prep, skip this check until the release tag exists at `HEAD`; if run earlier, the failure is expected.
+
+Workflow model, scheduler, fake-native control, and UI regressions run in `npm test`, alongside the existing suites and SDK fixtures. The additional workflow SDK/PTY acceptance is opt-in after reviewing its harnesses:
+
+```sh
+ZERG_WORKFLOW_ACCEPTANCE=parent-approved node --import tsx --test test/workflow-integration.test.ts
+```
+
+These Linux/Python/installed-Pi fixtures use empty owned environments, scripted localhost responses, bounded requests/output/time, and owned-process cleanup checks. They exercise real SDK tools and regular/fullscreen terminal input/resize/recovery. They are automated integration evidence—not an OS sandbox, manual visual acceptance, external-model quality evaluation, or universal third-party compatibility certification.
 
 ## Roadmap
 
@@ -319,7 +406,8 @@ npm run check:version
 - v1.1.11: patch release adding exact live messaging, an explicit composer, and bounded no-replay receipts
 - v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation
 - v1.1.13: patch release adding explicit reviewed continuation into a fresh native session
-- v1.1.14: patch release hardening runtime admission, history/UI lifetimes, terminal rendering, and bounded snapshot recovery (current release)
+- v1.1.14: patch release hardening runtime admission, history/UI lifetimes, terminal rendering, and bounded snapshot recovery
+- v1.1.15: patch release adding bounded declarative read-only workflows and exact progress/inspection controls (current release)
 - Further recovery and workspace features require separate scope.
 
 ## License

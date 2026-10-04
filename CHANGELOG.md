@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.15] - 2026-10-04
+
+### Added
+
+- Minimal declarative read-only workflows through `workflows.*` structured actions and `/zerg workflows`: validated named dependency graphs, bounded fan-out, deterministic aggregation, background progress, pause/resume, cancellation, and explicit fresh retries.
+- A discover → parallel review → verify → deduplicate/report preset. Reports retain failed coverage, verification disagreement, and original native identities; model verdicts are evidence, not ground truth.
+- A separate workflow monitor with phase/unit/result drill-down, exact native coding-view links, stale-selection guards, and rendered retry confirmation. Default lists omit intermediate results and per-unit identity dumps.
+- Frozen definitions, declared JSON inputs, agents and model selections; read-only builtin tool intersection, owned setup-through-cleanup permits, and bounded workflow state in the existing snapshot store. Recovery never reconnects or automatically replays work.
+- Focused model/scheduler/control/UI regressions and opt-in isolated localhost SDK/real Pi terminal fixtures. Automated terminal evidence is not manual visual acceptance, external-model quality, or universal extension compatibility.
+
+### Changed
+
+- Package allowlist includes workflow model/runtime modules and the workflow UI. No second agent runtime or transcript store is introduced.
+- Active workflow units reject input-changing operator messages; ordinary native messaging remains unchanged. Explicit workflow retry/new-run controls preserve frozen-input semantics.
+
 ## [1.1.14] - 2026-10-03
 
 ### Fixed

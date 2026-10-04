@@ -259,7 +259,7 @@ test('native abort isolates sync throws and async rejections and still signals s
   const functionNode = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'requestPiNativeAbort');
   assert.ok(functionNode);
   const js = ts.transpileModule(functionNode.getText(parsed), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
-  const abort = new Function(`${js}\nreturn requestPiNativeAbort;`)() as (id: string, runs: Map<string, unknown>) => { ok: boolean; message: string };
+  const abort = new Function('workflowActiveAdmissions', `${js}\nreturn requestPiNativeAbort;`)(new WeakMap()) as (id: string, runs: Map<string, unknown>) => { ok: boolean; message: string };
   const calls: string[] = [];
   const active = { cancelRequested: false, sessions: new Set([
     { abort() { calls.push('sync'); throw new Error('sync abort fault'); } },

@@ -1,0 +1,192 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { visibleWidth } from '@earendil-works/pi-tui';
+import type { StructuralPiCommandContext, StructuralPiCustomFactory } from '../../types.js';
+import type { WorkflowAction, WorkflowReply, WorkflowRun, WorkflowService, WorkflowUnit, WorkflowView } from '../../workflow-model.js';
+import { openZergWorkflowOverlay, ZergWorkflowComponent, type ZergWorkflowOverlayOptions } from '../../ui/workflow-overlay.js';
+
+const unit = (id = 'unit-a', status: WorkflowUnit['status'] = 'completed'): WorkflowUnit => ({
+  id, stepId: 'review', index: 0, status, inputHash: 'input-hash', inputs: {}, result: { findings: ['RESULT-ONLY-ON-DRILL'] },
+  native: { runId: `native-${id}`, taskId: `task-${id}` }, cleanupSettled: true,
+});
+const run = (id = 'workflow-a', patch: Partial<WorkflowRun> = {}): WorkflowRun => ({
+  workflowRunId: id, familyId: 'family-a', attemptNo: 1, definitionHash: 'definition-hash', inputs: {}, agents: {}, concurrency: 8,
+  definition: { id: 'definition-a', version: 1, label: 'Read-only review', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, steps: [] },
+  status: 'completed', createdAt: '2026-10-04T00:00:00Z', updatedAt: '2026-10-04T00:00:01Z', admissions: 1, cleanupSettled: true, recovered: false,
+  steps: [{ id: 'review', status: 'completed', units: [unit()] }], ...patch,
+});
+function view(value: WorkflowRun): WorkflowView {
+  const counts: WorkflowView['counts'] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unverified: 0 };
+  const correlations = value.steps.flatMap((step) => step.units.map((row) => { counts[row.status]++; return { stepId: step.id, unitId: row.id, status: row.status, native: row.native, reusedFrom: row.reusedFrom }; }));
+  return { workflowRunId: value.workflowRunId, familyId: value.familyId, attemptNo: value.attemptNo, definitionId: value.definition.id,
+    status: value.status, createdAt: value.createdAt, updatedAt: value.updatedAt, cleanupSettled: value.cleanupSettled, recovered: value.recovered, counts, correlations };
+}
+function fixture(initial = [run()], optionsPatch: Partial<ZergWorkflowOverlayOptions> = {}, servicePatch: Partial<ZergWorkflowOverlayOptions['service']> = {}) {
+  let runs = initial; let listener: Parameters<WorkflowService['subscribe']>[0] = () => undefined;
+  let renders = 0; let unsubscribed = 0; let done = 0; let result: unknown; let reads = 0;
+  const actions: WorkflowAction[] = [];
+  const service: ZergWorkflowOverlayOptions['service'] = {
+    list: () => runs.map(view), get: (id) => { reads++; return runs.find((row) => row.workflowRunId === id); },
+    subscribe: (next) => { listener = next; return () => { unsubscribed++; }; },
+    execute: async (action) => { actions.push(action); return { ok: true, action: action.action }; }, ...servicePatch,
+  };
+  const options = { service, onOpenNative: async () => undefined, ...optionsPatch };
+  const component = new ZergWorkflowComponent({ requestRender: () => { renders++; } }, undefined, (value) => { done++; result = value; }, options);
+  return { component, service, options, actions, update: (next: WorkflowRun[]) => { runs = next; listener(next.map(view)); }, late: () => listener(runs.map(view)),
+    get renders() { return renders; }, get done() { return done; }, get unsubscribed() { return unsubscribed; }, get result() { return result as { native: { runId: string; taskId: string } } | undefined; }, get reads() { return reads; } };
+}
+const out = (component: ZergWorkflowComponent, width = 512, height = 30) => component.render(width, height).join('\n');
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+function units(component: ZergWorkflowComponent): void { out(component); component.handleInput('enter'); out(component); component.handleInput('enter'); out(component); }
+
+test('workflow lists counts, phases, distinct unit outcomes/reuse/cleanup; results only explicit drill', () => {
+  const statuses: WorkflowUnit['status'][] = ['queued', 'running', 'completed', 'failed', 'cancelled', 'skipped', 'unverified'];
+  const source = run('workflow-a', { status: 'needs-attention', cleanupSettled: false, recovered: true,
+    steps: [{ id: 'review', status: 'unverified', units: statuses.map((status) => unit(status, status)) }] });
+  source.steps[0]!.units[2]!.reusedFrom = { workflowRunId: 'previous-attempt', unitId: 'old-unit', native: { runId: 'old-native', taskId: 'old-task' } };
+  const f = fixture([source]); const list = out(f.component);
+  for (const status of statuses) assert.ok(list.includes(`${status}:1`), status);
+  assert.ok(!list.includes('RESULT-ONLY-ON-DRILL'));
+  units(f.component); const text = out(f.component);
+  for (const status of statuses) assert.ok(text.includes(`unit ${status} · ${status}`), status);
+  assert.match(text, /needs-attention.*cleanup-pending/); assert.match(text, /reused from previous-attempt\/old-unit native:old-native/);
+  assert.ok(!text.includes('RESULT-ONLY-ON-DRILL')); f.component.handleInput('enter'); assert.match(out(f.component), /RESULT-ONLY-ON-DRILL/);
+  assert.equal(f.actions.length, 0); f.component.dispose();
+});
+
+test('exact native coding drill disposes observer, keeps reused source identity, never starts work', () => {
+  const source = run(); source.steps[0]!.units[0]!.reusedFrom = { workflowRunId: 'old', unitId: 'original', native: { runId: 'native-original', taskId: 'task-original' } };
+  const f = fixture([source]); units(f.component); f.component.handleInput('c');
+  assert.deepEqual(f.result?.native, { runId: 'native-original', taskId: 'task-original' });
+  assert.equal(f.unsubscribed, 1); assert.equal(f.done, 1); assert.equal(f.actions.length, 0);
+  const renders = f.renders; f.late(); f.component.handleInput('x'); f.component.dispose(); assert.equal(f.renders, renders); assert.equal(f.done, 1);
+});
+
+test('last-rendered selection holds across reorder; key navigation before redraw cannot retarget controls', async () => {
+  const a = run('a', { status: 'running', cleanupSettled: false }); const b = run('b', { status: 'running', cleanupSettled: false, familyId: 'family-b' });
+  const f = fixture([a, b]); out(f.component); f.update([b, a]); f.component.handleInput('x'); await tick();
+  assert.deepEqual(f.actions, [{ action: 'workflows.cancel', workflowRunId: 'a' }]);
+  out(f.component); f.component.handleInput('home'); f.component.handleInput('x'); await tick(); assert.equal(f.actions.length, 1);
+  out(f.component); f.component.handleInput('x'); await tick(); assert.equal((f.actions.at(-1) as { workflowRunId: string }).workflowRunId, 'b'); f.component.dispose();
+});
+
+test('replacement/missing run, step, unit and native identity cannot retarget a rendered coding action', () => {
+  for (const replace of [(r: WorkflowRun) => { r.definitionHash = 'new-definition'; }, (r: WorkflowRun) => { r.familyId = 'new-family'; },
+    (r: WorkflowRun) => { r.createdAt = '2026-10-04T00:00:02Z'; }, (r: WorkflowRun) => { r.attemptNo = 2; },
+    (r: WorkflowRun) => { r.steps[0]!.units[0]!.inputHash = 'new-input'; }, (r: WorkflowRun) => { r.steps[0]!.units[0]!.native!.taskId = 'different-task'; },
+    (r: WorkflowRun) => { r.steps[0]!.units[0]!.native!.runId = 'different-native'; }, (r: WorkflowRun) => { r.steps[0]!.units = []; }, (r: WorkflowRun) => { r.steps = []; }]) {
+    const f = fixture(); units(f.component); const replacement = run(); replace(replacement); f.update([replacement]); f.component.handleInput('c');
+    assert.equal(f.done, 0); assert.equal(f.actions.length, 0); f.component.dispose();
+  }
+  const f = fixture(); units(f.component); f.update([run('other')]); out(f.component); f.component.handleInput('c'); f.component.handleInput('x');
+  assert.equal(f.done, 0); assert.equal(f.actions.length, 0); assert.match(out(f.component), /missing\/evicted/); f.component.dispose();
+});
+
+test('duplicate identities/wrong lookup result are withheld, never infer another unit', () => {
+  const duplicate = run(); duplicate.steps[0]!.units.push(unit()); const f = fixture([duplicate]); units(f.component); f.component.handleInput('c');
+  assert.equal(f.result, undefined); assert.equal(f.done, 0); f.component.dispose();
+  const g = fixture([run()], {}, { get: () => run('wrong') }); assert.match(out(g.component), /Wrong workflow/); g.component.handleInput('x'); assert.equal(g.actions.length, 0); g.component.dispose();
+  const h = fixture([run(), run()]); out(h.component); h.component.handleInput('x'); assert.equal(h.actions.length, 0); h.component.dispose();
+});
+
+test('pause/resume explicitly follow rendered state, do not toggle unseen changes; cancel whole workflow', async () => {
+  const f = fixture([run('workflow-a', { status: 'running', cleanupSettled: false })]); out(f.component); f.component.handleInput('p'); await tick();
+  assert.deepEqual(f.actions[0], { action: 'workflows.pause', workflowRunId: 'workflow-a' });
+  f.update([run('workflow-a', { status: 'paused', cleanupSettled: false })]); out(f.component); f.component.handleInput('p'); await tick();
+  assert.deepEqual(f.actions[1], { action: 'workflows.resume', workflowRunId: 'workflow-a' });
+  out(f.component); f.update([run('workflow-a', { status: 'running', cleanupSettled: false })]); f.component.handleInput('p'); await tick(); assert.equal(f.actions.length, 2);
+  units(f.component); f.component.handleInput('x'); await tick(); assert.deepEqual(f.actions.at(-1), { action: 'workflows.cancel', workflowRunId: 'workflow-a' });
+  assert.match(out(f.component), /admitted workers continue/); f.component.dispose();
+});
+
+test('retry requires rendered explicit confirmation, settled cleanup, same attempt/state; no new work on selection', async () => {
+  const f = fixture(); out(f.component); f.component.handleInput('r'); f.component.handleInput('enter'); await tick(); assert.equal(f.actions.length, 0);
+  assert.match(out(f.component), /Retry NEW attempt/); f.component.handleInput('escape'); out(f.component); assert.equal(f.actions.length, 0);
+  f.component.handleInput('r'); out(f.component); f.component.handleInput('enter'); f.component.handleInput('enter'); await tick();
+  assert.deepEqual(f.actions, [{ action: 'workflows.retry', workflowRunId: 'workflow-a' }]); f.component.dispose();
+  const g = fixture(); out(g.component); g.component.handleInput('r'); out(g.component); g.update([run('workflow-a', { status: 'needs-attention', cleanupSettled: false })]); g.component.handleInput('enter'); await tick(); assert.equal(g.actions.length, 0); g.component.dispose();
+  for (const patch of [{ status: 'running' as const }, { cleanupSettled: false }]) {
+    const h = fixture([run('workflow-a', patch)]); out(h.component); h.component.handleInput('r'); assert.doesNotMatch(out(h.component), /Retry NEW attempt/); assert.equal(h.actions.length, 0); h.component.dispose();
+  }
+});
+
+test('deferred/sync-throwing controls are bounded, suppress duplicates, ignore completion after close', async () => {
+  let resolve!: (reply: WorkflowReply) => void; let calls = 0;
+  const f = fixture(undefined, {}, { execute: () => { calls++; return new Promise((next) => { resolve = next; }); } });
+  out(f.component); f.component.handleInput('x'); f.component.handleInput('x'); assert.equal(calls, 1); assert.match(out(f.component), /Control pending/);
+  f.component.dispose(); const renders = f.renders; resolve({ ok: true, action: 'workflows.cancel' }); await tick(); assert.equal(f.renders, renders); assert.equal(f.done, 1);
+  const hostile = Object.create(null, { message: { get() { throw new Error('getter'); } } });
+  const g = fixture(undefined, {}, { execute: () => { throw hostile; } }); out(g.component); assert.doesNotThrow(() => g.component.handleInput('x')); await tick(); assert.match(out(g.component), /non-text error/); g.component.dispose();
+  const h = fixture(undefined, {}, { execute: async (action) => ({ ok: false, action: action.action, error: '\x1b]52;c;INJECT\x07policy denied' }) });
+  out(h.component); h.component.handleInput('x'); await tick(); assert.match(out(h.component), /policy denied/); assert.doesNotMatch(out(h.component), /INJECT/); h.component.dispose();
+});
+
+test('geometry grid, Unicode and untrusted OSC/CSI/C1 are safe before trusted theme ANSI, theme invalidation rebuilds', () => {
+  const source = run(); source.definition.label = '中文 é 👨‍👩‍👧‍👦 \x1b[31mred\x1b[0m \x1b]52;c;LABEL-OSC\x07';
+  source.steps[0]!.error = '\x9b2Jphase \x9d52;c;ERROR-OSC\x9c'; source.steps[0]!.units[0]!.error = '\x1bPsecret\x1b\\safe unit';
+  const f = fixture([source]); let color = 36;
+  const component = new ZergWorkflowComponent({ terminal: { rows: 1 } }, { fg: (_token, text) => { assert.doesNotMatch(text, /[\x00-\x1f\x7f-\x9f]/u); return `\x1b[${color}m${text}\x1b[0m`; } }, undefined, f.options);
+  component.focused = true; assert.equal(component.focused, true);
+  for (const width of [1, 2, 3, 8, 20, 80, 512]) for (const height of [1, 2, 3, 5, 30, 128]) {
+    const lines = component.render(width, height); assert.ok(lines.length <= height); for (const line of lines) assert.ok(visibleWidth(line) <= width, `${width}x${height}: ${visibleWidth(line)}`);
+    assert.doesNotMatch(lines.join('\n'), /LABEL-OSC|ERROR-OSC|secret|\x9b|\x9d|\x1b\]/);
+  }
+  assert.match(out(component), /\x1b\[36m/); color = 35; component.invalidate(); assert.match(out(component), /\x1b\[35m/); assert.doesNotMatch(out(component), /\x1b\[36m/);
+  units(component); component.handleInput('enter'); for (const width of [1, 2, 20, 80]) for (const line of component.render(width, 5)) assert.ok(visibleWidth(line) <= width);
+  assert.ok(component.render(Number.NaN, Number.NaN).length <= 1); component.dispose(); f.component.dispose();
+});
+
+test('result traversal is explicitly clipped/bounded and never included in parent default progress view', () => {
+  const source = run(); source.steps[0]!.units[0]!.result = Array.from({ length: 10000 }, () => 'x'.repeat(1000));
+  const f = fixture([source]); units(f.component); assert.doesNotMatch(out(f.component), /preview clipped/); f.component.handleInput('enter');
+  f.component.handleInput('end'); assert.match(out(f.component), /preview clipped/); assert.equal(f.actions.length, 0); f.component.dispose();
+});
+
+test('public keys/back behavior, paste/mixed packets do not execute controls, close does not cancel service', () => {
+  const f = fixture(); units(f.component);
+  for (const packet of ['xc', 'p\x1b[A', '\x1b]52;c;bad\x07x', '\x1b[200~x']) f.component.handleInput(packet);
+  f.component.handleInput('p'); f.component.handleInput('r\x1b[201~x'); assert.equal(f.actions.length, 0); assert.equal(f.done, 0);
+  f.component.handleInput('enter'); out(f.component); f.component.handleInput('q'); assert.match(out(f.component), /· units ·/);
+  f.component.handleInput('\x1b'); assert.match(out(f.component), /· steps ·/); f.component.handleInput('escape'); assert.match(out(f.component), /· list ·/);
+  f.component.handleInput('\x03'); assert.equal(f.done, 1); assert.equal(f.actions.length, 0);
+});
+
+test('observer storms read only on render; throwing subscribe/redraw/theme/unsubscribe/done remain idempotent', () => {
+  const f = fixture(); out(f.component); const reads = f.reads; for (let i = 0; i < 100; i++) f.late(); assert.equal(f.reads, reads);
+  f.component.dispose(); f.component.dispose(); const renders = f.renders; f.late(); assert.equal(f.renders, renders); assert.equal(f.unsubscribed, 1); assert.equal(f.done, 1);
+  let done = 0; const g = fixture(undefined, {}, { subscribe: () => () => { throw new Error('unsubscribe'); } });
+  const component = new ZergWorkflowComponent({ requestRender: () => { throw new Error('redraw'); } }, { fg: () => { throw new Error('theme'); } }, () => { done++; throw new Error('done'); }, g.options);
+  assert.doesNotThrow(() => out(component)); assert.doesNotThrow(() => component.handleInput('home')); component.dispose(); component.dispose(); assert.equal(done, 1); g.component.dispose();
+  const h = fixture(undefined, {}, { subscribe: () => { throw new Error('subscribe'); } }); assert.match(out(h.component), /Observer unavailable/); h.component.dispose();
+});
+
+test('custom rejection/factory replacement/constructor failure and unsupported modes leave no watchers', async () => {
+  const f = fixture(); f.component.dispose();
+  await assert.rejects(openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async (factory) => { await (factory as StructuralPiCustomFactory)(); throw new Error('custom rejected'); } } }, f.options), /custom rejected/);
+  assert.equal(f.unsubscribed, 2);
+  await openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async (factory) => { const create = factory as StructuralPiCustomFactory; await create(); const current = await create(); current.dispose?.(); } } }, f.options);
+  assert.equal(f.unsubscribed, 4);
+  await assert.rejects(openZergWorkflowOverlay({ mode: 'tui', ui: { custom: async (factory) => { await (factory as StructuralPiCustomFactory)(); } } }, { ...f.options, workflowRunId: 'bad id' }), /Invalid exact/); assert.equal(f.unsubscribed, 4);
+  for (const mode of ['rpc', 'json', 'print'] as const) await assert.rejects(openZergWorkflowOverlay({ mode, hasUI: true, ui: { custom: () => { throw new Error('must not call'); } } }, f.options), /interactive Pi TUI/);
+  await assert.rejects(openZergWorkflowOverlay({ hasUI: false }, f.options), /interactive Pi TUI/);
+});
+
+test('coding navigation uses exact native callback and fresh interaction after error/return, old listeners inert', async () => {
+  const f = fixture(); f.component.dispose(); let customCalls = 0; const natives: Array<{ runId: string; taskId: string }> = [];
+  const context: StructuralPiCommandContext = { mode: 'tui', ui: { custom: async (factory) => {
+    const component = await (factory as StructuralPiCustomFactory)(); customCalls++;
+    if (customCalls === 1) { units(component as ZergWorkflowComponent); component.handleInput?.('c'); assert.equal(f.unsubscribed, 2); }
+    else { assert.match(out(component as ZergWorkflowComponent), /Exact coding viewer unavailable/); component.handleInput?.('\x03'); }
+  } } };
+  await openZergWorkflowOverlay(context, { ...f.options, onOpenNative: async (native) => { natives.push(native); assert.equal(f.unsubscribed, 2); throw new Error('closed native session'); } });
+  assert.equal(customCalls, 2); assert.deepEqual(natives, [{ runId: 'native-unit-a', taskId: 'task-unit-a' }]); assert.equal(f.unsubscribed, 3); assert.equal(f.actions.length, 0);
+});
+
+test('public Kitty/CSI keys work; key release and mixed suffix packets cannot trigger actions', async () => {
+  const f = fixture([run('workflow-a', { status: 'running', cleanupSettled: false })]); out(f.component);
+  f.component.handleInput('\x1b[120;1:3u'); f.component.handleInput('\x1b[120ux'); assert.equal(f.actions.length, 0);
+  f.component.handleInput('\x1b[112u'); await tick(); assert.deepEqual(f.actions, [{ action: 'workflows.pause', workflowRunId: 'workflow-a' }]);
+  out(f.component); f.component.handleInput('\x1b[13u'); assert.match(out(f.component), /· steps ·/);
+  f.component.handleInput('\x1b[13u'); out(f.component); f.component.handleInput('\x1b[99u');
+  assert.deepEqual(f.result?.native, { runId: 'native-unit-a', taskId: 'task-unit-a' }); assert.equal(f.unsubscribed, 1);
+});

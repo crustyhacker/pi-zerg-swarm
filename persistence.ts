@@ -1,6 +1,8 @@
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { recoverWorkflowState } from './workflow-runtime.js';
+import { WORKFLOW_EXTENSION_KEY } from './workflow-model.js';
 import { recoverSessionMessages } from './session-messages.js';
 import {
   appendZergLogRecord,
@@ -195,6 +197,19 @@ export function recoverZergStateAfterRestart(
 ): { state: ZergState; recoveredRunIds: string[] } {
   const recoveredAt = (options.now ?? (() => new Date()))().toISOString();
   let next = recoverSessionMessages(state, recoveredAt);
+  if (state.extensions[WORKFLOW_EXTENSION_KEY] !== undefined) {
+    try {
+      next = { ...next, extensions: { ...next.extensions,
+        [WORKFLOW_EXTENSION_KEY]: recoverWorkflowState(state.extensions[WORKFLOW_EXTENSION_KEY]),
+      } };
+    } catch (error) {
+      // Preserve the raw namespace for inspection. Core admission rejects it;
+      // corrupt workflow data must not suppress unrelated native recovery.
+      next = appendZergLogRecord(next, { source: 'adapter', level: 'warn', kind: 'error', createdAt: recoveredAt,
+        message: `Workflow recovery disabled; original namespace retained: ${(error instanceof Error ? error.message : String(error)).slice(0, 1024)}`,
+      });
+    }
+  }
   const recoveredRunIds: string[] = [];
 
   for (const run of getSubagentRunSnapshots(state)) {

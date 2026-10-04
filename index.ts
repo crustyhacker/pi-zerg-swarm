@@ -5,12 +5,16 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
+import { createWorkflowService } from './workflow-runtime.js';
+import { WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService } from './workflow-model.js';
+export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun } from './workflow-model.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
 import { createNativeContinuationService, captureNativeContinuationPolicy, captureNativeContinuationPolicySync, validateContinuationSourceImmediate, importNativeContinuation, appendNativeContinuationMarker, nativeSourceIdentity, strictContinuationFields, continuationDeclaredDefinition, continuationDigest, type NativeContinuationService, type NativeContinuationAdmission } from './native-continuation.js';
 export type { NativeContinuationPrepare, NativeContinuationReview, NativeContinuationPolicy, NativeContinuationService } from './native-continuation.js';
 import { openZergAgentOverlay } from './ui/agent-overlay.js';
+import { openZergWorkflowOverlay } from './ui/workflow-overlay.js';
 import { getZergTimeline, validateZergTimelineFilter } from './timeline.js';
 import { openZergTeamTimeline } from './ui/team-timeline.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
@@ -35,7 +39,7 @@ export interface ZergCommandHandlerOptions {
   nativeContinuationService?: NativeContinuationService;
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean };
+type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -220,10 +224,18 @@ export function registerZergSwarmExtension(
   const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
+  runtimeOptions.workflowService = workflowControlServices.get(control);
 
   try {
     if (typeof context.on === 'function') {
-      const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', () => { shutdownSessionMessages(sessionMessageService); shutdownNativeTranscript(nativeTranscriptService); subagentAdapter.dispose?.(); }));
+      const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', async () => {
+        let firstError: unknown;
+        for (const cleanup of [() => control.dispose(), () => subagentAdapter.dispose?.(), () => control.drain?.(),
+          () => shutdownSessionMessages(sessionMessageService), () => shutdownNativeTranscript(nativeTranscriptService)]) {
+          try { await cleanup(); } catch (error) { firstError ??= error; }
+        }
+        if (firstError) throw firstError;
+      }));
       if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
     }
     const installedPatch = installInternalPatch(context, syncedStateContainer);
@@ -417,24 +429,55 @@ export function createZergControl(
   const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService, isOwnerDisposed: () => disposed } as RuntimeCommandOptions;
   const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
   runtimeOptions.subagentAdapter = adapter;
+  const owner = workflowNativeOwners.get(adapter);
+  const unavailable: WorkflowNativePort = { preflight() { throw new Error('Workflows require an owned native runner; adapter kind/metadata is not authority.'); }, async execute() { throw new Error('Workflow native owner unavailable.'); } };
+  // Lazy ledger initialization preserves ordinary control construction/revisions.
+  let service: WorkflowService | undefined;
+  let initializing = false;
+  const getService = () => {
+    if (disposed) throw new Error('Workflow service disposed.');
+    if (service) return service;
+    // Construction publishes the ledger synchronously; nested reads must not create another owner.
+    if (initializing) throw new Error('Workflow service initializing; nested request refused.');
+    initializing = true;
+    try {
+      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now });
+    } finally { initializing = false; }
+  };
+  const workflowService: WorkflowService = {
+    execute: (action, signal) => getService().execute(action, signal), list: () => getService().list(),
+    get: (id) => getService().get(id), subscribe: (listener) => getService().subscribe(listener),
+    dispose: () => service?.dispose(), drain: async () => { await service?.drain(); },
+  };
+  runtimeOptions.workflowService = workflowService;
 
-  return {
+  const control: ZergControl = {
     async execute(action: ZergControlAction, signal?: AbortSignal): Promise<ZergControlResult> {
       return executeZergControlAction(container, action, runtimeOptions, signal);
     },
     getState() {
       return container.snapshot();
     },
+    async drain() {
+      const settled = await Promise.allSettled([workflowService.drain(), owner?.drain()]);
+      const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+      if (failure) throw failure.reason;
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
-      if (!options.sessionMessageService) shutdownSessionMessages(sessionMessageService);
-      if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService);
-      if (!options.subagentAdapter) {
-        adapter.dispose?.();
+      let firstError: unknown;
+      for (const cleanup of [() => workflowService.dispose(),
+        () => { if (!options.sessionMessageService) shutdownSessionMessages(sessionMessageService); },
+        () => { if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService); },
+        () => { if (!options.subagentAdapter) adapter.dispose?.(); }]) {
+        try { cleanup(); } catch (error) { firstError ??= error; }
       }
+      if (firstError) throw firstError;
     },
   };
+  workflowControlServices.set(control, workflowService);
+  return control;
 }
 
 async function executeZergControlAction(
@@ -444,6 +487,12 @@ async function executeZergControlAction(
   signal?: AbortSignal,
 ): Promise<ZergControlResult> {
   try {
+    if (WORKFLOW_ACTION_NAMES.has(action.action)) {
+      if (!options.workflowService) return controlError(action.action, 'invalid_request', 'Workflow service unavailable.', container.read().revision);
+      const reply = await options.workflowService.execute(action as WorkflowAction, signal);
+      return reply.ok ? controlOk(action.action, reply, JSON.stringify(reply), container.read().revision)
+        : controlError(action.action, 'invalid_request', reply.error ?? 'Workflow action refused.', container.read().revision);
+    }
     switch (action.action) {
       case 'status': {
         const snapshot = container.snapshot();
@@ -639,6 +688,7 @@ async function executeZergControlAction(
         if (!validateSessionMessageInput(input)) return controlError(action.action, 'invalid_request', 'Valid exact session IDs, messageId, mode and literal body are required.', container.read().revision);
         if (container.read().mode.readOnly) return controlError(action.action, 'read_only', 'Read-only control blocks exact-session messaging.', container.read().revision);
         if (signal?.aborted) return controlError(action.action, 'request_cancelled', 'Message request cancelled before enqueue.', container.read().revision);
+        if (options.sessionMessageService && workflowFrozenMessageKeys.get(options.sessionMessageService)?.has(workflowMessageTuple(key))) return controlError(action.action, 'transport_unavailable', WORKFLOW_FROZEN_INPUT_MESSAGE, container.read().revision);
         const result = await options.sessionMessageService?.send(input, signal);
         if (!result) return controlError(action.action, 'transport_unavailable', 'Exact session messaging is unavailable.', container.read().revision);
         return result.ok ? controlOk(action.action, result, result.message, container.read().revision, { runId: key.parentRunId })
@@ -707,7 +757,7 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
   const definition: StructuralPiToolDefinition = {
     name: 'zerg_control',
     label: 'Zerg control',
-    description: 'Structured pi-zerg-swarm control API for status, agents, teams, runs, logs, and interrupts.',
+    description: 'Structured pi-zerg-swarm control API for status, agents, teams, runs, logs, interrupts, and declarative read-only workflows.',
     promptSnippet: 'Control pi-zerg-swarm through structured actions without slash-command or terminal automation.',
     promptGuidelines: ['Use zerg_control for pi-zerg-swarm automation instead of driving /zerg through a terminal.'],
     parameters: {
@@ -715,6 +765,10 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
       additionalProperties: true,
       properties: {
         action: { type: 'string' },
+        definition: { type: 'object', description: 'Bounded declarative workflow definition for workflows.define; no code or arbitrary tools.' },
+        definitionId: { type: 'string', description: 'Workflow definition identity for workflows.show/start.' },
+        workflowRunId: { type: 'string', description: 'Exact workflow attempt identity for show/pause/resume/cancel/retry/report/forget.' },
+        inputs: { description: 'Schema-validated bounded JSON data for workflows.start; never permissions.' },
         targetId: { type: 'string' },
         body: { type: 'string' },
         runId: { type: 'string' },
@@ -771,7 +825,7 @@ function parseZergControlToolParams(params: unknown): { ok: true; action: ZergCo
 }
 
 function isZergControlActionName(value: string): value is ZergControlAction['action'] {
-  return value === 'status'
+  return WORKFLOW_ACTION_NAMES.has(value) || value === 'status'
     || value === 'agents.list'
     || value === 'agents.show'
     || value === 'agents.create'
@@ -2951,6 +3005,11 @@ function requestPiNativeAbort(runId: string, activeRuns: PiNativeActiveRunRegist
     return { ok: false, message: `No active cancellable native zerg run: ${runId}` };
   }
   activeRun.cancelRequested = true;
+  const workflow = workflowActiveAdmissions.get(activeRun);
+  if (workflow) {
+    signalWorkflowAbort(activeRun, workflow);
+    return { ok: true, activeRun, message: `workflow native abort requested for ${runId}; cleanup pending` };
+  }
   let abortCount = 0;
   let abortFaultCount = 0;
   for (const session of activeRun.sessions) {
@@ -3319,7 +3378,8 @@ function createPiSlashBridgeAdapter(
     }),
   ];
 
-  return {
+  const workflowOwner = createOwnedWorkflowNative(context, container, options, activeRuns, () => disposed);
+  const adapter: ZergSubagentControlAdapter = {
     kind: 'pi-native',
     listAgentDefinitions() {
       return getAgentDefinitions(container.read());
@@ -3523,6 +3583,7 @@ function createPiSlashBridgeAdapter(
         return { ok: false, runId: resolved.runId, targetId, routedTargetId: targetId, status: resolved.status, message: resolved.message };
       }
       try {
+        if (workflowActiveAdmissions.has(resolved.activeRun)) throw new Error(WORKFLOW_FROZEN_INPUT_MESSAGE);
         const disposition = await sendPiNativeOperatorMessage(resolved.session, targetId, body, mode);
         const status: ZergOperatorMessageDeliveryStatus = disposition === 'queued' ? 'queued' : 'handled';
         return { ok: true, runId: resolved.runId, targetId, routedTargetId: targetId, status, message: `operator message ${status} for ${targetId}` };
@@ -3554,7 +3615,8 @@ function createPiSlashBridgeAdapter(
         return { ok: false, runId: target, message: `Zerg run is already terminal: ${target}` };
       }
       closeSessionMessagesParent(options.sessionMessageService, target);
-      events.emit!(SLASH_SUBAGENT_CANCEL_EVENT, { requestId: target });
+      const ownedActive = activeRuns.get(target);
+      if (!ownedActive || !workflowActiveAdmissions.has(ownedActive)) events.emit!(SLASH_SUBAGENT_CANCEL_EVENT, { requestId: target });
       const abortResult = active ? requestPiNativeAbort(target, activeRuns) : { ok: false, message: 'bridge interrupt requested before native start' };
       const now = resolveTimestamp();
       if (!active) {
@@ -3585,6 +3647,8 @@ function createPiSlashBridgeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      let firstError: unknown;
+      try { workflowOwner.dispose(); } catch (error) { firstError = error; }
       try { options.nativeContinuationService?.dispose(); } catch { /* Review cleanup cannot block existing run/session cleanup. */ }
       shutdownSessionMessages(options.sessionMessageService);
       shutdownNativeTranscript(options.nativeTranscriptService);
@@ -3594,10 +3658,10 @@ function createPiSlashBridgeAdapter(
       }
       for (const runId of activeRuns.keys()) {
         requestPiNativeAbort(runId, activeRuns);
-        markRunTerminal(runId, 'cancelled', 'adapter disposed');
+        const ownedActive = activeRuns.get(runId);
+        if (!ownedActive || !workflowActiveAdmissions.has(ownedActive)) markRunTerminal(runId, 'cancelled', 'adapter disposed');
       }
       for (const activeRun of activeRuns.values()) activeRun.disposed = true;
-      let firstError: unknown;
       if (!listenersDisposed) {
         listenersDisposed = true;
         for (const dispose of disposers.splice(0)) {
@@ -3610,6 +3674,8 @@ function createPiSlashBridgeAdapter(
       if (firstError) throw firstError;
     },
   };
+  workflowNativeOwners.set(adapter, workflowOwner);
+  return adapter;
 }
 
 function installNativeContinuationService(
@@ -3674,7 +3740,8 @@ function createPiNativeAdapter(
   persistenceManager?.save(container.read(), runtimeOptions.now);
   installNativeContinuationService(context, container, runtimeOptions, activeRuns, () => disposed);
   options.nativeContinuationService ??= runtimeOptions.nativeContinuationService;
-  return {
+  const workflowOwner = createOwnedWorkflowNative(context, container, runtimeOptions, activeRuns, () => disposed);
+  const adapter: ZergSubagentControlAdapter = {
     kind: 'pi-native',
     listAgentDefinitions() {
       return getAgentDefinitions(container.read());
@@ -3756,6 +3823,7 @@ function createPiNativeAdapter(
         return { ok: false, runId: resolved.runId, targetId, routedTargetId: targetId, status: resolved.status, message: resolved.message };
       }
       try {
+        if (workflowActiveAdmissions.has(resolved.activeRun)) throw new Error(WORKFLOW_FROZEN_INPUT_MESSAGE);
         const disposition = await sendPiNativeOperatorMessage(resolved.session, targetId, body, mode);
         const status: ZergOperatorMessageDeliveryStatus = disposition === 'queued' ? 'queued' : 'handled';
         appendLogToContainer(container, runtimeOptions, { source: 'overlay', level: 'info', kind: 'text', message: `operator message ${status} for ${targetId}`, runId: resolved.runId, agentId: targetId, data: { targetId, body, disposition, mode } });
@@ -3809,12 +3877,16 @@ function createPiNativeAdapter(
     dispose() {
       if (disposed) return;
       disposed = true;
+      let firstError: unknown;
+      try { workflowOwner.dispose(); } catch (error) { firstError = error; }
       try { runtimeOptions.nativeContinuationService?.dispose(); } catch { /* Review cleanup cannot block existing run/session cleanup. */ }
       shutdownSessionMessages(runtimeOptions.sessionMessageService);
       shutdownNativeTranscript(runtimeOptions.nativeTranscriptService);
       for (const runId of activeRuns.keys()) {
         const now = (runtimeOptions.now ?? (() => new Date()))().toISOString();
         requestPiNativeAbort(runId, activeRuns);
+        const ownedActive = activeRuns.get(runId);
+        if (ownedActive && workflowActiveAdmissions.has(ownedActive)) continue; // Workflow owner publishes only after settlement.
         const activeRun = getSubagentRunSnapshot(container.read(), runId);
         if (activeRun && !isTerminalRunSnapshot(activeRun)) {
           const cancelled = applyRuntimeTransition(container.read(), {
@@ -3834,8 +3906,11 @@ function createPiNativeAdapter(
       for (const activeRun of activeRuns.values()) activeRun.disposed = true;
       activeRuns.clear();
       persistenceManager?.save(container.read(), runtimeOptions.now);
+      if (firstError) throw firstError;
     },
   };
+  workflowNativeOwners.set(adapter, workflowOwner);
+  return adapter;
 }
 
 function validatePiNativeUnsupportedCapabilities(
@@ -4081,11 +4156,13 @@ async function runSinglePiNativeAgent(
   run: PiNativeRunContext,
 ): Promise<{ agentId: string; status: 'done' | 'failed' | 'cancelled'; message?: string }> {
   if (run.activeRun?.cancelRequested) {
-    updateMemberProgress(run, definition.id, 'cancelled', { completedAt: (run.options.now ?? (() => new Date()))().toISOString(), handoffPath: run.handoffPath, message: 'cancel requested before session start' });
+    if (!workflowAdmissions.has(run.request)) updateMemberProgress(run, definition.id, 'cancelled', { completedAt: (run.options.now ?? (() => new Date()))().toISOString(), handoffPath: run.handoffPath, message: 'cancel requested before session start' });
     return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before session start' };
   }
 
   const admission = nativeContinuationAdmissions.get(run.request);
+  const workflow = workflowAdmissions.get(run.request);
+  workflow?.assert();
   const assertContinuation = async () => {
     if (!admission) return;
     if (run.activeRun?.cancelRequested || run.activeRun?.disposed || run.container.read().mode.readOnly) throw new Error('Continuation cancelled or blocked during startup.');
@@ -4095,10 +4172,11 @@ async function runSinglePiNativeAgent(
   if (admission) await assertContinuation();
   const sdk = await import('@earendil-works/pi-coding-agent');
   if (admission) await assertContinuation();
+  workflow?.assert();
   const cwd = admission?.review.policy.cwd ?? resolvePiNativeCwd(context);
   const modelSpec = resolvePiNativeRunModel(definition, run.request);
   const { session, sessionManager, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec,
-    admission ? { admission, assert: assertContinuation } : undefined);
+    admission ? { admission, assert: assertContinuation } : undefined, workflow);
   const sessionHandle = session as PiNativeSessionHandle;
   const updateAt = () => (run.options.now ?? (() => new Date()))().toISOString();
   const reviewedEffectiveThinking = admission ? session.thinkingLevel : undefined;
@@ -4115,6 +4193,7 @@ async function runSinglePiNativeAgent(
   let freshTurnStarted = false;
   let disposition: string | undefined;
   const assertImmediate = () => {
+    if (workflow) assertWorkflowSession(workflow, session);
     if (!admission) return;
     const current = getAgentDefinition(run.container.read(), admission.source.agentDefinitionId);
     const currentSource = nativeReferences(run.container).filter((ref) => ref.parentRunId === admission.source.parentRunId && ref.memberRunId === admission.source.memberRunId && ref.piSessionId === admission.source.piSessionId);
@@ -4124,10 +4203,15 @@ async function runSinglePiNativeAgent(
     if (continuationDigest(policy) !== admission.review.policyDigest || `${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(modelSpec).modelId || session.thinkingLevel !== reviewedEffectiveThinking) throw new Error('Actual current policy/model/thinking differs from review before the new task.');
     validateContinuationSourceImmediate(admission);
   };
+  let oversizedResponse = false;
   const captureResponse = (value: unknown) => {
     const outcome = inspectPiNativeAssistantOutcome(value);
     const text = extractPiNativePromptResponse(value);
+    if (workflow && text !== undefined && Buffer.byteLength(text, 'utf8') > WORKFLOW_LIMITS.resultBytes) {
+      oversizedResponse = true; capturedResponse = undefined; assistantOutcome = outcome; return;
+    }
     if (text !== undefined || outcome) {
+      oversizedResponse = false;
       capturedResponse = text;
       assistantOutcome = outcome;
     }
@@ -4155,7 +4239,7 @@ async function runSinglePiNativeAgent(
     if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
     updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
     unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
-      if (admission ? freshTurnStarted && event.type === 'message_end' && isPiNativeAssistantMessage(event.message)
+      if (admission || workflow ? freshTurnStarted && event.type === 'message_end' && isPiNativeAssistantMessage(event.message)
         : event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
         captureResponse(event);
       }
@@ -4183,7 +4267,10 @@ async function runSinglePiNativeAgent(
     } catch { /* A failed observer never prevents execution. */ }
 
     if (admission) await assertContinuation();
-    await session.bindExtensions({ mode: 'print', abortHandler: () => { if (run.activeRun) run.activeRun.cancelRequested = true; } });
+    await session.bindExtensions({ mode: 'print', abortHandler: () => {
+      if (run.activeRun) { if (workflow) signalWorkflowAbort(run.activeRun, workflow); else run.activeRun.cancelRequested = true; }
+    } });
+    if (workflow) assertWorkflowSession(workflow, session);
     if (admission) {
       await assertContinuation();
       if (`${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(modelSpec).modelId) throw new Error('Actual startup model differs from reviewed current policy.');
@@ -4199,13 +4286,19 @@ async function runSinglePiNativeAgent(
       data: { model: modelSpec, tools, ...timelineData('recorded-event') },
     });
     if (run.activeRun?.cancelRequested) {
-      updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancel requested before prompt' });
+      if (!workflow) updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancel requested before prompt' });
       return { agentId: definition.id, status: 'cancelled', message: 'cancel requested before prompt' };
     }
     updateMemberProgress(run, definition.id, 'running', { handoffPath: run.handoffPath });
     try {
       const exact = { parentRunId: reference.parentRunId, memberRunId: reference.memberRunId, piSessionId: reference.piSessionId };
-      releaseMessages = run.options.sessionMessageService?.register(exact, {
+      if (workflow && run.options.sessionMessageService) {
+        const service = run.options.sessionMessageService;
+        const keys = workflowFrozenMessageKeys.get(service) ?? new Set<string>();
+        workflowFrozenMessageKeys.set(service, keys);
+        const tuple = workflowMessageTuple(exact); keys.add(tuple);
+        releaseMessages = () => { keys.delete(tuple); }; // No accepting facade: coding composer stays disabled.
+      } else releaseMessages = run.options.sessionMessageService?.register(exact, {
         accepting: () => !run.activeRun?.cancelRequested && !run.activeRun?.disposed && session.sessionId === exact.piSessionId && session.isStreaming && !session.isCompacting,
         subscribe: (listener) => session.subscribe(listener),
         enqueue: (input) => session.sendCustomMessage({ customType: OPERATOR_CUSTOM_TYPE, content: input.body, display: true,
@@ -4213,21 +4306,29 @@ async function runSinglePiNativeAgent(
       });
     } catch { /* Receipt integration cannot own task execution. */ }
     if (admission) { await assertContinuation(); assertImmediate(); }
-    const promptResult = await session.prompt(run.task, admission
+    if (workflow) assertImmediate();
+    const promptResult = await session.prompt(run.task, admission || workflow
       ? { source: 'extension' as never, expandPromptTemplates: false, preflightResult: (value) => {
         disposition = value;
         if (value === 'started') { assertImmediate(); freshTurnStarted = true; }
         else { freshTurnStarted = false; capturedResponse = undefined; assistantOutcome = undefined; }
       } }
       : { source: 'extension' as never });
-    if (!admission) {
+    if (!admission && !workflow) {
       captureResponse(promptResult);
       capturedResponse = extractPiNativePromptResponse(sessionHandle.messages);
       assistantOutcome = inspectPiNativeAssistantOutcome(sessionHandle.messages);
     } else if (disposition !== 'started') { capturedResponse = undefined; assistantOutcome = undefined; }
     if (run.activeRun?.cancelRequested) {
-      updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancelled' });
+      if (!workflow) updateMemberProgress(run, definition.id, 'cancelled', { completedAt: updateAt(), handoffPath: run.handoffPath, message: 'cancelled' });
       return { agentId: definition.id, status: 'cancelled', message: 'cancelled' };
+    }
+    if (workflow) {
+      workflow.result = oversizedResponse ? { status: 'failed', error: 'Workflow final assistant result exceeded 16 KiB before parsing.', cleanupSettled: false }
+        : assistantOutcome?.status === 'failed' || assistantOutcome?.status === 'cancelled' ? { status: assistantOutcome.status, error: workflowFailure(assistantOutcome.message ?? 'Assistant stopped without success.'), cleanupSettled: false }
+        : { status: assistantOutcome?.status === 'done' && capturedResponse !== undefined ? 'completed' : 'unverified',
+          ...(assistantOutcome?.status === 'done' && capturedResponse !== undefined ? { text: capturedResponse } : { error: 'Workflow final assistant result missing, interrupted, or not verified successful.' }), cleanupSettled: false };
+      return { agentId: definition.id, status: workflow.result.status === 'completed' ? 'done' : 'failed' };
     }
     if (!assistantOutcome) {
       const message = admission && disposition === 'handled' ? 'new task handled by input hook; no new assistant completion' : 'assistant final outcome was not captured';
@@ -4273,7 +4374,8 @@ async function runSinglePiNativeAgent(
     updateMemberProgress(run, definition.id, 'done', { completedAt: updateAt(), handoffPath: run.handoffPath, message: handoffMessage });
     return { agentId: definition.id, status: 'done', message: handoffMessage };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = workflow ? workflowFailure(error) : error instanceof Error ? error.message : String(error);
+    if (workflow) workflow.result = { status: run.activeRun?.cancelRequested ? 'cancelled' : 'unverified', error: message, cleanupSettled: false };
     appendLogToContainer(run.container, run.options, {
       source: 'adapter',
       level: 'error',
@@ -4285,9 +4387,20 @@ async function runSinglePiNativeAgent(
       data: timelineData('recorded-event'),
     });
     const status = run.activeRun?.cancelRequested ? 'cancelled' : 'failed';
-    updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
+    if (!workflow) updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
     return { agentId: definition.id, status, message };
   } finally {
+    if (workflow) {
+      await cleanupWorkflowSession(workflow, session, sdk, [
+        () => releaseMessages?.(), () => releaseTranscript?.(),
+        () => unregisterPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle),
+        () => { if (run.runId === run.parentRunId) unregisterPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle); },
+        () => unsubscribe?.(),
+      ]);
+      try { if (reference) setNativeSessionReference(run, { ...reference,
+        attachment: workflow.cleanupSettled ? 'disposed' : 'unavailable', ...(workflow.cleanupSettled ? { disposedAt: updateAt() } : {}),
+      }); } catch (error) { workflow.failures.push(workflowFailure(error)); workflow.cleanupSettled = false; }
+    } else {
     try { releaseMessages?.(); } catch { /* Messaging cleanup never owns SDK disposal. */ }
     try { releaseTranscript?.(); } catch { /* Observer cleanup never owns SDK disposal. */ }
     try {
@@ -4309,6 +4422,7 @@ async function runSinglePiNativeAgent(
           ...(disposed ? { disposedAt: updateAt() } : {}),
         });
       }
+    }
     }
   }
 }
@@ -4757,12 +4871,14 @@ async function createPiNativeSession(
   cwd: string,
   modelSpec: string | undefined,
   continuation?: { admission: NativeContinuationAdmission; assert(): Promise<void> },
+  workflow?: WorkflowAdmission,
 ) {
   if (definition.permissionMode === 'manual' || definition.permissionMode === 'assisted') {
     throw new Error(`Native Pi runner does not support agent permissionMode ${definition.permissionMode}; use inherit/default or automatic for native runs.`);
   }
   const agentDir = sdk.getAgentDir();
-  if (continuation && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for continuation.');
+  if ((continuation || workflow) && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for reviewed native execution.');
+  workflow?.assert();
   if (continuation) await continuation.assert();
   const modelRuntime = await sdk.ModelRuntime.create({
     authPath: resolvePath(agentDir, 'auth.json'),
@@ -4770,8 +4886,10 @@ async function createPiNativeSession(
     allowModelNetwork: false,
   });
   if (continuation) await continuation.assert();
+  workflow?.assert();
   const { modelId, thinkingLevel } = splitModelAndThinking(modelSpec);
-  const toolPolicy = resolvePiNativeToolPolicy(definition.tools, definition.disallowedTools);
+  const declaredPolicy = resolvePiNativeToolPolicy(definition.tools, definition.disallowedTools);
+  const toolPolicy = workflow ? { ...declaredPolicy, tools: [...workflow.tools], activeTools: [...workflow.tools], customTools: [] } : declaredPolicy;
   const tools = toolPolicy.activeTools;
   const settingsManager = sdk.SettingsManager.create(cwd, agentDir);
   // Package discovery reads scoped settings, not applyOverrides(), and reloads
@@ -4795,16 +4913,19 @@ async function createPiNativeSession(
   }
   settingsManager.applyOverrides({
     compaction: { enabled: false },
-    retry: { enabled: true, maxRetries: 2 },
+    retry: { enabled: !workflow, maxRetries: workflow ? 0 : 2 },
     defaultTools: tools,
   });
   if (continuation) await continuation.assert();
   const loaderDefinition = continuation ? { ...definition, prompt: `${definition.prompt}\n\n${continuation.admission.review.policy.authorityInstruction}` } : definition;
-  const resourceLoader = await createPiNativeResourceLoader(sdk, loaderDefinition, task, cwd, settingsManager);
+  const resourceLoader = await createPiNativeResourceLoader(sdk, loaderDefinition, task, cwd, settingsManager, workflow);
+  workflow?.assert();
   if (continuation) await continuation.assert();
   const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
   if (continuation) await continuation.assert();
+  workflow?.assert();
   const sessionManager = continuation ? importNativeContinuation(sdk, continuation.admission) : sdk.SessionManager.create(cwd);
+  if (workflow) workflow.cleanupSettled = false;
   const { session } = await sdk.createAgentSession({
     cwd,
     agentDir,
@@ -4815,10 +4936,36 @@ async function createPiNativeSession(
     tools: toolPolicy.tools ?? [],
     ...(toolPolicy.noTools ? { noTools: toolPolicy.noTools } : {}),
     excludeTools: toolPolicy.excludeTools,
-    customTools: createPiNativeCustomTools(toolPolicy.customTools) as never,
+    customTools: workflow ? [] : createPiNativeCustomTools(toolPolicy.customTools) as never,
     sessionManager,
     settingsManager,
   });
+  if (workflow) {
+    try {
+      assertWorkflowSession(workflow, session);
+      const prepare = session.agent.prepareRequest;
+      session.agent.prepareRequest = async (request, signal) => {
+        const prepared = await prepare?.(request, signal);
+        assertWorkflowSession(workflow, session);
+        const model = prepared?.model ?? request.model;
+        if (`${model.provider}/${model.id}` !== modelId) throw new Error('Workflow routed model drifted.');
+        return prepared || undefined;
+      };
+      const payload = session.agent.onPayload;
+      session.agent.onPayload = async (...args) => {
+        const result = await payload?.(...args);
+        assertWorkflowSession(workflow, session); // AFTER ordinary before_provider_request hooks.
+        return result;
+      };
+      const beforeToolCall = session.agent.beforeToolCall;
+      session.agent.beforeToolCall = async (call, signal) => {
+        const result = await beforeToolCall?.(call, signal);
+        assertWorkflowSession(workflow, session);
+        if (!workflow.tools.includes(call.toolCall.name)) return { block: true, reason: 'Workflow read-only tool boundary.' };
+        return result;
+      };
+    } catch (error) { await cleanupWorkflowSession(workflow, session, sdk, []); throw error; }
+  }
   if (continuation) {
     try {
       await continuation.assert();
@@ -4846,6 +4993,7 @@ async function createPiNativeResourceLoader(
   task: string,
   cwd: string,
   settingsManager: unknown,
+  workflow?: WorkflowAdmission,
 ): Promise<unknown> {
   const systemPrompt = [
     definition.prompt || `You are ${definition.label ?? definition.id}, a zerg coding agent.`,
@@ -4857,7 +5005,16 @@ async function createPiNativeResourceLoader(
   ].join('\n');
 
   if (sdk.DefaultResourceLoader && typeof sdk.getAgentDir === 'function') {
-    const loader = new sdk.DefaultResourceLoader({ cwd, agentDir: sdk.getAgentDir(), settingsManager, systemPrompt });
+    const loader = new sdk.DefaultResourceLoader({ cwd, agentDir: sdk.getAgentDir(), settingsManager, systemPrompt,
+      ...(workflow ? { extensionFactories: [(pi: import('@earendil-works/pi-coding-agent').ExtensionAPI) => {
+        pi.on('tool_call', (event) => {
+          workflow.assert();
+          const tools = pi.getAllTools().filter((tool) => tool.name === event.toolName);
+          if (!workflow.tools.includes(event.toolName) || tools.length !== 1 || tools[0]!.sourceInfo.path !== `builtin:${event.toolName}` || tools[0]!.sourceInfo.source !== 'builtin') return { block: true, reason: 'Workflow immutable read-only builtin tool boundary.' };
+          return undefined;
+        });
+      }] } : {}),
+    });
     await loader.reload();
     return loader;
   }
@@ -5332,12 +5489,13 @@ export function createPiZergCommandHandler(
   const scaffoldHandler = createZergCommandHandler(stateOrReader, options);
   const runtimeOptions = options as RuntimeCommandOptions;
   const transcript = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(stateOrReader) });
-  const viewCoding = (context: StructuralPiCommandContext, select?: (refs: ZergNativeSessionReference[]) => ZergNativeSessionReference[]) => openZergAgentOverlay(context, {
+  const viewCoding = (context: StructuralPiCommandContext, select?: (refs: ZergNativeSessionReference[]) => ZergNativeSessionReference[], initialKey?: ZergSessionMessageKey) => openZergAgentOverlay(context, {
     getReferences: () => { const refs = transcript.list(); return select ? select(refs) : refs; },
     subscribeReferences: (listener) => subscribeToZergState(stateOrReader, listener),
     open: (key, openOptions) => transcript.open(key, openOptions),
     composer: options.sessionMessageService,
     nativeContinuationService: options.nativeContinuationService,
+    ...(initialKey ? { initialKey: { ...initialKey } } : {}),
   });
 
   const viewTimeline = (context: StructuralPiCommandContext, initialFilter: ZergTimelineFilter = {}) => openZergTeamTimeline(context, {
@@ -5356,6 +5514,37 @@ export function createPiZergCommandHandler(
 
   return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
     const routed = stripOptionalZergInvocation(input.trimStart());
+    if (/^workflows(?:\s|$)/i.test(routed)) {
+      const container = getWritableStateContainer(stateOrReader);
+      const service = runtimeOptions.workflowService;
+      try {
+        if (!container || !service) throw new Error('Workflow service unavailable; use an owner-registered Pi command/control.');
+        const monitor = /^workflows\s+monitor(?:\s+(\S+))?\s*$/i.exec(routed);
+        if (monitor) {
+          if (context.hasUI === false || (context.mode !== undefined && context.mode !== 'tui') || !context.ui?.custom) {
+            const reply = await service.execute(monitor[1] ? { action: 'workflows.show', workflowRunId: monitor[1] } : { action: 'workflows.list' });
+            context.ui?.notify?.(JSON.stringify(reply), reply.ok ? 'info' : 'error'); return;
+          }
+          await openZergWorkflowOverlay(context, { service, workflowRunId: monitor[1], onOpenNative: async (identity) => {
+            const correlations = service.list().flatMap((view) => view.correlations);
+            const run = getSubagentRunSnapshot(container.read(), identity.runId);
+            if (!correlations.some((unit) => unit.native?.runId === identity.runId && unit.native.taskId === identity.taskId) || run?.taskId !== identity.taskId) throw new Error('Exact workflow/native correlation is no longer current.');
+            const selected = (ref: ZergNativeSessionReference) => ref.parentRunId === identity.runId && ref.memberRunId === identity.runId;
+            const current = run.nativeSessions?.filter(selected) ?? [];
+            const references = transcript.list().filter(selected);
+            if (current.length !== 1 || references.length !== 1 || current[0]!.piSessionId !== references[0]!.piSessionId) throw new Error('Exact workflow native reference is missing, ambiguous, or stale; no fallback.');
+            const initialKey = { parentRunId: current[0]!.parentRunId, memberRunId: current[0]!.memberRunId, piSessionId: current[0]!.piSessionId };
+            if (!validateSessionMessageKey(initialKey)) throw new Error('Exact workflow native reference is stale or invalid; no fallback.');
+            await viewCoding(context, (refs) => refs.filter(selected), initialKey);
+          } }); return;
+        }
+        const parsed = parseWorkflowCommand(routed);
+        if (!parsed) throw new Error('Usage: /zerg workflows list|define <JSON>|start <JSON>|show <JSON>|pause|resume|cancel|retry|report|forget <workflowRunId>|monitor [workflowRunId]');
+        const reply = await executeZergControlAction(container, parsed, runtimeOptions);
+        context.ui?.notify?.(reply.output ?? reply.error?.message ?? 'Workflow outcome unavailable.', reply.ok ? 'info' : 'error');
+      } catch (error) { context.ui?.notify?.(workflowFailure(error), 'error'); }
+      return;
+    }
     if (/^sessions\s+continue(?:\s|$)/i.test(routed)) {
       const container = getWritableStateContainer(stateOrReader);
       const parsed = parseNativeContinuationCommand(routed);
@@ -5907,4 +6096,193 @@ export function parseNativeContinuationCommand(input: string): ZergControlAction
   const discard = input.match(/^sessions\s+continue\s+discard\s+(\S+)\s*$/i);
   if (discard) return { action: 'session.continuation.discard', reviewId: discard[1]! };
   return undefined;
+}
+
+// Workflow authority is an owner-local capability, never a DTO, kind tag, or saved marker.
+interface OwnedWorkflowNative {
+  port: WorkflowNativePort;
+  dispose(): void;
+  drain(): Promise<void>;
+}
+interface WorkflowAdmission {
+  request: WorkflowNativeRequest;
+  assert(): void;
+  tools: readonly string[];
+  aborts: Promise<void>[];
+  failures: string[];
+  cleanupSettled: boolean;
+  result?: WorkflowNativeOutcome;
+}
+const workflowNativeOwners = new WeakMap<ZergSubagentControlAdapter, OwnedWorkflowNative>();
+const workflowControlServices = new WeakMap<ZergControl, WorkflowService>();
+const workflowAdmissions = new WeakMap<ZergSubagentLaunchRequest, WorkflowAdmission>();
+const workflowActiveAdmissions = new WeakMap<PiNativeActiveRun, WorkflowAdmission>();
+const workflowFrozenMessageKeys = new WeakMap<SessionMessageService, Set<string>>();
+const WORKFLOW_FROZEN_INPUT_MESSAGE = 'Workflow unit inputs are frozen; messaging unavailable. Use an explicit retry or new workflow run.';
+function workflowMessageTuple(key: { parentRunId: string; memberRunId: string; piSessionId: string }): string {
+  return JSON.stringify([key.parentRunId, key.memberRunId, key.piSessionId]);
+}
+const WORKFLOW_READ_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
+const WORKFLOW_ACTION_NAMES = new Set(['workflows.list', 'workflows.define', 'workflows.show', 'workflows.start', 'workflows.pause', 'workflows.resume', 'workflows.cancel', 'workflows.retry', 'workflows.report', 'workflows.forget']);
+
+function workflowFailure(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 1024);
+}
+function workflowAgentTools(agent: ZergAgentDefinition): readonly string[] {
+  if (!agent.model?.trim() || !splitModelAndThinking(agent.model).modelId?.includes('/')) throw new Error('Workflow agent requires an explicit provider/model.');
+  if (agent.maxTurns !== undefined || agent.fallbackModels?.length || (agent.permissionMode !== undefined && agent.permissionMode !== 'inherit')) throw new Error('Workflow agents reject turn limits, fallback models, and permission overrides.');
+  const tools = resolvePiNativeToolPolicy(agent.tools, agent.disallowedTools).activeTools.filter((name) => WORKFLOW_READ_TOOLS.has(name));
+  if (tools.length === 0) throw new Error('Workflow requires at least one currently authorized read/grep/find/ls builtin; no tools are added.');
+  return Object.freeze([...tools]);
+}
+function signalWorkflowAbort(active: PiNativeActiveRun, admission: WorkflowAdmission): void {
+  active.cancelRequested = true;
+  for (const session of active.sessions) {
+    // Retain promises independently of the active routing registry, even on dispose.
+    try { admission.aborts.push(Promise.resolve(session.abort?.()).catch((error) => { admission.failures.push(workflowFailure(error)); })); }
+    catch (error) { admission.failures.push(workflowFailure(error)); }
+  }
+}
+function createOwnedWorkflowNative(
+  context: StructuralPiExtensionContext, container: ZergStateContainer, options: RuntimeCommandOptions,
+  activeRuns: PiNativeActiveRunRegistry, isDisposed: () => boolean,
+): OwnedWorkflowNative {
+  const jobs = new Set<Promise<WorkflowNativeOutcome>>();
+  const handles = new Map<PiNativeActiveRun, WorkflowAdmission>();
+  let disposed = false;
+  let uncertain = false;
+  const assertPolicy = (agent: ZergAgentDefinition) => {
+    if (disposed || isDisposed() || options.isOwnerDisposed?.() || uncertain) throw new Error('Workflow native owner unavailable or previous cleanup uncertain.');
+    const state = container.read();
+    if (state.mode.readOnly || state.lifecycle === 'disposed') throw new Error('Workflow admission blocked by current read-only/disposed authority.');
+    const current = getAgentDefinition(state, agent.id);
+    if (!current || workflowHash(normalizeWorkflowAgent(current)) !== workflowHash(agent)) throw new Error('Workflow frozen agent definition no longer matches current policy.');
+    workflowAgentTools(agent);
+  };
+  const port: WorkflowNativePort = {
+    preflight: assertPolicy,
+    execute(request) {
+      // Defer execution one microtask so the settlement is owned before any publication.
+      const job = Promise.resolve().then(async (): Promise<WorkflowNativeOutcome> => {
+        const runId = (options.idFactory?.runId ?? defaultIdFactory.runId)();
+        const taskId = (options.idFactory?.taskId ?? defaultIdFactory.taskId)();
+        const identity = { runId, taskId };
+        const active = createPiNativeActiveRun(runId);
+        const admission: WorkflowAdmission = { request, tools: workflowAgentTools(request.agent), aborts: [], failures: [], cleanupSettled: true,
+          assert() {
+            assertPolicy(request.agent);
+            request.assertAdmission();
+            if (request.signal.aborted || active.cancelRequested || active.disposed) throw new Error('Workflow unit cancelled before native admission.');
+          },
+        };
+        const nativeRequest: ZergSubagentLaunchRequest = { agent: request.agent.id, agentDefinitionId: request.agent.id, task: request.prompt, runId, taskId, model: request.agent.model, launchMode: 'fresh' };
+        workflowAdmissions.set(nativeRequest, admission);
+        workflowActiveAdmissions.set(active, admission);
+        const abort = () => signalWorkflowAbort(active, admission);
+        handles.set(active, admission);
+        request.signal.addEventListener('abort', abort);
+        let published = false;
+        let outcome: WorkflowNativeOutcome;
+        try {
+          admission.assert();
+          const state = container.read();
+          if (state.agents[runId] || state.tasks[taskId]) throw new Error('Workflow native identity collision.');
+          request.onIdentity(identity); // Correlate before task, native reference, logs or hooks.
+          admission.assert();
+          activeRuns.set(runId, active);
+          const now = (options.now ?? (() => new Date()))().toISOString();
+          const lineage = { workflowRunId: request.workflowRunId, familyId: request.familyId, attemptNo: request.attemptNo, stepId: request.stepId, unitId: request.unitId, inputHash: request.inputHash };
+          const taskState = upsertTask(container.read(), { id: taskId, title: `Workflow ${request.stepId}/${request.unitId}`, status: 'running', ownerAgentId: runId, updatedAt: now, metadata: { workflow: lineage } });
+          const started = applyRuntimeTransition(taskState, { entity: 'agent', action: 'start', id: runId, label: request.agent.label, kind: 'subagent', substate: 'starting', activity: 'read-only workflow unit', metadata: { taskId, agentDefinitionId: request.agent.id, launchMode: 'fresh', workflow: lineage } }, { now: () => new Date(now) });
+          published = true;
+          container.replace(started);
+          admission.assert();
+          await runSinglePiNativeAgent(context, request.agent, { task: request.prompt, runId, taskId, parentRunId: runId, request: nativeRequest, options, container, activeRun: active });
+          outcome = admission.result ?? { status: active.cancelRequested ? 'cancelled' : 'unverified', error: 'No exact workflow assistant outcome captured.', cleanupSettled: admission.cleanupSettled };
+        } catch (error) {
+          outcome = { status: active.cancelRequested || request.signal.aborted ? 'cancelled' : 'unverified', error: workflowFailure(error), cleanupSettled: admission.cleanupSettled };
+        } finally {
+          request.signal.removeEventListener('abort', abort);
+          // Abort callbacks may still be settling after prompt() and routing teardown.
+          for (let index = 0; index < admission.aborts.length; index++) await admission.aborts[index];
+          activeRuns.delete(runId);
+          handles.delete(active);
+        }
+        const cleanupSettled = admission.cleanupSettled && admission.failures.length === 0;
+        if (!cleanupSettled) uncertain = true;
+        outcome = { ...outcome!, identity, cleanupSettled, ...(!cleanupSettled ? { status: 'unverified' as const, error: `Native cleanup uncertain: ${admission.failures.join('; ') || outcome!.error || 'setup did not settle'}` } : {}) };
+        if (published) {
+          try {
+            const now = (options.now ?? (() => new Date()))().toISOString();
+            const status = outcome.status === 'completed' ? 'done' : outcome.status === 'cancelled' ? 'cancelled' : 'failed';
+            const reason = outcome.error ?? `workflow unit ${outcome.status}`;
+            updateMemberProgress({ task: request.prompt, runId, taskId, parentRunId: runId, request: nativeRequest, options, container, activeRun: active }, request.agent.id, status, { completedAt: now, message: reason });
+            const stopped = applyRuntimeTransition(container.read(), { entity: 'agent', action: status === 'done' ? 'stop' : 'fail', id: runId, kind: 'subagent', status, substate: status === 'done' ? 'completed' : status, activity: reason, metadata: { completedAt: now, ...(outcome.text !== undefined ? { finalSummary: outcome.text } : {}), ...(outcome.error ? { errorSummary: outcome.error } : {}), workflowCleanupSettled: cleanupSettled } }, { now: () => new Date(now) });
+            container.replace(updateRunTaskLifecycle(stopped, taskId, status, status === 'done' ? 'completed' : status, reason, now));
+          } catch (error) { outcome = { ...outcome, status: 'unverified', error: `Workflow terminal publication failed: ${workflowFailure(error)}` }; }
+        }
+        return outcome;
+      });
+      jobs.add(job);
+      void job.finally(() => jobs.delete(job)).catch(() => { uncertain = true; });
+      return job;
+    },
+  };
+  return { port,
+    dispose() { if (disposed) return; disposed = true; for (const [active, admission] of handles) { active.disposed = true; signalWorkflowAbort(active, admission); } },
+    async drain() { const settled = await Promise.allSettled([...jobs]); if (settled.some((entry) => entry.status === 'rejected')) throw new Error('Workflow native settlement rejected; cleanup unknown.'); },
+  };
+}
+
+function assertWorkflowSession(admission: WorkflowAdmission, session: import('@earendil-works/pi-coding-agent').AgentSession): void {
+  admission.assert();
+  if (`${session.model?.provider}/${session.model?.id}` !== splitModelAndThinking(admission.request.agent.model).modelId) throw new Error('Workflow effective model drifted.');
+  const active = session.getActiveToolNames();
+  if (active.length !== admission.tools.length || active.some((name) => !admission.tools.includes(name))) throw new Error('Workflow effective tool allowlist drifted.');
+  const all = session.getAllTools();
+  for (const name of admission.tools) {
+    const matches = all.filter((tool) => tool.name === name);
+    if (matches.length !== 1 || matches[0]!.sourceInfo.path !== `builtin:${name}` || matches[0]!.sourceInfo.source !== 'builtin') throw new Error(`Workflow requires the original SDK builtin ${name}; replacement tool refused.`);
+  }
+}
+
+async function cleanupWorkflowSession(
+  admission: WorkflowAdmission, session: import('@earendil-works/pi-coding-agent').AgentSession,
+  sdk: typeof import('@earendil-works/pi-coding-agent'), stages: Array<() => unknown | Promise<unknown>>,
+): Promise<void> {
+  const attempt = async (stage: () => unknown | Promise<unknown>) => { try { await stage(); } catch (error) { admission.failures.push(workflowFailure(error)); } };
+  // SDK abort waits for idle. Retain every cancellation promise before disposal.
+  await attempt(() => session.abort());
+  for (let index = 0; index < admission.aborts.length; index++) await attempt(() => admission.aborts[index]);
+  await attempt(() => session.waitForIdle());
+  for (const stage of stages) await attempt(stage);
+  // emit() reports extension faults rather than rejecting; observe those too.
+  let unsubscribeErrors: (() => void) | undefined;
+  await attempt(() => { unsubscribeErrors = session.extensionRunner.onError((error) => { admission.failures.push(workflowFailure(error.error)); }); });
+  await attempt(() => session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }));
+  await attempt(() => unsubscribeErrors?.());
+  await attempt(() => session.dispose());
+  admission.cleanupSettled = admission.failures.length === 0;
+}
+
+function parseWorkflowCommand(input: string): WorkflowAction | undefined {
+  const match = /^workflows\s+(\S+)(?:\s+([\s\S]*))?$/i.exec(input.trim());
+  if (!match) return undefined;
+  const action = `workflows.${match[1]!.toLowerCase()}`;
+  const body = match[2]?.trim() ?? '';
+  if (Buffer.byteLength(body, 'utf8') > WORKFLOW_LIMITS.definitionBytes) throw new Error('Workflow command JSON exceeds 64 KiB.');
+  if (!WORKFLOW_ACTION_NAMES.has(action)) return undefined;
+  if (action === 'workflows.list') return body ? undefined : { action };
+  if (action === 'workflows.define') return { action, definition: JSON.parse(body) };
+  if (action === 'workflows.start') {
+    const value = JSON.parse(body);
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some((key) => !['definitionId', 'inputs', 'concurrency'].includes(key))) throw new Error('Workflow start requires JSON {definitionId, inputs, concurrency?}.');
+    return { ...value, action };
+  }
+  if (action === 'workflows.show') {
+    const value = JSON.parse(body);
+    return { ...value, action };
+  }
+  if (!body || /\s/.test(body)) return undefined;
+  return { action: action as 'workflows.pause', workflowRunId: body };
 }
