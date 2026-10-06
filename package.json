@@ -1,6 +1,6 @@
 {
   "name": "pi-zerg-swarm",
-  "version": "1.1.18",
+  "version": "1.1.19",
   "description": "Pi coding-agent extension for native configurable agent teams, durable recovery, direct control, and zerg-style subagent orchestration.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,9 @@
     "./workflow-model.ts": "./workflow-model.ts",
     "./workflow-recovery.ts": "./workflow-recovery.ts",
     "./workflow-runtime.ts": "./workflow-runtime.ts",
+    "./workflow-script.ts": "./workflow-script.ts",
+    "./workflow-script-format.ts": "./workflow-script-format.ts",
+    "./workflow-script-examples.ts": "./workflow-script-examples.ts",
     "./workflow-workspace.ts": "./workflow-workspace.ts"
   },
   "files": [
@@ -47,6 +50,13 @@
     "workflow-native-tools.ts",
     "workflow-recovery.ts",
     "workflow-runtime.ts",
+    "workflow-script.ts",
+    "workflow-script-format.ts",
+    "workflow-script-compiler.mjs",
+    "workflow-script-process.ts",
+    "workflow-script-controls.ts",
+    "workflow-script-examples.ts",
+    "workflow-script-language.md",
     "workflow-workspace.ts",
     "ui",
     "README.md",
@@ -78,11 +88,13 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
+  "dependencies": {
+    "typescript": "5.9.3"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.0.0",
     "@earendil-works/pi-tui": "^1.0.0",
     "@types/node": "^24.0.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.8.0"
+    "tsx": "^4.20.0"
   }
 }

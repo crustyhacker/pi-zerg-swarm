@@ -5,6 +5,9 @@ import type { WorkflowCodingPolicy, WorkflowCodingCapability, WorkflowCodingAppr
 import type { RecoveryCheckpointV1 } from './workflow-recovery.js';
 import type { RecoveryOwnershipInspection, RecoveryWriterOwnerEvidence } from './persistence.js';
 import type { DurableCheckReceiptConfig } from './workflow-checks.js';
+import type { WorkflowScriptAuthoring, WorkflowScriptSpan } from './workflow-script-format.js';
+import { WORKFLOW_SCRIPT_FORMAT_VERSION, WORKFLOW_SCRIPT_LANGUAGE_VERSION, WORKFLOW_SCRIPT_COMPILER_VERSION,
+  WORKFLOW_SCRIPT_PARSER_VERSION, WORKFLOW_SCRIPT_LIMITS } from './workflow-script-format.js';
 
 export type WorkflowJson = null | boolean | number | string | WorkflowJson[] | { [key: string]: WorkflowJson };
 export interface WorkflowSchema {
@@ -33,7 +36,7 @@ export interface WorkflowStep {
   /** v3 controlled staged coding step; executed only by a trusted native coding port, never model approval. */
   coding?: WorkflowCodingStepSpec;
 }
-export interface WorkflowDefinition { id: string; version: 1 | 2 | 3; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[] }
+export interface WorkflowDefinition { id: string; version: 1 | 2 | 3; label: string; inputSchema: WorkflowSchema; steps: WorkflowStep[]; authoring?: WorkflowScriptAuthoring }
 export interface WorkflowNativeIdentity { runId: string; taskId: string }
 export interface WorkflowNativeLineage {
   blockId?: string; iterationId?: string; iterationNo?: number;
@@ -101,13 +104,17 @@ export interface WorkflowRecoveryDiagnostic {
   localView: 'stale-or-uncertain';
   publication: 'canonical-selection-observed' | 'uncertain';
 }
+/** Display-only authored address/location; never an execution or native identity. */
+export interface WorkflowSourceProjection {
+  authoredPath?: string[]; source?: { sourceName: string; span: WorkflowScriptSpan }; phaseId?: string;
+}
 export interface WorkflowView {
   recoveryDiagnostic?: WorkflowRecoveryDiagnostic;
   workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; recoveryOf?: string; definitionId: string;
   status: WorkflowRunStatus; createdAt: string; updatedAt: string; cleanupSettled: boolean; recovered: boolean;
-  steps?: Array<{ id: string; kind: WorkflowStep['kind']; status: WorkflowUnitStatus; condition?: boolean; skipReason?: WorkflowStepRun['skipReason']; iterations?: number; maxIterations?: number; currentIteration?: number; iterationId?: string; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery'; error?: string }>;
+  steps?: Array<WorkflowSourceProjection & { id: string; kind: WorkflowStep['kind']; status: WorkflowUnitStatus; condition?: boolean; skipReason?: WorkflowStepRun['skipReason']; iterations?: number; maxIterations?: number; currentIteration?: number; iterationId?: string; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery'; error?: string }>;
   counts: Record<WorkflowUnitStatus, number>;
-  correlations: Array<{ blockId?: string; iterationId?: string; iterationNo?: number; stepId: string; unitId: string; status: WorkflowUnitStatus; native?: WorkflowNativeIdentity; reusedFrom?: WorkflowUnit['reusedFrom'] }>;
+  correlations: Array<WorkflowSourceProjection & { blockId?: string; iterationId?: string; iterationNo?: number; stepId: string; unitId: string; status: WorkflowUnitStatus; native?: WorkflowNativeIdentity; reusedFrom?: WorkflowUnit['reusedFrom'] }>;
   error?: string;
 }
 /** Compact structured list DTO; unit/native/reuse correlations require explicit show. */
@@ -283,7 +290,7 @@ export function validateWorkflowDefinition(value: WorkflowDefinition): WorkflowD
 }
 function validateDefinition(value: WorkflowDefinition, iterationSchema?: WorkflowSchema): WorkflowDefinition {
   const def = freezeWorkflowData(value, WORKFLOW_LIMITS.definitionBytes);
-  keysOnly(def, ['id', 'version', 'label', 'inputSchema', 'steps']);
+  keysOnly(def, ['id', 'version', 'label', 'inputSchema', 'steps', 'authoring']);
   workflowAssert(identifier(def.id) && (def.version === 1 || def.version === 2 || def.version === 3) && typeof def.label === 'string' && def.label.length > 0 && def.label.length <= 160, 'Invalid workflow identity');
   validateWorkflowSchema(def.inputSchema);
   workflowAssert(Array.isArray(def.steps) && def.steps.length > 0 && def.steps.length <= WORKFLOW_LIMITS.steps, 'Workflow step limit exceeded');
@@ -416,8 +423,66 @@ function validateDefinition(value: WorkflowDefinition, iterationSchema?: Workflo
     }
     workflowAssert(authored <= 16 && expanded <= 256 && native * 3 <= 256, 'Repeat expansion exceeds workflow budget');
   }
+  if (def.authoring !== undefined) validateWorkflowAuthoring(def);
   return def;
 }
+
+/** Compatibility is checked without parsing/recompiling source or changing durable schemas. */
+export function assertWorkflowAuthoringCompatibility(authoring: WorkflowScriptAuthoring): void {
+  workflowAssert(authoring && typeof authoring === 'object' && !Array.isArray(authoring), 'Invalid workflow authoring metadata');
+  workflowAssert(authoring.formatVersion === WORKFLOW_SCRIPT_FORMAT_VERSION && authoring.languageVersion === WORKFLOW_SCRIPT_LANGUAGE_VERSION &&
+    authoring.compilerVersion === WORKFLOW_SCRIPT_COMPILER_VERSION && authoring.parserVersion === WORKFLOW_SCRIPT_PARSER_VERSION,
+  'Workflow authoring migration-required: unsupported format/language/compiler/parser version');
+}
+/** Provenance is bounded data, not source authentication, external dependency capture or reuse proof. */
+function validateWorkflowAuthoring(definition: WorkflowDefinition): void {
+  const authoring = definition.authoring!;
+  workflowJson(authoring, WORKFLOW_SCRIPT_LIMITS.metadataBytes);
+  assertWorkflowAuthoringCompatibility(authoring);
+  keysOnly(authoring, ['formatVersion', 'languageVersion', 'compilerVersion', 'parserVersion', 'sourceHash', 'graphHash', 'sourceName', 'sourceBytes', 'sourceLength', 'steps', 'phases']);
+  const hash = (v: unknown) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
+  workflowAssert(hash(authoring.sourceHash) && hash(authoring.graphHash), 'Invalid workflow authoring hash');
+  workflowAssert(typeof authoring.sourceName === 'string' && authoring.sourceName.length <= WORKFLOW_SCRIPT_LIMITS.sourceName && /^[A-Za-z0-9_.-]+$/.test(authoring.sourceName), 'Invalid workflow authoring source name');
+  workflowAssert(Number.isSafeInteger(authoring.sourceBytes) && authoring.sourceBytes > 0 && authoring.sourceBytes <= WORKFLOW_SCRIPT_LIMITS.sourceBytes &&
+    Number.isSafeInteger(authoring.sourceLength) && authoring.sourceLength > 0 && authoring.sourceLength <= WORKFLOW_SCRIPT_LIMITS.sourceLength &&
+    authoring.sourceLength <= authoring.sourceBytes && authoring.sourceBytes <= 3 * authoring.sourceLength, 'Invalid workflow authoring source bounds');
+  const span = (value: WorkflowScriptSpan): void => {
+    workflowAssert(value && typeof value === 'object' && !Array.isArray(value), 'Invalid workflow authoring span');
+    keysOnly(value, ['start', 'end', 'line', 'column']);
+    workflowAssert(Number.isSafeInteger(value.start) && Number.isSafeInteger(value.end) && value.start >= 0 && value.start < value.end && value.end <= authoring.sourceLength &&
+      Number.isSafeInteger(value.line) && value.line >= 1 && value.line <= value.start + 1 &&
+      Number.isSafeInteger(value.column) && value.column >= 0 && value.column <= value.start &&
+      (value.line !== 1 || value.column === value.start), 'Invalid workflow authoring span bounds');
+  };
+  const expectedPaths = definition.steps.flatMap(s => [[s.id], ...(s.kind === 'repeat' ? s.body!.map(b => [s.id, b.id]) : [])]);
+  const expected = new Set(expectedPaths.map(path => JSON.stringify(path)));
+  workflowAssert(expected.size <= WORKFLOW_SCRIPT_LIMITS.steps && Array.isArray(authoring.steps) && authoring.steps.length === expected.size, 'Workflow authoring step map coverage mismatch');
+  const address = (path: string[]): string => {
+    workflowAssert(Array.isArray(path) && (path.length === 1 || path.length === 2) && path.every(identifier), 'Invalid workflow authored path');
+    const key = JSON.stringify(path); workflowAssert(expected.has(key), 'Unknown workflow authored path'); return key;
+  };
+  const mapped = new Set<string>();
+  for (const entry of authoring.steps) {
+    workflowAssert(entry && typeof entry === 'object' && !Array.isArray(entry), 'Invalid workflow authoring step map'); keysOnly(entry, ['path', 'span']);
+    const key = address(entry.path); workflowAssert(!mapped.has(key), 'Duplicate workflow authored path'); mapped.add(key); span(entry.span);
+  }
+  workflowAssert(Array.isArray(authoring.phases) && authoring.phases.length <= WORKFLOW_SCRIPT_LIMITS.phases, 'Workflow authoring phase limit exceeded');
+  const phases = new Set<string>(), membership = new Set<string>();
+  for (const phase of authoring.phases) {
+    workflowAssert(phase && typeof phase === 'object' && !Array.isArray(phase), 'Invalid workflow authoring phase'); keysOnly(phase, ['id', 'paths', 'span']);
+    workflowAssert(identifier(phase.id) && !phases.has(phase.id), 'Invalid/duplicate workflow phase ID'); phases.add(phase.id); span(phase.span);
+    workflowAssert(Array.isArray(phase.paths) && phase.paths.length > 0 && phase.paths.length <= expected.size, 'Invalid workflow phase membership');
+    let scope: string | undefined;
+    for (const path of phase.paths) {
+      const key = address(path), localScope = JSON.stringify(path.slice(0, -1));
+      workflowAssert(!membership.has(key) && (scope === undefined || scope === localScope), 'Duplicate/cross-scope workflow phase membership');
+      membership.add(key); scope = localScope;
+    }
+  }
+  const { authoring: omitted, ...graph } = definition;
+  workflowAssert(workflowHash(graph) === authoring.graphHash, 'Workflow authoring graph hash mismatch');
+}
+
 
 function validateBoundaryBinding(binding: WorkflowBinding, def: WorkflowDefinition, schema: WorkflowSchema, boundary: WorkflowStep): WorkflowSchema | undefined {
   workflowAssert(!('ref' in binding) || ['iteration', 'step'].includes(binding.ref.source), 'Boundary permits only body outputs and iteration');
@@ -526,8 +591,22 @@ export function resolveWorkflowRef(ref: WorkflowRef, inputs: WorkflowJson, outpu
 export function workflowView(run: WorkflowRun): WorkflowView {
   const counts: WorkflowView['counts'] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unverified: 0 };
   const correlations: WorkflowView['correlations'] = [];
-  for (const { step, blockId, iterationId, iterationNo } of workflowStepEntries(run)) for (const unit of step.units) { counts[unit.status]++; correlations.push({ ...(blockId ? { blockId, iterationId, iterationNo } : {}), stepId: step.id, unitId: unit.id, status: unit.status, ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}) }); }
-  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), ...(run.recoveryOf ? { recoveryOf: run.recoveryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...((run.definition.version === 2 || run.definition.version === 3) ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
+  const entries = workflowStepEntries(run), authoring = run.definition.authoring;
+  // Projection copies bounded validated provenance; offsets never qualify runtime IDs.
+  const sourceProjection = (spec: WorkflowStep, blockId?: string): WorkflowSourceProjection => {
+    if (!authoring) return {};
+    const path = blockId ? [blockId, spec.id] : [spec.id], key = JSON.stringify(path);
+    const mapped = authoring.steps.find(entry => JSON.stringify(entry.path) === key);
+    workflowAssert(mapped, 'Missing workflow authored source projection');
+    const phase = authoring.phases.find(group => group.paths.some(member => JSON.stringify(member) === key));
+    return { authoredPath: [...path], source: { sourceName: authoring.sourceName, span: { ...mapped.span } }, ...(phase ? { phaseId: phase.id } : {}) };
+  };
+  for (const { spec, step, blockId, iterationId, iterationNo } of entries) for (const unit of step.units) {
+    counts[unit.status]++; correlations.push({ ...(blockId ? { blockId, iterationId, iterationNo } : {}), stepId: step.id, unitId: unit.id, status: unit.status,
+      ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}), ...sourceProjection(spec, blockId) });
+  }
+  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), ...(run.recoveryOf ? { recoveryOf: run.recoveryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations,
+    ...((run.definition.version === 2 || run.definition.version === 3 || authoring) ? { steps: entries.map(({ spec, step, blockId }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}), ...sourceProjection(spec, blockId) })) } : {}), ...(run.error ? { error: run.error } : {}) };
 }
 
 const stringSchema = (maxLength: number): WorkflowSchema => ({ type: 'string', maxLength });

@@ -180,9 +180,57 @@ async function select(f: Awaited<ReturnType<typeof fixture>>) {
   const a = await f.authorize(assessment.fingerprint); assert.equal(a.ok,true,a.error); assert.equal(f.publications, 1); assert.deepEqual(readdirSync(f.stagingParent).sort(),f.originalStageEntries);
   return a.view!.workflowRunId;
 }
-async function pendingApproval(f: Awaited<ReturnType<typeof fixture>>, kind: string) {
-  try { return await waitFor(() => f.service.approvals.inspect().find(a => a.kind === kind && a.status === 'pending'), kind + ' approval'); } catch (error) { throw Error(String(error) + JSON.stringify(f.service.list())); }
+async function pendingApproval(f: Awaited<ReturnType<typeof fixture>>, kind: string, timing = {
+  now: () => Date.now(), sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+}) {
+  const end = timing.now() + 10000;
+  try {
+    while (true) {
+      // Publication can delay the polling timer past the deadline. Accept a late
+      // observation only with proof that this pending gate was created in time.
+      const approval = f.service.approvals.inspect().find(a => {
+        const createdAt = typeof a.createdAt === 'string' ? Date.parse(a.createdAt) : NaN;
+        return a.kind === kind && a.status === 'pending' && Number.isFinite(createdAt)
+          && new Date(createdAt).toISOString() === a.createdAt && createdAt < end;
+      });
+      if (approval) return approval;
+      if (timing.now() >= end) throw Error(`deadline: ${kind} approval`);
+      await timing.sleep(10);
+    }
+  } catch (error) { throw Error(String(error) + JSON.stringify(f.service.list())); }
 }
+
+test('pendingApproval accepts an in-time gate observed on a delayed polling wake', async () => {
+  for (const wakeAt of [110000, 110001]) {
+    let clock = 100000, samples = 0, sleeps = 0;
+    const gate = { id: 'exact-pending-approval', kind: 'application', status: 'pending', createdAt: new Date(109999).toISOString() };
+    // Non-executing registry stub: only the two inspection methods are used.
+    const f = { service: { approvals: { inspect: () => { samples++; return sleeps ? [gate] : []; } }, list: () => [] } } as unknown as Awaited<ReturnType<typeof fixture>>;
+    const result = await pendingApproval(f, 'application', {
+      now: () => clock,
+      sleep: async ms => { assert.equal(ms, 10); sleeps++; clock = wakeAt; },
+    });
+    assert.strictEqual(result, gate);
+    assert.equal(samples, 2); assert.equal(sleeps, 1);
+  }
+});
+
+test('pendingApproval rejects late, absent, nonpending and invalid gates at the unchanged deadline', async () => {
+  const gate = { id: 'gate', kind: 'application', status: 'pending', createdAt: new Date(109999).toISOString() };
+  for (const observed of [
+    [], [{ ...gate, createdAt: new Date(110000).toISOString() }], [{ ...gate, createdAt: new Date(110001).toISOString() }],
+    [{ ...gate, status: 'granted' }], [{ ...gate, kind: 'implementation' }],
+    [{ ...gate, createdAt: 'invalid' }], [{ ...gate, createdAt: undefined }], [{ ...gate, createdAt: 109999 }], [{ ...gate, createdAt: '0' }],
+  ]) for (const wakeAt of [110000, 110001]) {
+    let clock = 100000, samples = 0, sleeps = 0;
+    const f = { service: { approvals: { inspect: () => { samples++; return sleeps ? observed : []; } }, list: () => [] } } as unknown as Awaited<ReturnType<typeof fixture>>;
+    await assert.rejects(pendingApproval(f, 'application', {
+      now: () => clock,
+      sleep: async ms => { assert.equal(ms, 10); sleeps++; clock = wakeAt; },
+    }), /^Error: Error: deadline: application approval\[\]$/);
+    assert.equal(samples, 2); assert.equal(sleeps, 1);
+  }
+});
 
 for (const repeat of [false, true]) test(`SIGKILL partial application -> selected ${repeat ? 'repeat frontier' : 'DAG'} -> fresh writer/check/review -> separate remaining apply`, { timeout: 30000 }, async t => {
   const f = await fixture(t, { repeat }); const childId = await select(f);

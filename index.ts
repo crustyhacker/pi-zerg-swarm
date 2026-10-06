@@ -11,6 +11,12 @@ import { createWorkflowService } from './workflow-runtime.js';
 import { profileHash as codingCheckProfileHash } from './workflow-checks.js';
 import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowStepEntries, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowServiceOptions, type WorkflowTrustedApprovalApi, type WorkflowTrustedRecoveryApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
 export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
+import { createWorkflowScriptControlOwner, executeWorkflowScriptAction, isWorkflowScriptActionName, parseWorkflowScriptAction, WORKFLOW_SCRIPT_COMMAND_BYTES, type WorkflowScriptControlOwner } from './workflow-script-controls.js';
+import type { WorkflowScriptAction } from './workflow-script-format.js';
+export type { WorkflowScriptAction, WorkflowScriptAuthoring, WorkflowScriptDiagnostic, WorkflowScriptInspection, WorkflowScriptSpan, WorkflowScriptStepSource, WorkflowScriptPhase } from './workflow-script-format.js';
+export { WORKFLOW_SCRIPT_FORMAT_VERSION, WORKFLOW_SCRIPT_LANGUAGE_VERSION, WORKFLOW_SCRIPT_COMPILER_VERSION, WORKFLOW_SCRIPT_PARSER_VERSION, WORKFLOW_SCRIPT_LIMITS } from './workflow-script-format.js';
+export { compileWorkflowScript, inspectWorkflowScriptDefinition } from './workflow-script.js';
+export { READ_ONLY_PARALLEL_SCRIPT, CONDITIONAL_REFINEMENT_SCRIPT, READ_ONLY_PARALLEL_DEFINITION, CONDITIONAL_REFINEMENT_DEFINITION } from './workflow-script-examples.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
@@ -32,6 +38,8 @@ type ZergIdFactory = {
 };
 
 export interface ZergCommandHandlerOptions {
+  /** Trusted base cwd for explicit local script import; never supplied in action JSON. */
+  cwd?: string;
   now?: () => Date;
   subagentAdapter?: ZergSubagentControlAdapter;
   idFactory?: ZergIdFactory;
@@ -53,7 +61,7 @@ export interface ZergCommandHandlerOptions {
   };
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; startupRecoveryBlock?: StartupRecoveryBlock };
+type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; workflowScriptOwner?: WorkflowScriptControlOwner; startupRecoveryBlock?: StartupRecoveryBlock };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -385,6 +393,7 @@ export function registerZergSwarmExtension(
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
   runtimeOptions.workflowService = workflowControlServices.get(control);
+  runtimeOptions.workflowScriptOwner = workflowScriptControlOwners.get(control);
 
   try {
     if (typeof context.on === 'function') {
@@ -896,7 +905,8 @@ export function createZergControl(
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(container) });
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(container, persistenceManager, options.now);
   let disposed = false;
-  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService, isOwnerDisposed: () => disposed } as RuntimeCommandOptions;
+  const workflowScriptOwner = createWorkflowScriptControlOwner();
+  const runtimeOptions = { ...options, persistenceManager, nativeTranscriptService, sessionMessageService, isOwnerDisposed: () => disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.() === true, workflowScriptOwner } as RuntimeCommandOptions;
   const adapter = options.subagentAdapter ?? createPiNativeAdapter({}, container, runtimeOptions);
   runtimeOptions.subagentAdapter = adapter;
   const owner = workflowNativeOwners.get(adapter);
@@ -941,7 +951,14 @@ export function createZergControl(
       if ((action.action === 'workflows.recovery.inspect' || action.action === 'workflows.recovery.prepare') && container.read().extensions.workflows === undefined) {
         return Promise.resolve({ ok: false, action: action.action, error: 'Workflow run not found; recovery inspection does not initialize a ledger.' });
       }
-      return getService().execute(action, signal);
+      const current = getService();
+      // Lazy construction publishes synchronously. A revocation in that callback
+      // must not let an authoring save define after its owner/caller is closed.
+      if (action.action === 'workflows.define' && (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.() || signal?.aborted)) {
+        if (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.()) current.dispose();
+        return Promise.resolve({ ok: false, action: action.action, error: 'Workflow definition owner/caller cancelled during initialization.' });
+      }
+      return current.execute(action, signal);
     }, list: () => getService().list(),
     get: (id) => getService().get(id), get approvals() { return getService().approvals; },
     get recovery() { return recoveryProxy; }, subscribe: (listener) => getService().subscribe(listener),
@@ -963,7 +980,7 @@ export function createZergControl(
       return workflowService.recovery;
     },
     async drain() {
-      const settled = await Promise.allSettled([workflowService.drain(), owner?.drain()]);
+      const settled = await Promise.allSettled([workflowScriptOwner.drain(), workflowService.drain(), owner?.drain()]);
       const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
       if (failure) throw failure.reason;
     },
@@ -971,7 +988,7 @@ export function createZergControl(
       if (disposed) return;
       disposed = true;
       let firstError: unknown;
-      for (const cleanup of [() => workflowService.dispose(),
+      for (const cleanup of [() => workflowScriptOwner.dispose(), () => workflowService.dispose(),
         () => { if (!options.sessionMessageService) shutdownSessionMessages(sessionMessageService); },
         () => { if (!options.nativeTranscriptService) shutdownNativeTranscript(nativeTranscriptService); },
         () => { if (!options.subagentAdapter) adapter.dispose?.(); }]) {
@@ -981,6 +998,7 @@ export function createZergControl(
     },
   };
   workflowControlServices.set(control, workflowService);
+  workflowScriptControlOwners.set(control, workflowScriptOwner);
   return control;
 }
 
@@ -1047,6 +1065,25 @@ async function executeZergControlAction(
   signal?: AbortSignal,
 ): Promise<ZergControlResult> {
   try {
+    if (isWorkflowScriptActionName(action.action)) {
+      if (options.isOwnerDisposed?.()) throw new Error('Workflow authoring owner disposed.');
+      const execute = options.workflowScriptOwner?.execute ?? executeWorkflowScriptAction;
+      const reply = await execute(action, {
+        readLedger: () => container.read().extensions[WORKFLOW_EXTENSION_KEY],
+        cwd: options.cwd ?? process.cwd(),
+        define: (definition, saveSignal) => {
+          if (options.isOwnerDisposed?.() || saveSignal?.aborted) throw new Error('Workflow authoring owner/caller cancelled before save.');
+          const state = container.read();
+          if (state.mode.readOnly || state.lifecycle === 'disposed') throw new Error('Workflow script save blocked by read-only/disposed authority.');
+          if (!options.workflowService) throw new Error('Workflow service unavailable.');
+          return options.workflowService.execute({ action: 'workflows.define', definition }, saveSignal);
+        },
+      }, signal);
+      if (options.isOwnerDisposed?.() || signal?.aborted) throw new Error('Workflow authoring owner/caller cancelled.');
+      const output = JSON.stringify(reply.data ?? { error: reply.error });
+      return reply.ok ? { ...controlOk(action.action, undefined, output, container.read().revision), data: reply.data }
+        : { ...controlError(action.action, 'invalid_request', reply.error ?? 'Workflow script action refused.', container.read().revision), data: reply.data };
+    }
     if (WORKFLOW_ACTION_NAMES.has(action.action)) {
       if (!options.workflowService) return controlError(action.action, 'invalid_request', 'Workflow service unavailable.', container.read().revision);
       const reply = await options.workflowService.execute(action as WorkflowAction, signal);
@@ -1329,7 +1366,10 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
       properties: {
         action: { type: 'string' },
         definition: { type: 'object', description: 'Bounded declarative workflow definition for workflows.define; no code or arbitrary tools.' },
-        definitionId: { type: 'string', description: 'Workflow definition identity for workflows.show/start.' },
+        definitionId: { type: 'string', description: 'Workflow definition identity for workflows.show/start or non-executing scripts.inspect.' },
+        source: { type: 'string', maxLength: 65536, description: 'Bounded restricted workflow source for scripts.validate/compile/save; never executable JavaScript or approval.' },
+        sourceName: { type: 'string', maxLength: 128, description: 'Optional display-only source label.' },
+        path: { type: 'string', maxLength: 1024, description: 'Explicit normalized relative-cwd local regular file for scripts.import; no scans, traversal or symlinks.' },
         workflowRunId: { type: 'string', maxLength: 160, description: 'Exact workflow attempt identity for show/pause/resume/cancel/retry/report/forget/recovery inspect/prepare; no fallback.' },
         selections: { type: 'object', additionalProperties: false, description: 'Optional read-only recovery projection selections for workflows.recovery.prepare only; prepare is not authorization and cannot execute recovered work.', properties: { reuseUnitIds: { type: 'array', maxItems: 256, items: { type: 'string', minLength: 1, maxLength: 160 } }, rerunUnitIds: { type: 'array', maxItems: 256, items: { type: 'string', minLength: 1, maxLength: 160 } } } },
         inputs: { description: 'Schema-validated bounded JSON data for workflows.start; never permissions.' },
@@ -1376,6 +1416,11 @@ function parseZergControlToolParams(params: unknown): { ok: true; action: ZergCo
   const actionName = (params as { action: string }).action;
   if (!isZergControlActionName(actionName)) {
     return { ok: false, message: `Unknown zerg_control action: ${actionName}` };
+  }
+
+  if (isWorkflowScriptActionName(actionName)) {
+    try { return { ok: true, action: parseWorkflowScriptAction(params) }; }
+    catch (error) { return { ok: false, message: workflowFailure(error) }; }
   }
 
   if (actionName === 'workflows.recovery.inspect' || actionName === 'workflows.recovery.prepare') {
@@ -1437,7 +1482,7 @@ function parseRecoverySelections(raw: unknown): { ok: true; selections?: { reuse
 }
 
 function isZergControlActionName(value: string): value is ZergControlAction['action'] {
-  return WORKFLOW_ACTION_NAMES.has(value) || value === 'status'
+  return isWorkflowScriptActionName(value) || WORKFLOW_ACTION_NAMES.has(value) || value === 'status'
     || value === 'agents.list'
     || value === 'agents.show'
     || value === 'agents.create'
@@ -6160,7 +6205,15 @@ export function createPiZergCommandHandler(
       const container = getWritableStateContainer(stateOrReader);
       const service = runtimeOptions.workflowService;
       try {
-        if (!container || !service) throw new Error('Workflow service unavailable; use an owner-registered Pi command/control.');
+        if (!container) throw new Error('Workflow state unavailable; use an owner-registered Pi command/control.');
+        if (/^workflows\s+scripts(?:\s|$)/i.test(routed)) {
+          const parsed = parseWorkflowCommand(routed);
+          if (!parsed) throw new Error('Usage: /zerg workflows scripts validate|compile|inspect|save|import <JSON>');
+          const reply = await executeZergControlAction(container, parsed, { ...runtimeOptions, cwd: context.cwd ?? runtimeOptions.cwd });
+          context.ui?.notify?.(reply.output ?? reply.error?.message ?? 'Workflow script outcome unavailable.', reply.ok ? 'info' : 'error');
+          return;
+        }
+        if (!service) throw new Error('Workflow service unavailable; use an owner-registered Pi command/control.');
         const approve = /^workflows\s+approve\s+(\S+)\s+(\S+)\s*$/i.exec(routed);
         if (approve) {
           const message = await approveWorkflowInteractively(service.approvals, approve[1]!, approve[2]!, context);
@@ -6762,6 +6815,7 @@ interface WorkflowAdmission {
 }
 const workflowNativeOwners = new WeakMap<ZergSubagentControlAdapter, OwnedWorkflowNative>();
 const workflowControlServices = new WeakMap<ZergControl, WorkflowService>();
+const workflowScriptControlOwners = new WeakMap<ZergControl, WorkflowScriptControlOwner>();
 const workflowAdmissions = new WeakMap<ZergSubagentLaunchRequest, WorkflowAdmission>();
 const workflowActiveAdmissions = new WeakMap<PiNativeActiveRun, WorkflowAdmission>();
 const workflowFrozenMessageKeys = new WeakMap<SessionMessageService, Set<string>>();
@@ -6953,8 +7007,18 @@ async function approveWorkflowInteractively(approvals: WorkflowTrustedApprovalAp
   return `approved ${approvalId} for workflow ${workflowRunId} (${before.requestHash})`;
 }
 
-function parseWorkflowCommand(input: string): WorkflowAction | undefined {
+function parseWorkflowCommand(input: string): WorkflowAction | WorkflowScriptAction | undefined {
   const trimmed = input.trim();
+  if (/^workflows\s+scripts(?:\s|$)/i.test(trimmed)) {
+    const script = /^workflows\s+scripts\s+(validate|compile|inspect|save|import)\s+([\s\S]+)$/i.exec(trimmed);
+    if (!script) throw new Error('Usage: /zerg workflows scripts validate|compile|inspect|save|import <JSON>');
+    if (Buffer.byteLength(script[2]!, 'utf8') > WORKFLOW_SCRIPT_COMMAND_BYTES) throw new Error('Workflow script command JSON exceeds bound.');
+    let body: unknown;
+    try { body = JSON.parse(script[2]!); }
+    catch { throw new Error('Script command requires valid bounded JSON fields.'); }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.hasOwn(body, 'action')) throw new Error('Script command requires JSON fields without action.');
+    return parseWorkflowScriptAction({ ...body, action: `workflows.scripts.${script[1]!.toLowerCase()}` });
+  }
   const recovery = /^workflows\s+recovery\s+(inspect|prepare)\s+(\S+)\s*$/i.exec(trimmed);
   if (recovery) {
     const workflowRunId = recovery[2]!;

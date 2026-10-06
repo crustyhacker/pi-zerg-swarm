@@ -5,6 +5,18 @@ import type { WorkflowAction, WorkflowJson, WorkflowNativeIdentity, WorkflowRun,
 import { sanitizeUiText, styleText, uiErrorText, visibleSlice, type UiThemeLike } from './components.js';
 import { matchesKey } from './state.js';
 
+/** Display-only provenance, never used to select or authorize an execution ID. */
+function authoredLabel(run: WorkflowRun, entry?: ReturnType<typeof workflowStepEntries>[number]): string {
+  const authoring = run.definition.authoring;
+  if (!authoring || !entry) return '';
+  const path = entry.blockId ? [entry.blockId, entry.spec.id] : [entry.spec.id];
+  const matches = authoring.steps.slice(0, 16).filter(row => row.path.length === path.length && row.path.every((id, index) => id === path[index]));
+  if (matches.length !== 1) return '';
+  const phases = authoring.phases.slice(0, 16).filter(phase => phase.paths.slice(0, 16).some(row => row.length === path.length && row.every((id, index) => id === path[index])));
+  const span = matches[0]!.span;
+  return ` · authored ${clipped(path.join('/'), 161)}${phases.length === 1 ? ` · group ${clipped(phases[0]!.id, 80)}` : ''} · source ${clipped(authoring.sourceName, 128)}:${span.line}:${span.column}`;
+}
+
 export interface ZergWorkflowOverlayOptions {
   service: Pick<WorkflowService, 'list' | 'get' | 'subscribe' | 'execute' | 'approvals'>;
   /** Separate host capability, never obtained through model-facing execute actions. */
@@ -306,7 +318,7 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
       const values = [`unit ${unit.id} · ${unit.status}${!unit.cleanupSettled ? ' · cleanup-pending' : ''}${codingSummary(unit)}`,
         unit.reusedFrom ? `reused from workflow ${unit.reusedFrom.workflowRunId} / unit ${unit.reusedFrom.unitId} / native ${unit.reusedFrom.native.runId}` : 'Original attempt result; no inferred replies.',
         `native run ${nativeOf(unit)?.runId ?? 'unlinked'} · task ${nativeOf(unit)?.taskId ?? 'unlinked'}`, `error: ${unit.error ?? '(none)'}`,
-        ...codingDetailLines(unit, this.options.service), resultPreview(unit.result), 'Local structured result preview only; no transcript copy.'];
+        ...codingDetailLines(unit, this.options.service), ...(selectedEntry ? [authoredLabel(run!, selectedEntry)] : []), resultPreview(unit.result), 'Local structured result preview only; no transcript copy.'];
       const lines: string[] = [];
       for (const value of values) {
         const wrapped = new Text(sanitizeUiText(value), 0, 0).render(w);
@@ -331,10 +343,10 @@ export class ZergWorkflowComponent implements StructuralPiCustomComponent, Focus
         if (this.state.level === 'steps' || this.state.level === 'body') {
           const entry = entries.find(({ step }) => step.id === id)!;
           const row = entry.step;
-          return `${mark} phase ${id} · ${row.status} · ${row.units.length} units${entry.spec.kind === 'repeat' ? ` · iteration ${row.iterations?.length ?? 0}/${entry.spec.maxIterations}` : ''} · ${row.skipReason ?? ''} ${row.error ?? ''}${entry.spec.kind === 'repeat' ? ` · ${repeatOutcome(row, run!.recovered)}` : ''}`;
+          return `${mark} phase ${id} · ${row.status} · ${row.units.length} units${entry.spec.kind === 'repeat' ? ` · iteration ${row.iterations?.length ?? 0}/${entry.spec.maxIterations}` : ''} · ${row.skipReason ?? ''} ${row.error ?? ''}${entry.spec.kind === 'repeat' ? ` · ${repeatOutcome(row, run!.recovered)}` : ''}${authoredLabel(run!, entry)}`;
         }
         const row = selectedStep!.units.find((entry) => entry.id === id)!;
-        return `${mark} unit ${id} · ${row.status}${row.cleanupSettled ? '' : ' · cleanup-pending'}${row.reusedFrom ? ` · reused from ${row.reusedFrom.workflowRunId}/${row.reusedFrom.unitId} native:${row.reusedFrom.native.runId}` : ''}${codingSummary(row)} · ${row.error ?? ''}`;
+        return `${mark} unit ${id} · ${row.status}${row.cleanupSettled ? '' : ' · cleanup-pending'}${row.reusedFrom ? ` · reused from ${row.reusedFrom.workflowRunId}/${row.reusedFrom.unitId} native:${row.reusedFrom.native.runId}` : ''}${codingSummary(row)} · ${row.error ?? ''}${authoredLabel(run!, selectedEntry)}`;
       });
       shown = index >= 0 && slice.rows.includes(selected!);
       if (!body.length) body = ['No retained selection. Missing IDs never select another run/unit.'];

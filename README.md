@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.17 release status**
-> Adds opt-in, explicitly authorized staged coding workflows with independent review and separate implementation/application approvals. Existing read-only workflows stay read-only.
-> Restart restores inspectable history, not execution or authority. Checks execute trusted project code with host permissions; there is no filesystem/network sandbox or automatic Git operation.
+> **v1.1.19 release status**
+> Adds restricted workflow-script authoring compiled as data into the existing validated workflow engine. Validate/compile/inspect never start agents; save/import and explicit start remain separate.
+> Existing read-only defaults, coding approvals and conservative durable recovery remain intact. Submitted scripts are never executed as JavaScript; this is not an OS sandbox or full JavaScript automation.
 
 ## Release status
 
-- Current release: **v1.1.18** (explicit durable workflow recovery and fresh approval gates).
+- Current release: **v1.1.19** (restricted scripted workflow authoring, Stage 8D).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - The release path requires general, milestone, security, performance, hardening, and cleanup audits.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -84,6 +84,9 @@ Use structured `zerg_control` or `control.execute(...)` for automation:
 | `workflows.retry` | `workflowRunId`; explicit new attempt in the same family, not in-place replay |
 | `workflows.report` | `workflowRunId`; explicitly retrieves the final report, when available |
 | `workflows.forget` | `workflowRunId`; explicitly removes a terminal, cleanup-settled workflow record, not its native history |
+| `workflows.scripts.validate` / `compile` / `save` | `{ source, sourceName? }`; explicit script validation/compilation/save (Stage 8D, below) |
+| `workflows.scripts.inspect` | `{ definitionId }`; frozen saved definition plus provenance-aware inspection, no parse or service start |
+| `workflows.scripts.import` | `{ path }`; explicit bounded local-file read, then compile + define |
 
 Slash equivalents use `/zerg workflows list`, `define <JSON>`, `start <JSON>`, `show {"workflowRunId":"..."}` (or `definitionId`), and `pause|resume|cancel|retry|report|forget <workflow-run-id>`. `/zerg workflows monitor [workflow-run-id]` adds the interactive view; aliases remain supported and noninteractive inspection does not require a TUI.
 
@@ -215,7 +218,36 @@ const pending = control.workflowApprovals.inspect().filter(r => r.status === 'pe
 // Application has its own later request: never auto-grant it from model output.
 ```
 
-For packaged consumers, the package allowlist includes the public workflow TypeScript modules, `workflow-check-supervisor.py`, and `workflow-coding-example.ts`; private agent artifacts remain excluded.
+For packaged consumers, the package allowlist includes the public workflow TypeScript modules, `workflow-check-supervisor.py`, `workflow-coding-example.ts`, and `workflow-script-examples.ts`; private agent artifacts remain excluded.
+
+### Compiled workflow scripts (Stage 8D)
+
+Stage 8D adds an optional compiled authoring surface: a small declarative script
+(`workflow({id,label,inputSchema}, () => { ... })` with `native`, `aggregate`,
+`coding`, `repeat`, and `phase` builders) that compiles to the existing
+validated version-2/version-3 graph. The script is parsed as pure data by an
+owned, bounded TypeScript-5.9.3 parser subprocess — it never runs user code,
+shell commands, checks, or agents, and compilation has no network, provider,
+workspace, check, or shell effects. There are no ordinary JavaScript/async
+runtime semantics; the AST whitelist is exact (literals, the recognized builder
+calls, and `value`/`ref` bindings only).
+
+Compilation is always explicit — `workflows.scripts.validate|compile|inspect|save|import`
+(or `compileWorkflowScript`), slash parity `/zerg workflows scripts ...` — and
+starting remains the ordinary `workflows.start` with its trusted gates. There
+is no start flag, autostart, scan, watch, automatic recompilation, or restart
+authority; unseen external edits never alter frozen imports, and only an
+explicit save/import replaces a settled named definition (invalidating plans
+via the namespace/hash change). Compiled definitions may record bounded
+provenance (`definition.authoring`: source/graph hashes, spans, versions);
+the existing full `definitionHash` binds authoring and source edits.
+
+Full grammar, accepted/rejected forms, repeat feedback semantics, coding
+operation support, and provenance/invalidation rules are documented in
+[`workflow-script-language.md`](workflow-script-language.md). Runnable example
+scripts are exported from `workflow-script-examples.ts`
+(`READ_ONLY_PARALLEL_SCRIPT`, `CONDITIONAL_REFINEMENT_SCRIPT` and equivalent
+definition exports); importing it compiles and starts nothing.
 
 ### Explicit workflow recovery (Stage 8C)
 
@@ -612,6 +644,16 @@ Workflow model, scheduler, fake-native control, and UI regressions run in `npm t
 ZERG_WORKFLOW_ACCEPTANCE=parent-approved node --import tsx --test test/workflow-integration.test.ts
 ```
 
+Restricted-script acceptance has a separate explicit opt-in for the actual SDK, regular/fullscreen host and offline packed-layout journeys:
+
+```sh
+ZERG_WORKFLOW_SCRIPT_ACCEPTANCE=parent-approved node --import tsx --test test/workflow-script-integration.test.ts
+# After reviewing all applicable harnesses, run both opt-in groups:
+ZERG_WORKFLOW_ACCEPTANCE=parent-approved ZERG_WORKFLOW_SCRIPT_ACCEPTANCE=parent-approved npm test
+```
+
+The script host fixtures drive the registered authoring command handler in an actual Pi context and use real terminal input for progress/navigation; they do not certify manually typed authoring JSON or pixel-level visual acceptance. The packed-layout smoke extracts the package and copies already-installed declared runtime/host dependencies into an owned layout with checkout fallback blocked; it does not install packages or certify package-manager installation.
+
 These Linux/Python/installed-Pi fixtures use empty owned environments, scripted localhost responses, bounded requests/output/time, and owned-process cleanup checks. They exercise real SDK tools and regular/fullscreen terminal input/resize/recovery. They are automated integration evidence—not an OS sandbox, manual visual acceptance, external-model quality evaluation, or universal third-party compatibility certification.
 
 ## Roadmap
@@ -664,8 +706,8 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.15: patch release adding bounded declarative read-only workflows and exact progress/inspection controls
 - v1.1.16: patch release adding bounded read-only conditions and repeat workflows
 - v1.1.17: patch release adding trusted staged coding with separate approval gates
-- v1.1.18: patch release adding explicit durable workflow recovery and fresh linked execution (Stage 8C; current release)
-- Stage 8D: optional scripted bounded workflows (future proposal only; separate authority required)
+- v1.1.18: patch release adding explicit durable workflow recovery and fresh linked execution (Stage 8C)
+- v1.1.19: patch release adding restricted scripted workflow authoring through the existing engine (Stage 8D; current release)
 
 ## License
 

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { ZergAgentDefinition, ZergStateContainer } from './types.js';
-import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, aggregateWorkflow, createReadOnlyReviewDefinition,
+import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, assertWorkflowAuthoringCompatibility, aggregateWorkflow, createReadOnlyReviewDefinition,
   freezeWorkflowData, normalizeWorkflowAgent, resolveWorkflowRef, validateReviewInputs, validateWorkflowDefinition, validateWorkflowValue,
   workflowRecoveryAddresses, workflowUnavailableEnvelope, evaluateWorkflowCondition, workflowStepEntries, workflowStepContext, qualifyWorkflowStep, workflowAssert, workflowHash, workflowJson, workflowRecoveryDependencyHash, workflowRecoverySourceContract, workflowUnitHash, workflowUnitEnvelope, workflowView } from './workflow-model.js';
 import { approvalRequestHash, codingBaselineHash, codingGatesPassed, codingPolicyHash, createCodingApprovalRequest, resolveCodingBounds, validateCodingPolicy } from './workflow-coding.js';
@@ -18,6 +18,8 @@ import type { RecoveryCheckpointV1, RecoveryOperationKind, RecoveryResultStatus 
 import type { WorkflowAction, WorkflowDefinition, WorkflowJson, WorkflowNativeIdentity, WorkflowNativeOutcome,
   WorkflowNativePort, WorkflowRecoveryWriterOwnerEvidence, WorkflowReply, WorkflowRun, WorkflowService, WorkflowServiceOptions, WorkflowState,
   WorkflowBinding, WorkflowIterationRun, WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus, WorkflowTrustedApprovalApi, WorkflowTrustedRecoveryAuthorizeRequest } from './workflow-model.js';
+import { WORKFLOW_SCRIPT_FORMAT_VERSION, WORKFLOW_SCRIPT_LANGUAGE_VERSION, WORKFLOW_SCRIPT_COMPILER_VERSION,
+  WORKFLOW_SCRIPT_PARSER_VERSION } from './workflow-script-format.js';
 
 const settled = (status: WorkflowUnitStatus) => !['queued', 'running'].includes(status);
 const terminal = (run: WorkflowRun) => ['completed', 'failed', 'cancelled', 'needs-attention'].includes(run.status);
@@ -629,6 +631,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     workflowAssert(!cleanupUncertain || (selectedPlan && ![...active.values()].some(a => a.unit.status === 'unverified' || a.run.status === 'needs-attention') && state.runs.every(r => r.cleanupSettled || r === run || selectedPlan.settledSources.has(r.workflowRunId))), 'Workflow admission closed: uncertain cleanup outside verified selected scope');
     const current = container.read(); workflowAssert(current.lifecycle !== 'disposed' && current.lifecycle !== 'resetting', 'Canonical lifecycle blocks workflow admission'); workflowAssert(!current.mode.readOnly, 'Read-only caller state blocks workflow admission');
     if (run) {
+      if (run.definition.authoring) assertWorkflowAuthoringCompatibility(run.definition.authoring);
       workflowAssert(state.runs.includes(run), 'Workflow run ownership changed');
       workflowAssert(workflowHash(state.definitions.find(d => d.id === run.definition.id)) === run.definitionHash, 'Workflow definition changed after host callback');
       for (const [id, agent] of Object.entries(run.agents)) workflowAssert(current.agentDefinitions[id] && workflowHash(normalizeWorkflowAgent(current.agentDefinitions[id])) === workflowHash(agent), 'Frozen agent definition/policy changed after host callback');
@@ -1357,6 +1360,10 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     }
     const definition = state.definitions.find(d => d.id === run.definition.id) ?? null;
     if (!definition || workflowHash(definition) !== run.definitionHash) mismatches.push('definition-drift');
+    if (run.definition.authoring) {
+      try { assertWorkflowAuthoringCompatibility(run.definition.authoring); }
+      catch { mismatches.push('authoring-migration-required'); }
+    }
     const declaredPolicy = { definitionHash: run.definitionHash, frozenAgentsHash: workflowHash(run.agents), trustedRecoveryConfig: trustedRecoveryConfig ?? null };
     const profiles: Record<string, string | null> = {};
     for (const { spec } of workflowStepEntries(run)) if (spec.coding?.operation === 'check' && spec.coding.checkProfileId) {
@@ -1375,7 +1382,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       }
       catch { profiles[id] = null; mismatches.push(`missing-or-invalid-check-profile:${id}`); }
     }
-    const currentConfig = { concurrency: run.concurrency, recoveryEnabled, sourceContract: recoverySourceContract, coding: codingCfg ?? null, profiles, unsupportedSourceConfig: options.recovery?.sourceConfig !== undefined || options.recovery?.identityVersionHash !== undefined };
+    const currentConfig = { concurrency: run.concurrency, recoveryEnabled, sourceContract: recoverySourceContract, ...(run.definition.authoring ? { authoringCompatibility: { formatVersion: WORKFLOW_SCRIPT_FORMAT_VERSION, languageVersion: WORKFLOW_SCRIPT_LANGUAGE_VERSION, compilerVersion: WORKFLOW_SCRIPT_COMPILER_VERSION, parserVersion: WORKFLOW_SCRIPT_PARSER_VERSION } } : {}), coding: codingCfg ?? null, profiles, unsupportedSourceConfig: options.recovery?.sourceConfig !== undefined || options.recovery?.identityVersionHash !== undefined };
     return { declaredPolicyHash: workflowHash(declaredPolicy), currentAgentsHash: workflowHash(agents), currentConfigHash: workflowHash(currentConfig), namespaceHash: workflowHash(current.extensions[WORKFLOW_EXTENSION_KEY] ?? null), mode: { automation: current.mode.automation ?? null, controller: current.mode.controller ?? null, readOnly: current.mode.readOnly ?? null, contextId: current.mode.contextId ?? null, interventionEnabled: current.mode.interventionEnabled ?? null }, lifecycle: current.lifecycle ?? null, requiredAgentIds, mismatches };
   };
 
@@ -2035,6 +2042,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   };
 
   const makeRun = (definition: WorkflowDefinition, inputs: WorkflowJson, concurrency: number, previous?: WorkflowRun): WorkflowRun => {
+    if (definition.authoring) assertWorkflowAuthoringCompatibility(definition.authoring);
     workflowAssert(state.runs.length < 16, 'Workflow run retention full; explicitly forget a terminal run');
     workflowAssert(Number.isSafeInteger(concurrency) && concurrency >= 1 && concurrency <= 32, 'Concurrency must be integer 1..32');
     const frozenInputs = freezeWorkflowData(inputs, WORKFLOW_LIMITS.inputBytes); validateWorkflowValue(frozenInputs, definition.inputSchema);

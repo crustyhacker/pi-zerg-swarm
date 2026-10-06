@@ -2,7 +2,7 @@ import type { WorkflowAction } from './workflow-model.js';
 export type { WorkflowAction, WorkflowDefinition, WorkflowRun, WorkflowView, WorkflowReply, WorkflowNativeLineage } from './workflow-model.js';
 
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.18' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.19' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -348,6 +348,7 @@ export interface ZergSubagentControlAdapter {
 }
 
 export type ZergControlAction =
+  | import('./workflow-script-format.js').WorkflowScriptAction
   | WorkflowAction
   | { action: 'status' }
   | { action: 'agents.list' }

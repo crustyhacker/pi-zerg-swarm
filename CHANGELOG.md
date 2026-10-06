@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.19] - 2026-10-06
+
+### Added
+
+- Restricted, versioned JavaScript-subset workflow authoring with immutable data/step handles, explicit references and dependencies, display-only phases, typed conditions, bounded repeat feedback, existing aggregation and supported coding requests. Accepted source lowers to the existing validated declarative engine; submitted JavaScript is never executed.
+- Separate bounded `workflows.scripts.validate`, `compile`, `inspect`, `save` and explicit local-file `import` controls with slash-command/alias parity. Validation and inspection remain inert, while save/import never imply start or grant approval.
+- Deterministic source/compiler/graph hashes and bounded authored-address/source-location provenance in frozen definitions, existing progress views and snapshots. Unsupported compiler formats require migration; restart does not recompile source or restore authority.
+- Two public read-only examples with equivalent declarative graphs, a precise language guide, focused adversarial regressions and opt-in isolated SDK, regular/fullscreen Pi-host and offline packed-layout acceptance fixtures.
+
+### Changed
+
+- Parsing uses pinned TypeScript 5.9.3 as a declared runtime dependency in an owned, deadline-limited compiler child. Source, token, nesting, AST, literal, expansion, output and diagnostic budgets are explicit; cancellation/disposal drains owned parser work. These bounds are not an OS sandbox or full JavaScript/Claude feature parity.
+- Authored worst-case family admission checks include native and coding operations without increasing engine limits or adding another scheduler, runner, approval registry or recovery system. Existing Stage 8C uncertainty and historical-result-reuse restrictions remain unchanged.
+
+### Fixed
+
+- Recovery-test approval polling now recognizes an in-time pending gate observed after a delayed timer wake, while rejecting gates created at or after the original deadline; runtime approvals and the ten-second test deadline are unchanged.
+- Authoring save rechecks owner/caller cancellation after reentrant lazy workflow initialization, preventing a definition from being saved after its owner is disposed.
+
 ## [1.1.18] - 2026-10-06
 
 ### Added
