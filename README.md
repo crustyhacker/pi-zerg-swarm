@@ -9,9 +9,9 @@
 
 ## Release status
 
-- Current release: **v1.1.17** (authorized staged coding workflows and approval gates).
+- Current release: **v1.1.18** (explicit durable workflow recovery and fresh approval gates).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
-- Mandatory RC audits for the release path: `prompts/audit/generalized-deep-audit_v2-0-0.md`, `prompts/audit/milestone-audit_v2-0-0.md`, `prompts/audit/security-audit_v2-0-0.md`, `prompts/audit/performance-audit_v2-0-0.md`, `prompts/audit/hardening-sweep_v2-0-0.md`, and `prompts/audit/themed-cleanup_v2-0-0.md`.
+- The release path requires general, milestone, security, performance, hardening, and cleanup audits.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
 
 ## Pi compatibility
@@ -183,7 +183,7 @@ Supported file handling is intentionally narrow. Explicit UTF-8 text inputs and 
 
 Dependency preparation is explicit: only manifested read-only text inputs are copied into the owned stage, with no automatic repository/dependency-tree copy or shared writable dependency link. Checks require Linux, an existing `/usr/bin/python3` with subreaper and pidfd support, and the bundled `workflow-check-supervisor.py`; unsupported or unverified cleanup fails closed. Exact executable/argv, working directory, minimal environment, time/output bounds, and actual candidate identity are recorded. Checks execute trusted project code with host permissions, **not** a filesystem or network sandbox. Command allowlisting and descendant supervision do not confine arbitrary project code. No downloads or external services are enabled automatically.
 
-Cancellation stops subsequent admissions and writes where possible; it cannot undo a completed write. Apply is per file, not atomic across all files, and there is no automatic rollback or Git operation. Partial/uncertain outcomes retain evidence for inspection; settled ownership release does not delete retained candidates. Cleanup is restricted to provably owned artifacts, and uncertain application cannot be erased through generic forget. Restart is inspect-only: no live grants, native reconnection, automatic checks/application/rollback, or mutating retry. Stage 8C must design explicit reconciliation and fresh authority before any durable execution resumption; retained paths alone prove neither ownership nor integrity.
+Cancellation stops subsequent admissions and writes where possible; it cannot undo a completed write. Apply is per file, not atomic across all files, and there is no automatic rollback or Git operation. Partial/uncertain outcomes retain evidence for inspection; settled ownership release does not delete retained candidates. Cleanup is restricted to provably owned artifacts, and uncertain application cannot be erased through generic forget. Restart is inspect-only: no live grants, native reconnection, automatic checks/application/rollback, or mutating retry. The Stage 8C implementation below adds explicit reconciliation and fresh authority, not automatic restart execution; retained paths alone prove neither ownership nor integrity.
 
 A compile-tested disposable-project builder is exported directly from `workflow-coding-example.ts` (not from the package index):
 
@@ -216,6 +216,85 @@ const pending = control.workflowApprovals.inspect().filter(r => r.status === 'pe
 ```
 
 For packaged consumers, the package allowlist includes the public workflow TypeScript modules, `workflow-check-supervisor.py`, and `workflow-coding-example.ts`; private agent artifacts remain excluded.
+
+### Explicit workflow recovery (Stage 8C)
+
+Version 1.1.18 adds opt-in explicit recovery under the conservative execution contract below. Applied-source tests, isolated SDK/host acceptance, and independent release review pass. Workflow recovery is distinct from `session.continuation.*`, which copies selected native history into a new task.
+
+#### Inspect first; nothing replays
+
+Recovery is opt-in through trusted host options `recovery: { enabled: true }` together with enabled persistence. Startup, `workflows.recovery.inspect`, and `workflows.recovery.prepare` are inert: no native/model calls, checks, stage creation/adoption, application, writer acquisition, or cleanup. Missing/corrupt evidence is retained, not repaired. A restored run is inspectable history, not a live SDK session; persisted selections never restore execution plans or approvals.
+
+```text
+/zerg workflows recovery inspect <workflow-run-id>
+/zerg workflows recovery prepare <workflow-run-id>
+```
+
+Aliases `/zerg-swarm` and `/swarm` keep the same grammar. Structured actions use `workflowRunId`; `workflows.recovery.prepare` additionally accepts `selections: { reuseUnitIds, rerunUnitIds }`. Both return `data.assessment`; a successful read does not mean its plan is executable. Examine `blocked`, `plan.status`, and `fingerprint` (passed to authorization as `assessmentFingerprint`).
+
+Keep **original recorded history** separate from **current observations**. `recoveryOriginal` preserves first recovered statuses; operation intents/results, original iterations, feedback, errors, and native identities remain history. Later verified owner/check/native settlement and destination byte observations do not rewrite recorded cleanup uncertainty or manufacture an old completion. Missing or uncertain receipts are not proof that an effect did or did not happen. Destination preimage/postimage equality is a current observation, not actor attribution.
+
+#### Settlement is a trusted-host proof, not a model flag
+
+Default interrupted native settlement is **unknown**. Checks require exact verified supervisor/receipt settlement; absent PIDs, supervisors, or elapsed time alone never establish that descendants or transport work stopped. Unknown relevant owner/check/native settlement blocks conflicting execution.
+
+The optional synchronous trusted-host callback is `recovery.inspectNativeSettlement(request): 'settled' | 'unknown'`. Its exact request contains `workflowRunId`, `familyId`, `unitId`, `operationId`, `native` (the exact identity or `null`), `inputHash`, `dependencyHash`, and `policyHash`. Return `settled` only for caller-owned lifecycle evidence positively binding **all** those fields and proving the relevant owned work/transport/descendants closed. Missing, mismatched, unsupported, or unreadable evidence must return `unknown`. This callback is an observation, not implementation/application authority, result reuse, an environment snapshot, or a model-supplied boolean. A `settled` return must attest irreversible closure of the exact owned work, not temporary idleness or a revocable permission. The runtime rejects observed unknown/drift and checks physical owner/check/artifact fences, but repeated enum reads cannot certify hidden revocation by an adversarial final host callback. Such a host must supply immutable verified lifecycle-proof semantics or leave settlement unknown.
+
+There is no positive generic native closure contract supplied by the default SDK host. A narrowly sealed, independently supervised local transport fixture can prove its own closure; that is not a production-wide settlement provider. Do not substitute an always-settled callback or infer closure from PID absence.
+
+#### Select exactly, then confirm through the trusted host
+
+Preparation exposes bounded `plan.executionAddresses`, `recommendedSelections`, `repeatFrontiers`, `correctionUsage`, and `effectiveScopes`. The current conservative route requires explicit rerun selection of **all potential native/coding addresses** derived from frozen `maxIterations`/`maxItems`, including future repeat/fan-out slots. Potential addresses are not admissions: only materialized work consumes admission budgets. Empty/partial/duplicate/overlapping/unknown selections block. Recommendations are data, never permission. Reprepare with the exact selection and review the **new fingerprint**, full addresses/counts, scopes, settlement observations, budgets, and fresh gates.
+
+In the workflow monitor, **n** prepares; **s** applies recommendations only to a new read-only preparation; **a** arms the exact displayed proof. After that proof renders, **Enter** invokes host confirmation. Nothing is authorized by n/s/a alone. Changed observations/fingerprint, navigation, closing, or incomplete/clipped disclosure invalidates confirmation; a proof that cannot be displayed completely cannot authorize through that pane. Closing a view does not cancel a submitted child.
+
+The host-only API is `control.workflowRecovery.authorize({ workflowRunId, assessmentFingerprint, selections }, signal?)`, returning a `WorkflowReply` (direct `view`/`assessment`, unlike `control.execute`'s `data` wrapper). It is optional and requires a recovery-enabled owner. The service-level equivalent is `workflowService.recovery.authorize`. There is **no model-callable recovery grant, slash JSON confirmation flag, or persisted grant authority**. Ordinary slash/structured recovery commands inspect/prepare only.
+
+Public SDK example (inspection only):
+
+```ts
+import { createZergControl } from 'pi-zerg-swarm';
+
+const control = createZergControl({}, {
+  persistence: { enabled: true, rootDir: process.cwd() },
+  recovery: {
+    enabled: true,
+    inspectNativeSettlement: (_request) => {
+      // Safe placeholder: no externally owned lifecycle proof is supplied.
+      // A real trusted host must verify exact request binding AND closure.
+      return 'unknown';
+    },
+  },
+  // Coding continuation also needs separately reviewed trusted coding config.
+});
+const workflowRunId = '<exact-retained-workflow-run-id>';
+const prepared = await control.execute({
+  action: 'workflows.recovery.prepare', workflowRunId,
+});
+// Inspect prepared.data.assessment. Unknown settlement deliberately blocks.
+// Reprepare with explicitly chosen selections; review its new fingerprint.
+// Do not call authorize automatically from recommendations or model output.
+```
+
+Only after a trusted operator reviews an eligible, exact re-prepared assessment may host code call `control.workflowRecovery.authorize` with that assessment's fingerprint and the same explicit selections. Writer fencing and revalidation precede durable publication of one linked child (`recoveryOf`/origin and source selection). Repeated confirmation returns that child or fails, never allocates another. Admission is not completion. Relevant drift, read-only mode, cancellation, stale snapshot/owner/scope, competing selection, uncertain acquisition/publication, or poisoned persistence blocks further effects; uncertain committed state is retained, not rolled back or silently retried. A selected child interrupted before admission is inert on restart and needs a new assessment/linked confirmation, not ordinary mutating retry.
+
+#### Fresh attempt, fresh gates, bounded family
+
+Continuation uses the existing scheduler and a new linked attempt with fresh task/run/Pi identities, **not reconnection**. An eligible retained managed candidate can be carried into a newly owned stage under current exact scope; original artifacts remain evidence. Carried bytes are **not reuse of an old completed writer**. The coding route requires fresh implementation authority, a new writer that inspects/refines those bytes, new approved checks, independent read-only review, and **separate exact application approval**. Confirmation alone grants none of those coding approvals. Already-satisfied destination paths become read-only effective scope, are freshly revalidated before effects, and are skipped by application writes. Conflicting/unknown destinations block.
+
+The current **all-satisfied, zero-write completion shortcut is blocked** until an explicit current-observation completion validator and fresh host decision exist. Inspection may show `alreadySatisfiedReadonlyPaths`; it must not invent writer/application completion from byte equality.
+
+- Family limits remain **3 attempts / 256 admissions**, cumulative across linked attempts; per-file receipts have separate bounds and are not extra unit admissions. Exhaustion blocks before effects/publication.
+- Each repeat block retains its frozen writer allowance: the first admitted writer is initial work, later writer admissions (including rerunning an attempted frontier) consume corrections. Failed/cancelled/interrupted work is not refunded; limits derive from frozen repeat/coding `maxIterations`, not a new `maxCorrections` field. Retain family anchors, every ancestor, and referenced provenance; forgetting cannot reset budgets or erase unresolved evidence.
+- Generic native/check/review result reuse is disabled without positive trusted versioned input/dependency/policy/environment capture and settled evidence. Current capture is unknown, so repeat reconstruction normally starts at **frontier zero**, with later source history retained rather than copied as valid completion. No generic environment capture is provided. Deterministic aggregates recompute from actual ordered envelopes; candidate carry is a separate byte operation.
+
+#### Guarantee boundary and validation
+
+The durable contract is for **Linux local filesystems**: exact boot/PID/start identity, a process-lifetime writer generation, exclusive snapshot-adjacent claim, expected-head fencing, and owned lease/manifest identities. Read-only inspection does not acquire those locks or clean them up. Live/unreadable/contradictory owners, incomplete claims, malformed evidence, stale artifacts, and unsupported multi-generation reconciliation remain blocked; there is no age-based takeover or unrelated process killing. Save-before-publication and per-effect intent/observation failures stop admission and preserve uncertainty, including after-effect failures.
+
+Bounded metadata, no-follow evidence reads, ownership checks, and fsync are not an OS sandbox, arbitrary-project containment, exactly-once execution, or power-loss certification. Checks still execute trusted project code with host permissions. Recovery never automatically invokes Git, installs dependencies, publishes to npm, calls external providers, or runs external triggers; newly authorized native work still uses its explicit current model. Ordinary legacy snapshot/native-history compatibility is separate from this stricter recovery contract.
+
+New isolated SDK and regular/fullscreen Pi-host recovery fixtures use actual native sessions/tools, owned process interruption, exact loopback transport closure proof, fresh writer/check/independent review, and separate application. The synchronized applied-source suite, all three new transport journeys, and independent release review pass. Scripted local evidence does not certify real-model coding quality, manual visual usability, universal Pi compatibility, or unsupported generic native settlement.
 
 #### Read-only refinement example
 
@@ -301,7 +380,7 @@ The monitor shows selection/skip reasons, current/max iteration, and termination
 - UTF-8 limits: definition **64 KiB**, start inputs **32 KiB**, resolved workflow prompt/input **256 KiB**, raw native unit result **16 KiB before JSON parsing**, aggregate **256 KiB**. The **entire workflow namespace** (registry plus retained runs) is capped at **2 MiB**, with at most **16 definitions / 16 retained attempts**. Complexity limits also apply. Overflow is explicit; results are not silently clipped and history is not automatically pruned. Normal Pi resource context and native JSONL have separate limits; these are not token budgets.
 - Retry requires a fully settled failed/cancelled latest attempt and unchanged frozen identities. It creates a new workflow run with the same family, incremented attempt number, and `retryOf`; only matching completed units are reused, retaining their original native identities. Newly executed units receive fresh task/run/Pi identities. There is no automatic retry, permission replay, or exactly-once guarantee.
 - Version-2 unit identities include block, iteration, body step, and fan-out item where applicable. Retry reuse additionally binds exact iteration state, feedback/transition history, dependency results, frozen definition, and agent policy; similar prompts or identical values in different iterations do not authorize reuse. Newly executed units always receive fresh native identities. An explicit retry can reproduce non-convergence using exact cached completed units without new provider calls; it does not force those units to execute again.
-- Frozen inputs and their hashes are **not a filesystem snapshot or proof of workspace freshness**. Reused results describe their original observations; after workspace changes, start a new workflow rather than assume cached results are fresh. Retry cannot replace inputs; changed inputs require a new run. Stronger source-state reconciliation and durable execution resumption are outside this stage.
+- Frozen inputs and their hashes are **not a filesystem snapshot or proof of workspace freshness**. Reused results describe their original observations; after workspace changes, start a new workflow rather than assume cached results are fresh. Retry cannot replace inputs; changed inputs require a new run. The separate Stage 8C recovery implementation above requires current-state reconciliation and fresh host authority; legacy retry matching alone does not satisfy it.
 - Workflow state uses the existing `extensions.workflows` snapshot namespace. Without opt-in persistence it is process-local. Recovery never starts work, reconnects SDK sessions, or replays messages; interrupted work is marked unverified/`needs-attention` and cannot simply resume or retry with unknown cleanup. Corrupt workflow data is retained and workflow actions fail closed without suppressing unrelated run recovery. Snapshot persistence retains its existing error/durability limitations.
 
 ## Native session reference foundation
@@ -508,7 +587,8 @@ The TypeScript modules are intentionally small:
 - `ui/continuation-review.ts` — separate literal-task editor, current-authority disclosure, and explicit continuation confirmation
 - `ui/team-timeline.ts` — exact filters, bounded timeline/details, and identity-checked coding-view round trips
 - `workflow-model.ts` — bounded declarative contracts, validation, immutable identities, and review aggregation
-- `workflow-runtime.ts` — dependency scheduling, explicit attempts, owned permits, and non-executing recovery
+- `workflow-runtime.ts` — dependency scheduling, explicit attempts, owned permits, inert recovery assessment, and trusted selected execution
+- `workflow-recovery.ts` — bounded checkpoint, operation, selection, and family evidence contracts
 - `ui/workflow-overlay.ts` — progress/step/unit/result views and exact native coding-view navigation
 - `internal-patch.ts` — no-op-safe internal bridge scaffold
 - `index.ts` — extension registration, command handling, direct control API, and native runner wiring
@@ -581,8 +661,11 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.12: patch release adding a read-only team/run timeline, exact filters, and safe coding-view navigation
 - v1.1.13: patch release adding explicit reviewed continuation into a fresh native session
 - v1.1.14: patch release hardening runtime admission, history/UI lifetimes, terminal rendering, and bounded snapshot recovery
-- v1.1.15: patch release adding bounded declarative read-only workflows and exact progress/inspection controls (current release)
-- Further recovery and workspace features require separate scope.
+- v1.1.15: patch release adding bounded declarative read-only workflows and exact progress/inspection controls
+- v1.1.16: patch release adding bounded read-only conditions and repeat workflows
+- v1.1.17: patch release adding trusted staged coding with separate approval gates
+- v1.1.18: patch release adding explicit durable workflow recovery and fresh linked execution (Stage 8C; current release)
+- Stage 8D: optional scripted bounded workflows (future proposal only; separate authority required)
 
 ## License
 

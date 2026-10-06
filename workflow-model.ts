@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import type { ZergAgentDefinition } from './types.js';
 import { validateCodingPolicy } from './workflow-coding.js';
 import type { WorkflowCodingPolicy, WorkflowCodingCapability, WorkflowCodingApprovalKind, WorkflowCodingApprovalRecord, WorkflowCodingApprovalRequest } from './workflow-coding.js';
+import type { RecoveryCheckpointV1 } from './workflow-recovery.js';
+import type { RecoveryOwnershipInspection, RecoveryWriterOwnerEvidence } from './persistence.js';
+import type { DurableCheckReceiptConfig } from './workflow-checks.js';
 
 export type WorkflowJson = null | boolean | number | string | WorkflowJson[] | { [key: string]: WorkflowJson };
 export interface WorkflowSchema {
@@ -77,16 +80,30 @@ export interface WorkflowUnit {
 }
 export interface WorkflowIterationRun { id: string; index: number; state: WorkflowJson; steps: WorkflowStepRun[]; feedback?: WorkflowJson; decision?: boolean; error?: string }
 export interface WorkflowStepRun { id: string; status: WorkflowUnitStatus; units: WorkflowUnit[]; output?: WorkflowJson; error?: string; condition?: boolean; skipReason?: 'condition-false' | 'dependency' | 'cancelled' | 'recovery'; iterations?: WorkflowIterationRun[]; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery' }
+export interface WorkflowRecoveryOriginalUnit { id: string; stepId: string; index: number; status: WorkflowUnitStatus; cleanupSettled: boolean; error?: string }
+export interface WorkflowRecoveryOriginalStep { id: string; status: WorkflowUnitStatus; error?: string; skipReason?: WorkflowStepRun['skipReason']; termination?: WorkflowStepRun['termination']; units: WorkflowRecoveryOriginalUnit[] }
+export interface WorkflowRecoveryOriginal { version: 1; recordedAt: string; status: WorkflowRunStatus; cleanupSettled: boolean; recovered: boolean; error?: string; steps: WorkflowRecoveryOriginalStep[] }
 export interface WorkflowRun {
-  workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; supersededBy?: string;
+  workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; recoveryOf?: string; supersededBy?: string;
   definition: WorkflowDefinition; definitionHash: string; inputs: WorkflowJson;
   agents: Record<string, ZergAgentDefinition>; concurrency: number; status: WorkflowRunStatus;
   createdAt: string; updatedAt: string; admissions: number; cleanupSettled: boolean; recovered: boolean;
   steps: WorkflowStepRun[]; report?: WorkflowJson; error?: string;
+  /** Immutable first observed raw recovery status evidence; inert, bounded, and never replay authority. */
+  recoveryOriginal?: WorkflowRecoveryOriginal;
+  /** Optional public durable recovery checkpoint; strictly inert evidence, never replay authority. */
+  recovery?: RecoveryCheckpointV1;
 }
 export interface WorkflowState { version: 1; definitions: WorkflowDefinition[]; runs: WorkflowRun[] }
+/** Read-only failure projection, never a durable run status or publication certificate. */
+export interface WorkflowRecoveryDiagnostic {
+  reason: string;
+  localView: 'stale-or-uncertain';
+  publication: 'canonical-selection-observed' | 'uncertain';
+}
 export interface WorkflowView {
-  workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; definitionId: string;
+  recoveryDiagnostic?: WorkflowRecoveryDiagnostic;
+  workflowRunId: string; familyId: string; attemptNo: number; retryOf?: string; recoveryOf?: string; definitionId: string;
   status: WorkflowRunStatus; createdAt: string; updatedAt: string; cleanupSettled: boolean; recovered: boolean;
   steps?: Array<{ id: string; kind: WorkflowStep['kind']; status: WorkflowUnitStatus; condition?: boolean; skipReason?: WorkflowStepRun['skipReason']; iterations?: number; maxIterations?: number; currentIteration?: number; iterationId?: string; termination?: 'converged' | 'max-iterations' | 'body-failed' | 'invalid-transition' | 'cancelled' | 'recovery'; error?: string }>;
   counts: Record<WorkflowUnitStatus, number>;
@@ -100,11 +117,14 @@ export type WorkflowAction =
   | { action: 'workflows.define'; definition: WorkflowDefinition }
   | { action: 'workflows.show'; definitionId?: string; workflowRunId?: string }
   | { action: 'workflows.start'; definitionId: string; inputs: WorkflowJson; concurrency?: number }
-  | { action: 'workflows.pause' | 'workflows.resume' | 'workflows.cancel' | 'workflows.retry' | 'workflows.report' | 'workflows.forget'; workflowRunId: string };
+  | { action: 'workflows.pause' | 'workflows.resume' | 'workflows.cancel' | 'workflows.retry' | 'workflows.report' | 'workflows.forget'; workflowRunId: string }
+  | { action: 'workflows.recovery.inspect'; workflowRunId: string }
+  | { action: 'workflows.recovery.prepare'; workflowRunId: string; selections?: { reuseUnitIds?: string[]; rerunUnitIds?: string[] } };
 export interface WorkflowDefinitionView { id: string; label: string; stepCount: number }
 export interface WorkflowReply {
   ok: boolean; action: WorkflowAction['action']; error?: string; view?: WorkflowView;
-  runs?: WorkflowRunSummary[]; definitions?: WorkflowDefinitionView[];
+  recoveryDiagnostic?: WorkflowRecoveryDiagnostic;
+  runs?: WorkflowRunSummary[]; definitions?: WorkflowDefinitionView[]; assessment?: WorkflowJson;
   definition?: WorkflowDefinitionView; report?: WorkflowJson;
 }
 export interface WorkflowTrustedApprovalApi {
@@ -118,11 +138,41 @@ export interface WorkflowService {
   execute(action: WorkflowAction, signal?: AbortSignal): Promise<WorkflowReply>;
   list(): WorkflowView[]; get(workflowRunId: string): WorkflowRun | undefined;
   readonly approvals: WorkflowTrustedApprovalApi;
+  /** Optional pure recovery assessment helper; prepare is not authorization and never schedules child work. */
+  readonly recovery?: { prepare(workflowRunId: string, selections?: { reuseUnitIds?: string[]; rerunUnitIds?: string[] }): Promise<WorkflowReply>; readonly authorize: WorkflowTrustedRecoveryApi['authorize'] };
   subscribe(listener: (views: WorkflowView[]) => void): () => void;
   dispose(): void; drain(): Promise<void>;
 }
-export interface WorkflowTrustedCodingConfig { projectRoot: string; stagingParent: string; writablePaths?: string[]; checkProfiles?: Record<string, unknown> }
-export interface WorkflowServiceOptions { now?: () => Date; idFactory?: () => string; coding?: WorkflowTrustedCodingConfig & { enabled?: boolean; approvalHost?: unknown } }
+export interface WorkflowTrustedRecoveryAuthorizeRequest { workflowRunId: string; assessmentFingerprint: string; selections?: { reuseUnitIds?: string[]; rerunUnitIds?: string[] } }
+export interface WorkflowTrustedRecoveryApi { authorize(request: WorkflowTrustedRecoveryAuthorizeRequest, signal?: AbortSignal): Promise<WorkflowReply> }
+export interface WorkflowTrustedCodingConfig { projectRoot: string; stagingParent: string; writablePaths?: string[]; checkProfiles?: Record<string, unknown>; receiptParent?: string; allocateCheckReceipt?: (request: { workflowRunId: string; unitId: string; candidateHash: string; candidateId: string; profileId: string; profileHash: string }) => DurableCheckReceiptConfig }
+export type WorkflowRecoveryWriterOwnerEvidence = RecoveryWriterOwnerEvidence;
+export type WorkflowRecoveryInspection = RecoveryOwnershipInspection;
+export interface WorkflowRecoveryDurablePort {
+  ensureWriter(): WorkflowRecoveryWriterOwnerEvidence;
+  inspectOwner(): WorkflowRecoveryInspection;
+  inspectPreviousOwner?(ownerEvidence: WorkflowRecoveryWriterOwnerEvidence): 'live' | 'dead' | 'unknown';
+  /** Host-only synchronous acquisition. Takeover requires exact dead-owner proof and snapshot head. */
+  acquireWriter?(options: { expectedSnapshotHash: string; verifiedDeadOwner?: WorkflowRecoveryWriterOwnerEvidence }): WorkflowRecoveryWriterOwnerEvidence | { owner: WorkflowRecoveryWriterOwnerEvidence };
+  /** Use the existing host save-before-replace/update writer path ONCE. No second commit/save.
+   * Save must verify the acquired generation and expected head. Throw on any uncertain result;
+   * preserve canonical synchronous observer changes under the host writer's poisoning rules.
+   * The runtime installs only a live owner-generation-bound plan after successful publication; startup never restores it.
+   */
+  publishSnapshot?(state: unknown, options: { expectedSnapshotHash: string }): unknown;
+}
+/** Positive local settlement is not result reuse or restored authority. The trusted host must
+ * bind this request to its owned native lifecycle evidence; PID absence alone is insufficient.
+ * Inspectors must be synchronous and their owned settlement observations must remain valid
+ * through the ensuing synchronous effect boundary. Runtime checks bounded identical sweeps,
+ * but enum-only returns cannot certify private state changed by a later host callback. Unknown
+ * or drift blocks admission; a revocable/asynchronous host needs an immutable lifecycle proof
+ * protocol rather than treating repeated enum observations as such a certificate. */
+export interface WorkflowRecoveryNativeSettlementRequest {
+  workflowRunId: string; familyId: string; unitId: string; operationId: string;
+  native: WorkflowNativeIdentity | null; inputHash: string; dependencyHash: string; policyHash: string;
+}
+export interface WorkflowServiceOptions { now?: () => Date; idFactory?: () => string; coding?: WorkflowTrustedCodingConfig & { enabled?: boolean; approvalHost?: unknown }; recovery?: { enabled?: boolean; durablePort?: WorkflowRecoveryDurablePort; inspectNativeSettlement?: (request: WorkflowRecoveryNativeSettlementRequest) => 'settled' | 'unknown'; sourceConfig?: WorkflowJson; identityVersionHash?: string } }
 export const WORKFLOW_LIMITS = Object.freeze({ steps: 16, fanout: 32, concurrency: 32, admissions: 256, attempts: 3,
   definitionBytes: 65536, inputBytes: 32768, resultBytes: 16384, promptBytes: 262144, aggregateBytes: 262144,
   ledgerBytes: 2097152, definitions: 16, runs: 16, depth: 24, nodes: 20000, keys: 256, stringLength: 262144 });
@@ -477,7 +527,7 @@ export function workflowView(run: WorkflowRun): WorkflowView {
   const counts: WorkflowView['counts'] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unverified: 0 };
   const correlations: WorkflowView['correlations'] = [];
   for (const { step, blockId, iterationId, iterationNo } of workflowStepEntries(run)) for (const unit of step.units) { counts[unit.status]++; correlations.push({ ...(blockId ? { blockId, iterationId, iterationNo } : {}), stepId: step.id, unitId: unit.id, status: unit.status, ...(unit.native ? { native: unit.native } : {}), ...(unit.reusedFrom ? { reusedFrom: unit.reusedFrom } : {}) }); }
-  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...((run.definition.version === 2 || run.definition.version === 3) ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
+  return { workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...(run.retryOf ? { retryOf: run.retryOf } : {}), ...(run.recoveryOf ? { recoveryOf: run.recoveryOf } : {}), definitionId: run.definition.id, status: run.status, createdAt: run.createdAt, updatedAt: run.updatedAt, cleanupSettled: run.cleanupSettled, recovered: run.recovered, counts, correlations, ...((run.definition.version === 2 || run.definition.version === 3) ? { steps: workflowStepEntries(run).map(({ spec, step }) => ({ id: step.id, kind: spec.kind, status: step.status, ...(step.condition !== undefined ? { condition: step.condition } : {}), ...(step.skipReason ? { skipReason: step.skipReason } : {}), ...(step.iterations ? { iterations: step.iterations.length, maxIterations: spec.maxIterations, currentIteration: step.iterations.length, ...(step.iterations.at(-1) ? { iterationId: step.iterations.at(-1)!.id } : {}) } : {}), ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}) })) } : {}), ...(run.error ? { error: run.error } : {}) };
 }
 
 const stringSchema = (maxLength: number): WorkflowSchema => ({ type: 'string', maxLength });
@@ -626,6 +676,28 @@ export function qualifyWorkflowStep(spec: WorkflowStep, iterationId?: string): W
   return iterationId ? { ...spec, id: `${iterationId}/${spec.id}`, dependsOn: spec.dependsOn.map(id => `${iterationId}/${id}`) } : spec;
 }
 
+
+export interface WorkflowRecoverySourceContract { knownHash: string | null; explicitUnknown: boolean }
+export function workflowRecoverySourceContract(sourceConfig?: WorkflowJson, identityVersionHash?: string): WorkflowRecoverySourceContract {
+  if (sourceConfig === undefined || identityVersionHash === undefined) return { knownHash: null, explicitUnknown: true };
+  workflowAssert(typeof identityVersionHash === 'string' && /^[a-f0-9]{64}$/.test(identityVersionHash), 'Invalid recovery identity version hash');
+  return { knownHash: workflowHash({ sourceConfig: workflowJson(sourceConfig, WORKFLOW_LIMITS.definitionBytes), identityVersionHash }), explicitUnknown: false };
+}
+export function workflowRecoveryDependencyHash(run: WorkflowRun, spec: WorkflowStep, unit: WorkflowUnit, hostSourceContract: WorkflowRecoverySourceContract): string {
+  const context = workflowStepContext(run, spec.id);
+  const declaredDependencies: Record<string, WorkflowJson> = {};
+  for (const depId of spec.dependsOn) {
+    const dep = context.steps.find(s => s.id === depId);
+    workflowAssert(!!dep, 'Missing declared dependency');
+    const id = context.iteration ? dep.id.slice(context.iteration.id.length + 1) : dep.id;
+    if (dep.output !== undefined) declaredDependencies[id] = dep.output;
+    else if (spec.consumeSkips && dep.skipReason === 'condition-false') declaredDependencies[id] = workflowUnavailableEnvelope(dep);
+    else if (spec.consumeFailures && ['failed', 'unverified'].includes(dep.status)) declaredDependencies[id] = workflowUnavailableEnvelope(dep);
+    else workflowAssert(false, 'Declared dependency output unavailable for recovery checkpoint');
+  }
+  return workflowHash({ version: 1, unit: { id: unit.id, index: unit.index, inputHash: unit.inputHash, inputs: unit.inputs, unitHash: workflowUnitHash(run, spec, unit.inputs) }, qualifiedStep: { id: spec.id, kind: spec.kind, dependsOn: spec.dependsOn, iterationId: context.iteration?.id ?? null }, priorIteration: context.iteration ? { id: context.iteration.id, index: context.iteration.index, state: context.iteration.state } : null, dependencies: declaredDependencies, hostSourceContract });
+}
+
 /** Unavailable values are materialized only for an explicitly consuming aggregate. */
 export function workflowUnavailableEnvelope(step: WorkflowStepRun): WorkflowJson {
   if (step.skipReason === 'condition-false') return { id: step.id, status: 'skipped', skipReason: 'condition-false' };
@@ -639,4 +711,21 @@ export function workflowUnavailableEnvelope(step: WorkflowStepRun): WorkflowJson
     }
   }
   return workflowJson({ id: step.id, status: step.status, ...(step.termination ? { termination: step.termination } : {}), ...(step.error ? { error: step.error } : {}), ...(diagnostic ? { diagnostic } : {}) });
+}
+
+/** Frozen potential execution addresses, not admissions. Aggregates and repeat containers
+ * are recomputed by the scheduler and do not consume execution permits. */
+export function workflowRecoveryAddresses(definition: WorkflowDefinition): Array<{ stepId: string; unitId: string; blockId?: string; iterationNo?: number }> {
+  const result: Array<{ stepId: string; unitId: string; blockId?: string; iterationNo?: number }> = [];
+  const add = (spec: WorkflowStep, prefix = '', blockId?: string, iterationNo?: number) => {
+    if (spec.kind === 'aggregate') return;
+    const stepId = prefix + spec.id;
+    for (let index = 0; index < (spec.fanout?.maxItems ?? 1); index++) result.push({ stepId, unitId: `${stepId}:${index}`, ...(blockId ? { blockId, iterationNo } : {}) });
+  };
+  for (const spec of definition.steps) {
+    if (spec.kind === 'repeat') for (let i = 0; i < spec.maxIterations!; i++) for (const body of spec.body!) add(body, `${spec.id}@${i}/`, spec.id, i + 1);
+    else add(spec);
+  }
+  workflowAssert(result.length <= WORKFLOW_LIMITS.nodes && result.length <= WORKFLOW_LIMITS.admissions, 'Recovery potential execution address limit exceeded');
+  return result;
 }

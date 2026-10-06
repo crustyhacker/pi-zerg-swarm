@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.18] - 2026-10-06
+
+### Added
+
+- Opt-in durable workflow recovery with inert startup and read-only `workflows.recovery.inspect` / `prepare`, immutable original status evidence, and separate current owner, receipt, artifact, and destination observations.
+- Trusted-host-only exact recovery confirmation, explicit bounded execution-address selection, selection-bound fingerprints, one durable linked child, and fresh generation-bound execution through the existing scheduler; no model-callable recovery grant or restored approvals.
+- Optional exact-request-bound `inspectNativeSettlement` host observation, defaulting to unknown without positive caller-owned lifecycle proof. A settled return must attest irreversible exact owned-work closure, not temporary idleness or revocable permission. PID/supervisor absence alone is not settlement; enum reads do not certify an adversarial host's hidden revocation, and no generic SDK native closure provider is supplied.
+- Monitor flow: prepare, read-only recommendation reprepare, arm/render full exact proof, then explicit host confirmation. Stale or clipped proof cannot authorize.
+- New isolated actual SDK and regular/fullscreen Pi-host recovery fixtures with owned process interruption and narrowly sealed loopback transport closure proof. Applied-source transport journeys and independent release review pass. Scripted evidence is not power-loss, manual visual, real-model quality, or universal compatibility certification.
+
+### Changed
+
+- Recovery fencing uses the existing authoritative snapshot writer, Linux boot/PID/start identity, lifetime generation and exclusive claim, expected-head checks, save-before-publication, and failure poisoning; inspection never acquires ownership or cleans retained evidence.
+- Managed candidate carry is separate from completed native-result reuse: fresh implementation approval, a new writer, new checks, independent review, and separate application approval are required. Already-satisfied paths stay read-only and are not rewritten; fully satisfied zero-write completion remains blocked pending an explicit observation-completion path.
+- Linked attempts retain cumulative three-attempt/256-admission family limits, per-repeat writer/correction allowances, anchors, and provenance. Unknown dependency/environment contracts disable generic native/check/review result reuse and normally give repeat frontier zero; deterministic aggregates recompute. Uncertain receipts remain uncertain without effect attribution, and no automatic Git, installation, publication, or recovery replay is introduced.
+
 ## [1.1.17] - 2026-10-04
 
 ### Added
@@ -607,7 +623,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Updated release messaging in public docs and version references from v0.8.1 to v0.9.0 while preserving completed milestone history.
 - Bumped package metadata versions from `0.8.1` to `0.9.0` in package manifest files.
-- Reserved the follow-up audit backlog (`prompts/audit/themed-cleanup_v2-0-0.md` and `prompts/audit/generalized-deep-audit_v2-0-0.md`) for v0.9.1.
+- Reserved the follow-up themed cleanup and generalized deep-audit backlog for v0.9.1.
 
 ### Known Limitations
 

@@ -1,12 +1,15 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve as resolvePath } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { closeSync, constants as fsConstants, existsSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve as resolvePath, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { installInternalPatch } from './internal-patch.js';
-import { createZergPersistenceManager, type ZergPersistenceManager } from './persistence.js';
+import { createZergPersistenceManager, type RecoveryWriterOwnerEvidence, type ZergPersistenceManager } from './persistence.js';
 import { createWorkflowService } from './workflow-runtime.js';
-import { WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowTrustedApprovalApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
+import { profileHash as codingCheckProfileHash } from './workflow-checks.js';
+import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowStepEntries, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowServiceOptions, type WorkflowTrustedApprovalApi, type WorkflowTrustedRecoveryApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
 export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
@@ -20,7 +23,7 @@ import { getZergTimeline, validateZergTimelineFilter } from './timeline.js';
 import { openZergTeamTimeline } from './ui/team-timeline.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
 import { renderZergTimeline, renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
-import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
+import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, updateZergState, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
 import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference, type ZergTimelineFilter, type ZergSessionMessageKey } from './types.js';
 
 type ZergIdFactory = {
@@ -40,9 +43,17 @@ export interface ZergCommandHandlerOptions {
   nativeContinuationService?: NativeContinuationService;
   /** Trusted host-only v3 workflow coding configuration; never supplied by model/tool actions. */
   coding?: WorkflowTrustedCodingConfig & { enabled?: boolean };
+  /** Trusted host-only durable recovery producer opt-in; never supplied by model/tool actions. */
+  recovery?: {
+    enabled?: boolean;
+    /** Trusted owned-lifecycle proof, bound to the exact run/unit/native/operation and
+     * input/dependency/policy hashes. PID absence is not settlement. Missing => unknown.
+     * This observation cannot grant implementation, reuse or application authority. */
+    inspectNativeSettlement?: NonNullable<WorkflowServiceOptions['recovery']>['inspectNativeSettlement'];
+  };
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService };
+type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; startupRecoveryBlock?: StartupRecoveryBlock };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -127,9 +138,89 @@ type PiNativeActiveRun = {
 
 type PiNativeActiveRunRegistry = Map<string, PiNativeActiveRun>;
 const nativeContinuationAdmissions = new WeakMap<ZergSubagentLaunchRequest, NativeContinuationAdmission>();
+const ownedPersistenceManagers = new WeakMap<ZergStateContainer, ZergPersistenceManager>();
+interface RecoveryPublicationGuard {
+  check(expectedCanonical?: ZergState, recordOnly?: boolean): void;
+  saved(expectedCanonical?: ZergState, recordOnly?: boolean): void;
+}
+// Enter the EXISTING save-before-publication wrapper; never commit independently.
+const recoveryPublications = new WeakMap<ZergStateContainer, (state: ZergState, guard: RecoveryPublicationGuard) => ZergState>();
+const recoveryWriterIdleChecks = new WeakMap<ZergStateContainer, () => void>();
 // Private per-call authority survives the bridge acknowledgement delay without
 // changing the public launch contract or retaining completed requests globally.
 const launchAuthorities = new WeakMap<ZergSubagentLaunchRequest, { signal?: AbortSignal; isOwnerDisposed?: () => boolean }>();
+
+type StartupRecoveryBlockReason = 'owner-lock-present' | 'claim-present' | 'inspection-blocked' | 'snapshot-load-error';
+
+interface StartupRecoveryBlock {
+  readonly blocked: true;
+  readonly reason: StartupRecoveryBlockReason;
+  readonly message: string;
+  readonly inspectedAt: string;
+  readonly snapshotFile?: string;
+  readonly ownerWriterSessionId?: string;
+  readonly claimPresent?: boolean;
+  readonly blocker?: string;
+  readonly lastLoadError?: string;
+}
+
+function inspectStartupRecoveryBlock(persistenceManager: ZergPersistenceManager | undefined, now?: () => Date): StartupRecoveryBlock | undefined {
+  if (!persistenceManager?.inspectRecoveryOwnership) return undefined;
+  const inspection = persistenceManager.inspectRecoveryOwnership();
+  const info = persistenceManager.info;
+  const inspectedAt = (now ?? (() => new Date()))().toISOString();
+  const base = {
+    blocked: true as const,
+    inspectedAt,
+    snapshotFile: inspection.snapshotFile,
+    claimPresent: inspection.claimPresent || undefined,
+    blocker: inspection.blocker?.slice(0, 1024),
+    lastLoadError: info.lastLoadError?.slice(0, 1024),
+  };
+  if (inspection.ownerValid && inspection.owner?.writerSessionId !== info.writerSessionId) {
+    return {
+      ...base,
+      reason: 'owner-lock-present',
+      ownerWriterSessionId: inspection.owner?.writerSessionId,
+      message: 'Startup recovery inspection is inert because a retained recovery owner lock is present.',
+    };
+  }
+  if (inspection.claimPresent) {
+    return { ...base, reason: 'claim-present', message: 'Startup recovery inspection is inert because a retained recovery claim is present.' };
+  }
+  if (inspection.blocker) {
+    return { ...base, reason: 'inspection-blocked', message: `Startup recovery inspection is inert because recovery ownership evidence is blocked: ${inspection.blocker.slice(0, 1024)}` };
+  }
+  if (info.lastLoadError) {
+    return { ...base, reason: 'snapshot-load-error', message: `Startup recovery inspection is inert because the persisted snapshot could not be loaded: ${info.lastLoadError.slice(0, 1024)}` };
+  }
+  return undefined;
+}
+
+function createInertInternalPatchController(message: string): ZergInternalPatchController {
+  return {
+    installed: false,
+    emit(event) {
+      return {
+        id: event.id ?? 'startup-recovery-inert',
+        createdAt: event.createdAt ?? new Date().toISOString(),
+        type: event.type,
+        message: event.message || message,
+        status: event.status,
+        agentId: event.agentId,
+        taskId: event.taskId,
+        teamId: event.teamId,
+        treeNodeId: event.treeNodeId,
+        revision: event.revision,
+      };
+    },
+    dispose() {},
+  };
+}
+
+function startupRecoveryStatus(block: StartupRecoveryBlock | undefined): { blocked: true; reason: StartupRecoveryBlockReason; message: string; inspectedAt: string; snapshotFile?: string; ownerWriterSessionId?: string; claimPresent?: boolean; blocker?: string; lastLoadError?: string } | undefined {
+  return block ? { ...block } : undefined;
+}
 
 function publishedLaunchBlock(container: ZergStateContainer, request: ZergSubagentLaunchRequest, disposed = false): string | undefined {
   const authority = launchAuthorities.get(request);
@@ -191,7 +282,8 @@ export function registerZergSwarmExtension(
   const stateContainer = createZergStateContainer(sharedSeed);
   const persistenceManager = createZergPersistenceManager(options.persistence);
   persistenceManager?.hydrate(stateContainer, options.now);
-  if (sharedSeed !== sharedSeedSource) {
+  let startupRecoveryBlock = inspectStartupRecoveryBlock(persistenceManager, options.now);
+  if (sharedSeed !== sharedSeedSource && !startupRecoveryBlock) {
     replaceSharedZergState(stateContainer.snapshot());
   }
   let patch: ZergInternalPatchController | undefined;
@@ -203,28 +295,93 @@ export function registerZergSwarmExtension(
     replaceSharedZergState(stateContainer.snapshot());
   };
 
+  let disposed = false;
+  let committingPersistentState = false;
+  let recoveryPublicationGuard: RecoveryPublicationGuard | undefined;
+  let persistentStateCommitPoisoned: Error | undefined;
+  const commitPersistentState = (computeNextState: () => ZergState): ZergState => {
+    if (!persistenceManager) {
+      stateContainer.replace(computeNextState());
+      const canonical = stateContainer.read();
+      syncSharedStateFromContainer();
+      return canonical;
+    }
+    if (startupRecoveryBlock) {
+      if (committingPersistentState) throw new Error('Zerg persistence commit already in progress; nested state writes are refused.');
+      committingPersistentState = true;
+      try {
+        const refreshedBlock = inspectStartupRecoveryBlock(persistenceManager, options.now);
+        startupRecoveryBlock = refreshedBlock;
+        if (refreshedBlock) {
+          throw new Error(`Zerg persistence commit unavailable while startup recovery is inert pending trusted recovery ownership: ${refreshedBlock.message}`);
+        }
+      } finally { committingPersistentState = false; }
+    }
+    if (persistentStateCommitPoisoned) {
+      throw new Error(`Zerg persistence commit unavailable after previous failure: ${persistentStateCommitPoisoned.message}`);
+    }
+    if (committingPersistentState) {
+      throw new Error('Zerg persistence commit already in progress; nested state writes are refused.');
+    }
+    committingPersistentState = true;
+    try {
+      const nextState = computeNextState();
+      recoveryPublicationGuard?.check();
+      const intended = snapshotZergState(nextState);
+      persistenceManager.save(intended, recoveryPublicationGuard ? () => {
+        const time = (options.now ?? (() => new Date()))();
+        recoveryPublicationGuard?.check();
+        return time;
+      } : options.now);
+      recoveryPublicationGuard?.saved();
+      stateContainer.replace(nextState);
+      const canonical = stateContainer.snapshot();
+      // Synchronous revocations remain canonical and must reach disk while the
+      // owned writer is valid. This SAME-manager follow-up is record-only.
+      recoveryPublicationGuard?.check(canonical, true);
+      if (!isDeepStrictEqual(canonical, intended)) {
+        persistenceManager.save(canonical, recoveryPublicationGuard ? () => {
+          const time = (options.now ?? (() => new Date()))();
+          recoveryPublicationGuard?.check(canonical, true);
+          return time;
+        } : options.now);
+        recoveryPublicationGuard?.saved(canonical, true);
+      }
+      recoveryPublicationGuard?.check(canonical, true);
+      syncSharedStateFromContainer();
+      return canonical;
+    } catch (error) {
+      if (recoveryPublicationGuard) syncSharedStateFromContainer();
+      persistentStateCommitPoisoned = recoveryPublicationGuard
+        ? new Error(`Recovery publication failed or is uncertain: ${error instanceof Error ? error.message : String(error)}`)
+        : error instanceof Error ? error : new Error(String(error));
+      throw persistentStateCommitPoisoned;
+    } finally {
+      committingPersistentState = false;
+    }
+  };
   const syncedStateContainer: ZergStateContainer = {
     read: () => stateContainer.read(),
     snapshot: () => stateContainer.snapshot(),
-    replace: (nextState) => {
-      stateContainer.replace(nextState);
-      const snapshot = stateContainer.snapshot();
-      syncSharedStateFromContainer();
-      persistenceManager?.save(snapshot, options.now);
-      return snapshot;
-    },
-    update: (nextState, patchOptions) => {
-      stateContainer.update(nextState, patchOptions);
-      const snapshot = stateContainer.snapshot();
-      syncSharedStateFromContainer();
-      persistenceManager?.save(snapshot, options.now);
-      return snapshot;
-    },
+    replace: (nextState) => commitPersistentState(() => createZergState(nextState)),
+    update: (nextState, patchOptions) => commitPersistentState(() => updateZergState(stateContainer.read(), nextState, patchOptions)),
     subscribe: (listener) => stateContainer.subscribe?.(listener) ?? (() => undefined),
   };
+  if (persistenceManager) {
+    ownedPersistenceManagers.set(syncedStateContainer, persistenceManager);
+    recoveryWriterIdleChecks.set(syncedStateContainer, () => {
+      if (committingPersistentState || recoveryPublicationGuard || persistentStateCommitPoisoned) throw new Error('Recovery writer nested/poisoned commit refused.');
+    });
+    recoveryPublications.set(syncedStateContainer, (state, guard) => {
+      if (committingPersistentState || recoveryPublicationGuard) throw new Error('Recovery publication nested write refused.');
+      recoveryPublicationGuard = guard;
+      try { return syncedStateContainer.replace(state); }
+      finally { recoveryPublicationGuard = undefined; }
+    });
+  }
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(syncedStateContainer) });
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(syncedStateContainer, persistenceManager, options.now);
-  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService } as RuntimeCommandOptions;
+  const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService, startupRecoveryBlock, isOwnerDisposed: () => disposed } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
   runtimeOptions.workflowService = workflowControlServices.get(control);
@@ -241,7 +398,9 @@ export function registerZergSwarmExtension(
       }));
       if (shutdownDisposer) sessionDisposers.push(shutdownDisposer);
     }
-    const installedPatch = installInternalPatch(context, syncedStateContainer);
+    const installedPatch = startupRecoveryBlock
+      ? createInertInternalPatchController(startupRecoveryBlock.message)
+      : installInternalPatch(context, syncedStateContainer);
     patch = installedPatch;
     const handler = createPiZergCommandHandler(syncedStateContainer, { ...runtimeOptions, subagentAdapter } as RuntimeCommandOptions);
 
@@ -262,13 +421,15 @@ export function registerZergSwarmExtension(
       toolDisposers.push(toolDisposer);
     }
 
-    patch.emit({
-      type: 'hook',
-      message: patch.installed
-        ? `pi-zerg-swarm v${ZERG_EXTENSION_VERSION} internal patch path active`
-        : `pi-zerg-swarm v${ZERG_EXTENSION_VERSION} internal patch unavailable; command surface registered`,
-      status: patch.installed ? 'running' : 'done',
-    });
+    if (!startupRecoveryBlock) {
+      patch.emit({
+        type: 'hook',
+        message: patch.installed
+          ? `pi-zerg-swarm v${ZERG_EXTENSION_VERSION} internal patch path active`
+          : `pi-zerg-swarm v${ZERG_EXTENSION_VERSION} internal patch unavailable; command surface registered`,
+        status: patch.installed ? 'running' : 'done',
+      });
+    }
   } catch (error) {
     disposeStartupResources(commandDisposers, patch);
     for (const sessionDisposer of sessionDisposers.splice(0)) {
@@ -296,7 +457,6 @@ export function registerZergSwarmExtension(
   }
 
   const installedPatch = patch;
-  let disposed = false;
 
   return {
     commands: [...ZERG_COMMANDS],
@@ -398,6 +558,247 @@ function createOwnedMessageService(container: ZergStateContainer, persistenceMan
   return createSessionMessageService({ container, now, readOnly: () => container.read().mode.readOnly === true,
     ...(persistenceManager ? { save: (state: ZergState) => persistenceManager.save(state, now) } : {}) });
 }
+
+
+
+type WorkflowHostOwnerInspection = 'live' | 'dead' | 'unknown';
+const HOST_CHECK_ROOT_MARKER = 'zerg-managed-root.json';
+const HOST_CHECK_GENERATION_MARKER = 'marker.json';
+const HOST_CHECK_MARKER_BYTES = 4096;
+const HOST_CHECK_MAX_RECEIPTS = 512;
+const HOST_CHECK_ROOT_SCOPE = 'zerg.workflow.checkReceiptRoot.v1';
+const HOST_CHECK_GENERATION_KEYS = Object.freeze(['candidateId', 'generation', 'nonce', 'profileId'] as const);
+
+function boundedReadJsonFileNoFollow(path: string, maxBytes: number, label: string): unknown {
+  let fd: number | undefined;
+  try {
+    const before = lstatSync(path);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size < 1 || before.size > maxBytes || before.uid !== process.getuid?.() || (before.mode & 0o177) !== 0) throw new Error(`${label} is not a private regular bounded file`);
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.nlink !== 1 || opened.size < 1 || opened.size > maxBytes || opened.uid !== process.getuid?.() || (opened.mode & 0o177) !== 0) throw new Error(`${label} changed before read`);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const chunk = Buffer.alloc(Math.min(1024, maxBytes + 1 - total));
+      const n = readSync(fd, chunk, 0, chunk.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) throw new Error(`${label} is too large`);
+      chunks.push(chunk.subarray(0, n));
+    }
+    const after = fstatSync(fd), current = lstatSync(path);
+    if (opened.dev !== after.dev || opened.ino !== after.ino || opened.size !== after.size || opened.mtimeMs !== after.mtimeMs || opened.ctimeMs !== after.ctimeMs || total !== opened.size || current.dev !== opened.dev || current.ino !== opened.ino || current.size !== opened.size || current.mtimeMs !== opened.mtimeMs || current.ctimeMs !== opened.ctimeMs) throw new Error(`${label} changed while reading`);
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, total)));
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function assertPrivateDirectoryNoFollow(path: string, label: string): void {
+  const st = lstatSync(path);
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`${label} must be a non-symlink directory`);
+  if (st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) throw new Error(`${label} must be private to the current uid`);
+}
+
+function fsyncOpenPath(path: string): void {
+  const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function assertUnder(child: string, parent: string, label: string): void {
+  const rel = resolvePath(child);
+  const root = parent.endsWith(sep) ? parent : parent + sep;
+  if (rel !== parent && !rel.startsWith(root)) throw new Error(`${label} escapes trusted root`);
+}
+
+function exactStringKeys(value: unknown, keys: readonly string[], label: string): Record<string, string> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  const record = value as Record<string, unknown>;
+  const actual = Object.keys(record).sort();
+  if (actual.length !== keys.length || actual.some((key, i) => key !== [...keys].sort()[i])) throw new Error(`${label} has unexpected fields`);
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    if (typeof record[key] !== 'string' || record[key].length === 0 || record[key].length > 512 || record[key].includes('\0')) throw new Error(`${label}.${key} invalid`);
+    out[key] = record[key] as string;
+  }
+  return out;
+}
+
+function inspectPreviousWorkflowOwner(owner: RecoveryWriterOwnerEvidence): WorkflowHostOwnerInspection {
+  if (process.platform !== 'linux') return 'unknown';
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+  const ticks = /^(0|[1-9][0-9]{0,31})$/;
+  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || owner.pid > 2147483647 || typeof owner.bootId !== 'string' || !uuid.test(owner.bootId) || typeof owner.startTimeTicks !== 'string' || !ticks.test(owner.startTimeTicks)) return 'unknown';
+  let bootId: string;
+  try { bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); }
+  catch { return 'unknown'; }
+  if (!uuid.test(bootId)) return 'unknown';
+  if (bootId !== owner.bootId) return 'dead';
+  try {
+    const stat = readFileSync(`/proc/${owner.pid}/stat`, 'utf8');
+    const end = stat.lastIndexOf(')');
+    if (end < 0) return 'unknown';
+    const current = stat.slice(end + 2).trim().split(/\s+/)[19];
+    if (!current || !ticks.test(current)) return 'unknown';
+    return current === owner.startTimeTicks ? 'live' : 'dead';
+  } catch (error) { return (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? 'dead' : 'unknown'; }
+}
+
+function createDefaultWorkflowCheckAllocator(container: ZergStateContainer, persistenceManager: ZergPersistenceManager, coding: WorkflowTrustedCodingConfig & { enabled?: boolean }, currentOwner: () => RecoveryWriterOwnerEvidence | undefined) {
+  const trustedProjectRootInput = coding.projectRoot;
+  const trustedStagingParentInput = coding.stagingParent;
+  if (typeof trustedProjectRootInput !== 'string' || typeof trustedStagingParentInput !== 'string' || !isAbsolute(trustedProjectRootInput) || !isAbsolute(trustedStagingParentInput)) throw new Error('Default durable check receipt allocator requires absolute projectRoot and stagingParent.');
+  const trustedProjectRoot = resolvePath(trustedProjectRootInput);
+  const trustedStagingParent = resolvePath(trustedStagingParentInput);
+  if (trustedProjectRoot === trustedStagingParent || trustedProjectRoot.startsWith(trustedStagingParent + sep) || trustedStagingParent.startsWith(trustedProjectRoot + sep)) throw new Error('Default durable check receipt allocator requires disjoint projectRoot and stagingParent.');
+  const rootScopeHash = workflowHash({ scope: HOST_CHECK_ROOT_SCOPE, projectRoot: trustedProjectRoot, stagingParent: trustedStagingParent, snapshotFile: persistenceManager.info.snapshotFile ?? null });
+  return (request: { workflowRunId: string; unitId: string; candidateHash: string; profileId: string; profileHash: string }) => {
+    for (const [key, value] of Object.entries(request)) if (typeof value !== 'string' || value.length === 0 || value.length > 512 || value.includes('\0')) throw new Error(`Invalid durable check request ${key}.`);
+    for (const root of [trustedProjectRoot, trustedStagingParent]) {
+      let current = root;
+      for (let depth = 0;; depth++) {
+        if (depth > 128) throw new Error('Trusted artifact root is too deep.');
+        const st = lstatSync(current);
+        if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('Unsafe trusted artifact root component.');
+        if (dirname(current) === current) break;
+        current = dirname(current);
+      }
+    }
+    assertPrivateDirectoryNoFollow(trustedStagingParent, 'trusted workflow staging parent');
+    const state = container.read();
+    if (state.mode.readOnly || state.lifecycle === 'disposed') throw new Error('Durable check receipt allocation requires current writable owner state.');
+    const extensionState = (state.extensions as Record<string, unknown>)[WORKFLOW_EXTENSION_KEY] as { runs?: unknown[] } | undefined;
+    const namespaceHash = workflowHash(extensionState ?? null), lifecycle = state.lifecycle;
+    const run = extensionState?.runs?.find((entry): entry is import('./workflow-model.js').WorkflowRun => !!entry && typeof entry === 'object' && (entry as { workflowRunId?: unknown }).workflowRunId === request.workflowRunId);
+    const entry = run && workflowStepEntries(run).find(entry => entry.step.units.some(unit => unit.id === request.unitId));
+    const unit = entry?.step.units.find(unit => unit.id === request.unitId);
+    const trustedProfile = coding.checkProfiles?.[request.profileId];
+    if (!run || !['running', 'paused'].includes(run.status) || run.recovered || !unit || unit.status !== 'running' || unit.cleanupSettled || entry?.spec.coding?.operation !== 'check' || entry.spec.coding.checkProfileId !== request.profileId || !trustedProfile || codingCheckProfileHash(trustedProfile) !== request.profileHash) throw new Error('Durable check receipt allocation requires an active running coding unit with matching candidate.');
+    if (!workflowStepEntries(run).some(entry => entry.spec.coding?.operation === 'stage-write' && entry.step.units.some(candidate => candidate.status === 'completed' && candidate.cleanupSettled && candidate.coding?.candidateHash === request.candidateHash))) throw new Error('No completed staged candidate matches the check receipt request.');
+    let checkIntent: NonNullable<typeof run.recovery>['operations'][number] | undefined;
+    if (run.recovery) {
+      for (let i = run.recovery.operations.length - 1; i >= 0; i--) {
+        const op = run.recovery.operations[i];
+        if (op.kind === 'check' && op.unitId === request.unitId && op.generation === undefined && op.result === undefined) { checkIntent = op; break; }
+      }
+    }
+    if (!run.recovery || !checkIntent || checkIntent.inputHash !== unit.inputHash || checkIntent.policyHash !== workflowHash({ kind: entry.spec.kind, coding: entry.spec.coding ?? null, agentId: entry.spec.agentId ?? null })) throw new Error('Durable check receipt allocation requires current recovery check intent and policy hash.');
+    const owner = currentOwner();
+    const inspected = persistenceManager.inspectRecoveryOwnership?.();
+    if (!owner || !inspected || inspected.blocker || inspected.claimPresent || inspected.ownerValid !== true || !inspected.owner || workflowHash(inspected.owner) !== workflowHash(owner)) throw new Error('Durable check receipt allocation requires current recovery owned writer evidence.');
+    if (!inspected.expectedSnapshotHash || !inspected.actualSnapshotHash || inspected.expectedSnapshotHash !== inspected.actualSnapshotHash) throw new Error('Durable check receipt allocation requires recovery manager expected head to match current head.');
+    const current = container.read();
+    if (current.mode.readOnly || current.lifecycle !== lifecycle || workflowHash(current.extensions[WORKFLOW_EXTENSION_KEY] ?? null) !== namespaceHash) throw new Error('Durable check authority changed during owner inspection.');
+    const familyRoot = join(trustedStagingParent, `managed-${rootScopeHash.slice(0, 32)}`);
+    let createdRoot = false;
+    try { mkdirSync(familyRoot, { mode: 0o700 }); createdRoot = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error; }
+    assertUnder(familyRoot, trustedStagingParent, 'managed receipt root');
+    assertPrivateDirectoryNoFollow(familyRoot, 'managed receipt root');
+    const rootMarker = join(familyRoot, HOST_CHECK_ROOT_MARKER);
+    if (createdRoot) {
+      writeFileSync(rootMarker, JSON.stringify({ scope: HOST_CHECK_ROOT_SCOPE, scopeHash: rootScopeHash, rootProject: trustedProjectRoot }) + '\n', { mode: 0o600, flag: 'wx' });
+      fsyncOpenPath(rootMarker); fsyncOpenPath(familyRoot); fsyncOpenPath(trustedStagingParent);
+    }
+    const rootBody = boundedReadJsonFileNoFollow(rootMarker, HOST_CHECK_MARKER_BYTES, 'managed receipt root marker') as Record<string, unknown>;
+    if (rootBody.scope !== HOST_CHECK_ROOT_SCOPE || rootBody.scopeHash !== rootScopeHash || rootBody.rootProject !== trustedProjectRoot || Object.keys(rootBody).length !== 3) throw new Error('Managed receipt root marker does not match trusted scope.');
+    const dir = opendirSync(familyRoot);
+    try {
+      let count = 0;
+      for (;;) {
+        const ent = dir.readSync();
+        if (!ent) break;
+        if (ent.name === HOST_CHECK_ROOT_MARKER) continue;
+        if (!ent.isDirectory() || !ent.name.startsWith('receipt-')) throw new Error('Unexpected managed receipt root entry.');
+        if (++count >= HOST_CHECK_MAX_RECEIPTS) throw new Error('Managed receipt cap reached.');
+      }
+    } finally { dir.closeSync(); }
+    const candidateId = workflowHash({ version: 1, workflowRunId: request.workflowRunId, unitId: request.unitId, candidateHash: request.candidateHash });
+    for (let i = 0; i < 16; i++) {
+      const generation = randomUUID(), nonce = randomBytes(24).toString('hex');
+      const receiptDir = join(familyRoot, `receipt-${workflowHash({ generation, nonce }).slice(0, 40)}`);
+      try { mkdirSync(receiptDir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue; throw error; }
+      const markerPath = join(receiptDir, HOST_CHECK_GENERATION_MARKER);
+      writeFileSync(markerPath, JSON.stringify({ generation, nonce, candidateId, profileId: request.profileId }) + '\n', { mode: 0o600, flag: 'wx' });
+      assertPrivateDirectoryNoFollow(receiptDir, 'durable receipt directory');
+      const marker = exactStringKeys(boundedReadJsonFileNoFollow(markerPath, HOST_CHECK_MARKER_BYTES, 'durable receipt marker'), HOST_CHECK_GENERATION_KEYS, 'durable receipt marker');
+      if (marker.generation !== generation || marker.nonce !== nonce || marker.candidateId !== candidateId || marker.profileId !== request.profileId) throw new Error('Durable receipt marker identity mismatch.');
+      fsyncOpenPath(markerPath); fsyncOpenPath(receiptDir); fsyncOpenPath(familyRoot);
+      return { receiptDir, markerPath, generation, nonce, candidateId, profileId: request.profileId };
+    }
+    throw new Error('Unable to allocate unique durable check receipt directory.');
+  };
+}
+
+function buildWorkflowRecoveryOptions(options: ZergControlOptions, persistenceManager: ZergPersistenceManager | undefined, container: ZergStateContainer, isDisposed: () => boolean, onWriter?: (owner: RecoveryWriterOwnerEvidence) => void) {
+  if (options.recovery?.enabled !== true) return undefined;
+  if (!persistenceManager || typeof persistenceManager.acquireRecoveryOwnership !== 'function' || typeof persistenceManager.inspectRecoveryOwnership !== 'function') {
+    throw new Error('Durable recovery requires configured persistenceManager/persistence with recovery ownership support when recovery.enabled is true.');
+  }
+  let acquiredOwner: RecoveryWriterOwnerEvidence | undefined;
+  const assertAuthority = () => {
+    const state = container.read();
+    if (isDisposed() || state.lifecycle === 'disposed' || state.mode.readOnly) throw new Error('Recovery writer blocked by read-only/disposed authority.');
+  };
+  return {
+    enabled: true,
+    ...(options.recovery.inspectNativeSettlement ? { inspectNativeSettlement: options.recovery.inspectNativeSettlement } : {}),
+    durablePort: {
+      acquireWriter(request: { expectedSnapshotHash: string; verifiedDeadOwner?: RecoveryWriterOwnerEvidence }) {
+        assertAuthority();
+        const idle = recoveryWriterIdleChecks.get(container);
+        if (!idle) throw new Error('Authoritative recovery writer wrapper unavailable.');
+        idle();
+        const ownership = persistenceManager.acquireRecoveryOwnership!(request);
+        acquiredOwner = ownership.owner;
+        onWriter?.(ownership.owner);
+        assertAuthority();
+        return ownership.owner;
+      },
+      publishSnapshot(raw: unknown, request: { expectedSnapshotHash: string }) {
+        const publish = recoveryPublications.get(container);
+        if (!publish) throw new Error('Authoritative recovery publication wrapper unavailable.');
+        const base = container.snapshot();
+        let expectedHead = request.expectedSnapshotHash;
+        const checkState = (expectedCanonical: ZergState, recordOnly: boolean) => {
+          const current = container.read();
+          // Record-only authority persists revocations, never grants execution or
+          // accepts a disposed owner. Compare to a captured version, not itself.
+          if (isDisposed() || current.lifecycle === 'disposed' || (!recordOnly && current.mode.readOnly)) throw new Error('Recovery writer blocked by read-only/disposed authority.');
+          if (!isDeepStrictEqual(current, expectedCanonical)) throw new Error('Recovery canonical state changed during publication.');
+        };
+        const inspect = (expectedCanonical: ZergState, recordOnly: boolean) => {
+          checkState(expectedCanonical, recordOnly);
+          const inspection = persistenceManager.inspectRecoveryOwnership!();
+          checkState(expectedCanonical, recordOnly);
+          if (!acquiredOwner || !inspection.ownerValid || inspection.blocker || inspection.claimPresent || !isDeepStrictEqual(inspection.owner, acquiredOwner)
+            || typeof inspection.expectedSnapshotHash !== 'string' || inspection.actualSnapshotHash !== inspection.expectedSnapshotHash) throw new Error('Recovery writer owner/head changed during publication.');
+          return inspection;
+        };
+        const guard: RecoveryPublicationGuard = {
+          check(expectedCanonical = base, recordOnly = false) {
+            if (inspect(expectedCanonical, recordOnly).actualSnapshotHash !== expectedHead) throw new Error('Recovery writer owner/head changed during publication.');
+          },
+          saved(expectedCanonical = base, recordOnly = false) {
+            // The authoritative manager advances its observed head only after save.
+            // Bind all later checks/follow-up recording to that next head/generation.
+            expectedHead = inspect(expectedCanonical, recordOnly).expectedSnapshotHash!;
+          },
+        };
+        guard.check();
+        return publish(raw as ZergState, guard);
+      },
+      ensureWriter() {
+        const ownership = persistenceManager.acquireRecoveryOwnership!();
+        onWriter?.(ownership.owner);
+        return ownership.owner;
+      },
+      inspectOwner() {
+        return persistenceManager.inspectRecoveryOwnership!();
+      },
+      inspectPreviousOwner: inspectPreviousWorkflowOwner,
+    },
+  };
+}
 export function createZergControl(
   stateOrContainer: ZergStateContainer | Partial<ZergState> = createZergStateContainer(),
   options: ZergControlOptions = {},
@@ -405,27 +806,93 @@ export function createZergControl(
   const baseContainer = isZergStateContainer(stateOrContainer)
     ? stateOrContainer
     : createZergStateContainer(seedBuiltinAgentDefinitions(createZergState({ ...options.seedState, ...stateOrContainer })));
-  const persistenceManager = createZergPersistenceManager(options.persistence);
-  persistenceManager?.hydrate(baseContainer, options.now);
-  const container: ZergStateContainer = persistenceManager
+  const associatedPersistenceManager = isZergStateContainer(stateOrContainer) ? ownedPersistenceManagers.get(stateOrContainer) : undefined;
+  const persistenceManager = associatedPersistenceManager ?? createZergPersistenceManager(options.persistence);
+  if (options.recovery?.enabled === true && !persistenceManager) {
+    throw new Error('Durable recovery requires configured persistenceManager/persistence when recovery.enabled is true.');
+  }
+  if (!associatedPersistenceManager && persistenceManager) {
+    persistenceManager.hydrate(baseContainer, options.now);
+  }
+  let startupRecoveryBlock = (options as ZergControlOptions & { startupRecoveryBlock?: StartupRecoveryBlock }).startupRecoveryBlock
+    ?? inspectStartupRecoveryBlock(persistenceManager, options.now);
+  let committingPersistentState = false;
+  let recoveryPublicationGuard: RecoveryPublicationGuard | undefined;
+  let persistentStateCommitPoisoned: Error | undefined;
+  const commitPersistentState = (computeNextState: () => ZergState): ZergState => {
+    if (startupRecoveryBlock) {
+      if (committingPersistentState) throw new Error('Zerg persistence commit already in progress; nested state writes are refused.');
+      committingPersistentState = true;
+      try {
+        const refreshedBlock = inspectStartupRecoveryBlock(persistenceManager, options.now);
+        startupRecoveryBlock = refreshedBlock;
+        if (refreshedBlock) {
+          throw new Error(`Zerg persistence commit unavailable while startup recovery is inert pending trusted recovery ownership: ${refreshedBlock.message}`);
+        }
+      } finally { committingPersistentState = false; }
+    }
+    if (persistentStateCommitPoisoned) {
+      throw new Error(`Zerg persistence commit unavailable after previous failure: ${persistentStateCommitPoisoned.message}`);
+    }
+    if (committingPersistentState) {
+      throw new Error('Zerg persistence commit already in progress; nested state writes are refused.');
+    }
+    committingPersistentState = true;
+    try {
+      const nextState = computeNextState();
+      recoveryPublicationGuard?.check();
+      const intended = snapshotZergState(nextState);
+      persistenceManager!.save(intended, recoveryPublicationGuard ? () => {
+        const time = (options.now ?? (() => new Date()))();
+        recoveryPublicationGuard?.check();
+        return time;
+      } : options.now);
+      recoveryPublicationGuard?.saved();
+      baseContainer.replace(nextState);
+      const canonical = baseContainer.snapshot();
+      // Synchronous revocations remain canonical and must reach disk while the
+      // owned writer is valid. This SAME-manager follow-up is record-only.
+      recoveryPublicationGuard?.check(canonical, true);
+      if (!isDeepStrictEqual(canonical, intended)) {
+        persistenceManager!.save(canonical, recoveryPublicationGuard ? () => {
+          const time = (options.now ?? (() => new Date()))();
+          recoveryPublicationGuard?.check(canonical, true);
+          return time;
+        } : options.now);
+        recoveryPublicationGuard?.saved(canonical, true);
+      }
+      recoveryPublicationGuard?.check(canonical, true);
+      return canonical;
+    } catch (error) {
+      persistentStateCommitPoisoned = recoveryPublicationGuard
+        ? new Error(`Recovery publication failed or is uncertain: ${error instanceof Error ? error.message : String(error)}`)
+        : error instanceof Error ? error : new Error(String(error));
+      throw persistentStateCommitPoisoned;
+    } finally {
+      committingPersistentState = false;
+    }
+  };
+  const container: ZergStateContainer = persistenceManager && !associatedPersistenceManager
     ? {
       read: () => baseContainer.read(),
       snapshot: () => baseContainer.snapshot(),
-      replace: (nextState) => {
-        baseContainer.replace(nextState);
-        const snapshot = baseContainer.snapshot();
-        persistenceManager.save(snapshot, options.now);
-        return snapshot;
-      },
-      update: (nextState, patchOptions) => {
-        baseContainer.update(nextState, patchOptions);
-        const snapshot = baseContainer.snapshot();
-        persistenceManager.save(snapshot, options.now);
-        return snapshot;
-      },
+      replace: (nextState) => commitPersistentState(() => createZergState(nextState)),
+      update: (nextState, patchOptions) => commitPersistentState(() => updateZergState(baseContainer.read(), nextState, patchOptions)),
       subscribe: (listener) => baseContainer.subscribe?.(listener) ?? (() => undefined),
     }
     : baseContainer;
+  if (persistenceManager && !associatedPersistenceManager) {
+    ownedPersistenceManagers.set(container, persistenceManager);
+    recoveryWriterIdleChecks.set(container, () => {
+      if (committingPersistentState || recoveryPublicationGuard || persistentStateCommitPoisoned) throw new Error('Recovery writer nested/poisoned commit refused.');
+    });
+    recoveryPublications.set(container, (state, guard) => {
+      if (committingPersistentState || recoveryPublicationGuard) throw new Error('Recovery publication nested write refused.');
+      recoveryPublicationGuard = guard;
+      try { return container.replace(state); }
+      finally { recoveryPublicationGuard = undefined; }
+    });
+  }
   const nativeTranscriptService = options.nativeTranscriptService ?? createNativeTranscriptService({ getReferences: () => nativeReferences(container) });
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(container, persistenceManager, options.now);
   let disposed = false;
@@ -437,19 +904,47 @@ export function createZergControl(
   // Lazy ledger initialization preserves ordinary control construction/revisions.
   let service: WorkflowService | undefined;
   let initializing = false;
+  let workflowRecoveryOwner: RecoveryWriterOwnerEvidence | undefined;
   const getService = () => {
-    if (disposed) throw new Error('Workflow service disposed.');
+    if (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.()) throw new Error('Workflow service disposed.');
     if (service) return service;
     // Construction publishes the ledger synchronously; nested reads must not create another owner.
     if (initializing) throw new Error('Workflow service initializing; nested request refused.');
     initializing = true;
     try {
-      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding: options.coding });
+      const recovery = buildWorkflowRecoveryOptions(options, persistenceManager, container, () => disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.() === true, (owned) => { workflowRecoveryOwner = owned; });
+      const coding = options.recovery?.enabled === true && options.coding?.enabled === true && typeof options.coding.allocateCheckReceipt !== 'function' && persistenceManager
+        ? { ...options.coding, allocateCheckReceipt: createDefaultWorkflowCheckAllocator(container, persistenceManager, options.coding, () => workflowRecoveryOwner) }
+        : options.coding;
+      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding, recovery });
     } finally { initializing = false; }
   };
+  // Reading a capability must not construct/persist an empty workflow ledger.
+  // Only trusted authorization of an exact existing run resolves its owner.
+  const recoveryProxy: WorkflowService['recovery'] = options.recovery?.enabled === true ? {
+    prepare: (workflowRunId, selections) => workflowService.execute({ action: 'workflows.recovery.prepare', workflowRunId, ...(selections !== undefined ? { selections } : {}) }),
+    async authorize(request, signal) {
+      const failure = (error: string) => ({ ok: false, action: 'workflows.recovery.prepare' as const, error });
+      if (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.()) return failure('Workflow service disposed.');
+      if (signal?.aborted) return failure('Caller already cancelled.');
+      const current = container.read();
+      if (current.mode.readOnly) return failure('Read-only caller state blocks recovery authorization.');
+      const ledger = current.extensions.workflows as { runs?: { workflowRunId?: unknown }[] } | undefined;
+      if (!ledger || !Array.isArray(ledger.runs) || !ledger.runs.some(run => run?.workflowRunId === request.workflowRunId)) {
+        return failure('Workflow run not found; recovery authorization does not initialize a ledger.');
+      }
+      return getService().recovery!.authorize(request, signal);
+    },
+  } : undefined;
   const workflowService: WorkflowService = {
-    execute: (action, signal) => getService().execute(action, signal), list: () => getService().list(),
-    get: (id) => getService().get(id), get approvals() { return getService().approvals; }, subscribe: (listener) => getService().subscribe(listener),
+    execute: (action, signal) => {
+      if ((action.action === 'workflows.recovery.inspect' || action.action === 'workflows.recovery.prepare') && container.read().extensions.workflows === undefined) {
+        return Promise.resolve({ ok: false, action: action.action, error: 'Workflow run not found; recovery inspection does not initialize a ledger.' });
+      }
+      return getService().execute(action, signal);
+    }, list: () => getService().list(),
+    get: (id) => getService().get(id), get approvals() { return getService().approvals; },
+    get recovery() { return recoveryProxy; }, subscribe: (listener) => getService().subscribe(listener),
     dispose: () => service?.dispose(), drain: async () => { await service?.drain(); },
   };
   runtimeOptions.workflowService = workflowService;
@@ -463,6 +958,9 @@ export function createZergControl(
     },
     get workflowApprovals() {
       return workflowService.approvals;
+    },
+    get workflowRecovery(): WorkflowTrustedRecoveryApi | undefined {
+      return workflowService.recovery;
     },
     async drain() {
       const settled = await Promise.allSettled([workflowService.drain(), owner?.drain()]);
@@ -574,7 +1072,7 @@ async function executeZergControlAction(
             logs: getZergLogState(snapshot).records.length,
             runs: getSubagentRunSnapshots(snapshot).length,
           },
-          persistence: options.persistenceManager?.info ?? { enabled: false },
+          persistence: { ...(options.persistenceManager?.info ?? { enabled: false }), startupRecovery: startupRecoveryStatus(inspectStartupRecoveryBlock(options.persistenceManager, options.now)) },
         }, renderStatusLine(snapshot, { width: PI_COMMAND_OUTPUT_WIDTH }), snapshot.revision);
       }
       case 'agents.list': {
@@ -822,7 +1320,7 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
   const definition: StructuralPiToolDefinition = {
     name: 'zerg_control',
     label: 'Zerg control',
-    description: 'Structured pi-zerg-swarm control API for status, agents, teams, runs, logs, interrupts, and declarative read-only workflows.',
+    description: 'Structured pi-zerg-swarm control API for status, agents, teams, runs, logs, interrupts, declarative read-only workflows, and non-executing recovery inspection and artifact assessment. Recovery prepare is not authorization and cannot execute recovered work.',
     promptSnippet: 'Control pi-zerg-swarm through structured actions without slash-command or terminal automation.',
     promptGuidelines: ['Use zerg_control for pi-zerg-swarm automation instead of driving /zerg through a terminal.'],
     parameters: {
@@ -832,7 +1330,8 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
         action: { type: 'string' },
         definition: { type: 'object', description: 'Bounded declarative workflow definition for workflows.define; no code or arbitrary tools.' },
         definitionId: { type: 'string', description: 'Workflow definition identity for workflows.show/start.' },
-        workflowRunId: { type: 'string', description: 'Exact workflow attempt identity for show/pause/resume/cancel/retry/report/forget.' },
+        workflowRunId: { type: 'string', maxLength: 160, description: 'Exact workflow attempt identity for show/pause/resume/cancel/retry/report/forget/recovery inspect/prepare; no fallback.' },
+        selections: { type: 'object', additionalProperties: false, description: 'Optional read-only recovery projection selections for workflows.recovery.prepare only; prepare is not authorization and cannot execute recovered work.', properties: { reuseUnitIds: { type: 'array', maxItems: 256, items: { type: 'string', minLength: 1, maxLength: 160 } }, rerunUnitIds: { type: 'array', maxItems: 256, items: { type: 'string', minLength: 1, maxLength: 160 } } } },
         inputs: { description: 'Schema-validated bounded JSON data for workflows.start; never permissions.' },
         targetId: { type: 'string' },
         body: { type: 'string' },
@@ -853,10 +1352,10 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
       required: ['action'],
     },
     async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
-      const action = parseZergControlToolParams(params);
-      const result = action.ok
-        ? await control.execute(action.action, signal)
-        : controlError('status', 'invalid_request', action.message, control.getState().revision);
+      const parsedAction = parseZergControlToolParams(params);
+      const result = parsedAction.ok
+        ? await control.execute(parsedAction.action, signal)
+        : controlError('status', 'invalid_request', parsedAction.message, control.getState().revision);
       return {
         content: [{ type: 'text', text: result.output ?? JSON.stringify(result.data ?? result.error ?? {}, null, 2) }],
         isError: !result.ok,
@@ -870,13 +1369,17 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
 }
 
 function parseZergControlToolParams(params: unknown): { ok: true; action: ZergControlAction } | { ok: false; message: string } {
-  if (!params || typeof params !== 'object' || typeof (params as { action?: unknown }).action !== 'string') {
+  if (!params || typeof params !== 'object' || Array.isArray(params) || typeof (params as { action?: unknown }).action !== 'string') {
     return { ok: false, message: 'zerg_control requires an object with action.' };
   }
 
   const actionName = (params as { action: string }).action;
   if (!isZergControlActionName(actionName)) {
     return { ok: false, message: `Unknown zerg_control action: ${actionName}` };
+  }
+
+  if (actionName === 'workflows.recovery.inspect' || actionName === 'workflows.recovery.prepare') {
+    return parseRecoveryControlToolAction(params as Record<string, unknown>, actionName);
   }
 
   if (actionName === 'message') {
@@ -887,6 +1390,50 @@ function parseZergControlToolParams(params: unknown): { ok: true; action: ZergCo
   }
 
   return { ok: true, action: params as ZergControlAction };
+}
+
+function parseRecoveryControlToolAction(params: Record<string, unknown>, actionName: 'workflows.recovery.inspect' | 'workflows.recovery.prepare'): { ok: true; action: ZergControlAction } | { ok: false; message: string } {
+  const allowed = new Set(actionName === 'workflows.recovery.inspect' ? ['action', 'workflowRunId'] : ['action', 'workflowRunId', 'selections']);
+  const extra = Object.keys(params).filter((key) => !allowed.has(key) && params[key] !== undefined);
+  if (extra.length > 0) return { ok: false, message: `${actionName} accepts only ${[...allowed].join(', ')}; recovery prepare is not authorization.` };
+  const workflowRunId = params.workflowRunId;
+  if (typeof workflowRunId !== 'string' || workflowRunId.length < 1 || workflowRunId.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(workflowRunId)) {
+    return { ok: false, message: `${actionName} requires exactly one workflowRunId string (1..160, valid identifier); no fallback identity is used.` };
+  }
+  if (actionName === 'workflows.recovery.inspect') return { ok: true, action: { action: actionName, workflowRunId } };
+  const parsedSelections = parseRecoverySelections(params.selections);
+  if (parsedSelections.ok === false) return { ok: false, message: parsedSelections.message };
+  return { ok: true, action: parsedSelections.selections ? { action: actionName, workflowRunId, selections: parsedSelections.selections } : { action: actionName, workflowRunId } };
+}
+
+function parseRecoverySelections(raw: unknown): { ok: true; selections?: { reuseUnitIds?: string[]; rerunUnitIds?: string[] } } | { ok: false; message: string } {
+  if (raw === undefined) return { ok: true };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, message: 'recovery selections must be an object with reuseUnitIds/rerunUnitIds arrays.' };
+  const value = raw as Record<string, unknown>;
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined);
+  if (keys.some((key) => key !== 'reuseUnitIds' && key !== 'rerunUnitIds')) return { ok: false, message: 'Unknown recovery selection field; use reuseUnitIds and rerunUnitIds only.' };
+  const parseIds = (field: 'reuseUnitIds' | 'rerunUnitIds'): string[] | string => {
+    const current = value[field];
+    if (current === undefined) return [];
+    if (!Array.isArray(current) || current.length > 256) return `${field} must be an array of at most 256 string IDs.`;
+    const ids: string[] = [];
+    for (const entry of current) {
+      if (typeof entry !== 'string' || entry.length < 1 || entry.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/.test(entry)) return `${field} must contain bounded valid unit IDs up to 160 characters.`;
+      ids.push(entry);
+    }
+    if (new Set(ids).size !== ids.length) return `${field} must not contain duplicate IDs.`;
+    return ids;
+  };
+  const reuse = parseIds('reuseUnitIds');
+  if (typeof reuse === 'string') return { ok: false, message: reuse };
+  const rerun = parseIds('rerunUnitIds');
+  if (typeof rerun === 'string') return { ok: false, message: rerun };
+  const reuseSet = new Set(reuse);
+  if (rerun.some((id) => reuseSet.has(id))) return { ok: false, message: 'reuseUnitIds and rerunUnitIds must be disjoint.' };
+  const selections: { reuseUnitIds?: string[]; rerunUnitIds?: string[] } = {};
+  if (reuse.length) selections.reuseUnitIds = reuse;
+  if (rerun.length) selections.rerunUnitIds = rerun;
+  return Object.keys(selections).length ? { ok: true, selections } : { ok: true, selections: {} };
 }
 
 function isZergControlActionName(value: string): value is ZergControlAction['action'] {
@@ -3799,10 +4346,20 @@ function createPiNativeAdapter(
 ): ZergSubagentControlAdapter {
   const activeRuns: PiNativeActiveRunRegistry = new Map();
   let disposed = false;
-  const persistenceManager = options.persistenceManager ?? createZergPersistenceManager(options.persistence);
+  const associatedManager = ownedPersistenceManagers.get(container);
+  const persistenceManager = associatedManager ?? options.persistenceManager ?? createZergPersistenceManager(options.persistence);
   const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
-  persistenceManager?.hydrate(container, runtimeOptions.now);
-  persistenceManager?.save(container.read(), runtimeOptions.now);
+  // An authoritative host wrapper already hydrated this exact manager/container.
+  // Rehydrating would publish through its writer before fresh recovery ownership;
+  // an independent save would bypass its startup inert block and single-save path.
+  if (!associatedManager) {
+    persistenceManager?.hydrate(container, runtimeOptions.now);
+    if (!inspectStartupRecoveryBlock(persistenceManager, runtimeOptions.now)) persistenceManager?.save(container.read(), runtimeOptions.now);
+  } else if (options.recovery?.enabled !== true && !inspectStartupRecoveryBlock(persistenceManager, runtimeOptions.now)) {
+    // Preserve ordinary opt-in native-reference recovery persistence, through
+    // the authoritative wrapper once and without rehydrating its timestamps.
+    container.replace(container.read());
+  }
   installNativeContinuationService(context, container, runtimeOptions, activeRuns, () => disposed);
   options.nativeContinuationService ??= runtimeOptions.nativeContinuationService;
   const workflowOwner = createOwnedWorkflowNative(context, container, runtimeOptions, activeRuns, () => disposed);
@@ -3970,7 +4527,9 @@ function createPiNativeAdapter(
       }
       for (const activeRun of activeRuns.values()) activeRun.disposed = true;
       activeRuns.clear();
-      persistenceManager?.save(container.read(), runtimeOptions.now);
+      // Wrapped containers persist their own canonical cleanup transitions. Never
+      // bypass that writer (or its poison/startup-inert guard) with an extra save.
+      if (!associatedManager && !inspectStartupRecoveryBlock(persistenceManager, runtimeOptions.now)) persistenceManager?.save(container.read(), runtimeOptions.now);
       if (firstError) throw firstError;
     },
   };
@@ -5613,7 +6172,7 @@ export function createPiZergCommandHandler(
             const reply = await service.execute(monitor[1] ? { action: 'workflows.show', workflowRunId: monitor[1] } : { action: 'workflows.list' });
             context.ui?.notify?.(JSON.stringify(reply), reply.ok ? 'info' : 'error'); return;
           }
-          await openZergWorkflowOverlay(context, { service, workflowRunId: monitor[1], onOpenNative: async (identity) => {
+          await openZergWorkflowOverlay(context, { service, recoveryAuthority: service.recovery, workflowRunId: monitor[1], onOpenNative: async (identity) => {
             const correlations = service.list().flatMap((view) => view.correlations);
             const run = getSubagentRunSnapshot(container.read(), identity.runId);
             if (!correlations.some((unit) => unit.native?.runId === identity.runId && unit.native.taskId === identity.taskId) || run?.taskId !== identity.taskId) throw new Error('Exact workflow/native correlation is no longer current.');
@@ -5627,7 +6186,7 @@ export function createPiZergCommandHandler(
           } }); return;
         }
         const parsed = parseWorkflowCommand(routed);
-        if (!parsed) throw new Error('Usage: /zerg workflows list|define <JSON>|start <JSON>|show <JSON>|pause|resume|cancel|retry|report|forget <workflowRunId>|monitor [workflowRunId]|approve <workflowRunId> <approvalId>');
+        if (!parsed) throw new Error('Usage: /zerg workflows list|define <JSON>|start <JSON>|show <JSON>|pause|resume|cancel|retry|report|forget <workflowRunId>|recovery inspect <workflowRunId>|recovery prepare <workflowRunId>|monitor [workflowRunId]|approve <workflowRunId> <approvalId>');
         const reply = await executeZergControlAction(container, parsed, runtimeOptions);
         context.ui?.notify?.(reply.output ?? reply.error?.message ?? 'Workflow outcome unavailable.', reply.ok ? 'info' : 'error');
       } catch (error) { context.ui?.notify?.(workflowFailure(error), 'error'); }
@@ -6211,7 +6770,7 @@ function workflowMessageTuple(key: { parentRunId: string; memberRunId: string; p
   return JSON.stringify([key.parentRunId, key.memberRunId, key.piSessionId]);
 }
 const WORKFLOW_READ_TOOLS = new Set(['read', 'grep', 'find', 'ls']);
-const WORKFLOW_ACTION_NAMES = new Set(['workflows.list', 'workflows.define', 'workflows.show', 'workflows.start', 'workflows.pause', 'workflows.resume', 'workflows.cancel', 'workflows.retry', 'workflows.report', 'workflows.forget']);
+const WORKFLOW_ACTION_NAMES = new Set(['workflows.list', 'workflows.define', 'workflows.show', 'workflows.start', 'workflows.pause', 'workflows.resume', 'workflows.cancel', 'workflows.retry', 'workflows.report', 'workflows.forget', 'workflows.recovery.inspect', 'workflows.recovery.prepare']);
 
 function workflowFailure(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 1024);
@@ -6395,7 +6954,15 @@ async function approveWorkflowInteractively(approvals: WorkflowTrustedApprovalAp
 }
 
 function parseWorkflowCommand(input: string): WorkflowAction | undefined {
-  const match = /^workflows\s+(\S+)(?:\s+([\s\S]*))?$/i.exec(input.trim());
+  const trimmed = input.trim();
+  const recovery = /^workflows\s+recovery\s+(inspect|prepare)\s+(\S+)\s*$/i.exec(trimmed);
+  if (recovery) {
+    const workflowRunId = recovery[2]!;
+    if (workflowRunId.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(workflowRunId)) throw new Error('Usage: workflow recovery inspect|prepare requires exactly one valid workflowRunId up to 160 characters.');
+    return { action: `workflows.recovery.${recovery[1]!.toLowerCase()}` as 'workflows.recovery.inspect' | 'workflows.recovery.prepare', workflowRunId };
+  }
+  if (/^workflows\s+recovery(?:\s|$)/i.test(trimmed)) return undefined;
+  const match = /^workflows\s+(\S+)(?:\s+([\s\S]*))?$/i.exec(trimmed);
   if (!match) return undefined;
   const action = `workflows.${match[1]!.toLowerCase()}`;
   const body = match[2]?.trim() ?? '';
@@ -6412,6 +6979,6 @@ function parseWorkflowCommand(input: string): WorkflowAction | undefined {
     const value = JSON.parse(body);
     return { ...value, action };
   }
-  if (!body || /\s/.test(body)) return undefined;
+  if (!body || /\s/.test(body) || body.length > 256) return undefined;
   return { action: action as 'workflows.pause', workflowRunId: body };
 }

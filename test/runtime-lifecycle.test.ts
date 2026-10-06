@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { isDeepStrictEqual } from 'node:util';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +7,7 @@ import test from 'node:test';
 import ts from 'typescript';
 import { createZergControl, registerZergSwarmExtension } from '../index.js';
 import { createZergPersistenceManager } from '../persistence.js';
-import { applyRuntimeTransition, createZergState, createZergStateContainer, getZergLogs, readSharedZergState, replaceSharedZergState, upsertTask } from '../state.js';
+import { applyRuntimeTransition, createZergState, createZergStateContainer, getZergLogs, readSharedZergState, replaceSharedZergState, snapshotZergState, updateZergState, upsertTask } from '../state.js';
 import type { ZergState, ZergStateContainer, ZergSubagentControlAdapter } from '../types.js';
 
 const ids = { runId: () => 'zerg-runtime-test', taskId: () => 'task-runtime-test' };
@@ -48,42 +49,39 @@ for (const method of ['replace', 'update'] as const) {
 // Pure exact-source extraction avoids adding public test seams or starting SDKs.
 const indexSource = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
 const parsed = ts.createSourceFile('index.ts', indexSource, ts.ScriptTarget.ES2022, true);
-function declaration(name: string, ownerName: string): ts.VariableDeclaration {
-  let found: ts.VariableDeclaration | undefined;
-  const visit = (node: ts.Node) => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) found = node;
-    ts.forEachChild(node, visit);
-  };
-  const owner = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === ownerName);
-  assert.ok(owner, `Exact source owner missing: ${ownerName}`);
-  visit(owner);
-  assert.ok(found, `Exact source declaration missing: ${name}`);
-  return found;
-}
-function compileExpression(node: ts.Node, parameters: string[]): (...args: unknown[]) => unknown {
-  const source = `const extracted = ${node.getText(parsed)};`;
-  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
-  return new Function(...parameters, `${js}\nreturn extracted;`) as (...args: unknown[]) => unknown;
-}
 function extractControlPersistenceWrapper(container: ZergStateContainer, snapshotFile: string): ZergStateContainer {
-  const initializer = declaration('container', 'createZergControl').initializer;
-  assert.ok(initializer && ts.isConditionalExpression(initializer));
-  const make = compileExpression(initializer.whenTrue, ['baseContainer', 'persistenceManager', 'options']);
+  const owner = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'createZergControl');
+  assert.ok(owner, 'createZergControl source missing');
+  const statements = owner.body?.statements ?? [];
+  const start = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'committingPersistentState'));
+  const end = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'container'));
+  assert.ok(start >= 0 && end >= start, 'persistence wrapper source block missing');
+  const source = `${statements.slice(start, end + 1).map((node) => node.getText(parsed)).join('\n')}\nreturn container;`;
+  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   // Use the actual persistence implementation, not a handwritten save stand-in.
-  return make(container, createPersistence(snapshotFile), {}) as ZergStateContainer;
+  return new Function('startupRecoveryBlock', 'baseContainer', 'persistenceManager', 'options', 'createZergState', 'updateZergState', 'snapshotZergState', 'isDeepStrictEqual', 'associatedPersistenceManager', js)(undefined, container, createPersistence(snapshotFile), {}, createZergState, updateZergState, snapshotZergState, isDeepStrictEqual, undefined) as ZergStateContainer;
 }
 function createPersistence(snapshotFile: string) { return createZergPersistenceManager({ snapshotFile }); }
+
+function extractRegistrationPersistenceWrapper(container: ZergStateContainer, persistenceManager: ReturnType<typeof createZergPersistenceManager>, syncSharedStateFromContainer: () => void): ZergStateContainer {
+  const owner = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'registerZergSwarmExtension');
+  assert.ok(owner, 'registerZergSwarmExtension source missing');
+  const statements = owner.body?.statements ?? [];
+  const start = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'committingPersistentState'));
+  const end = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'syncedStateContainer'));
+  assert.ok(start >= 0 && end >= start, 'registration persistence wrapper source block missing');
+  const source = `${statements.slice(start, end + 1).map((node) => node.getText(parsed)).join('\n')}\nreturn syncedStateContainer;`;
+  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  return new Function('startupRecoveryBlock', 'stateContainer', 'persistenceManager', 'options', 'syncSharedStateFromContainer', 'createZergState', 'updateZergState', 'snapshotZergState', 'isDeepStrictEqual', 'ownedPersistenceManagers', js)(undefined, container, persistenceManager, {}, syncSharedStateFromContainer, createZergState, updateZergState, snapshotZergState, isDeepStrictEqual, new WeakMap()) as ZergStateContainer;
+}
 
 for (const method of ['replace', 'update'] as const) {
   test(`registration persistence wrapper saves canonical reentrant ${method}`, () => {
     const root = mkdtempSync(join(tmpdir(), 'zerg-runtime-registration-'));
     const container = createZergStateContainer(seed());
     const snapshotFile = join(root, 'state.json');
-    const initializer = declaration('syncedStateContainer', 'registerZergSwarmExtension').initializer;
-    assert.ok(initializer);
-    const make = compileExpression(initializer, ['stateContainer', 'persistenceManager', 'options', 'syncSharedStateFromContainer']);
     let shared: ZergState | undefined;
-    const wrapped = make(container, createPersistence(snapshotFile), {}, () => { shared = container.snapshot(); }) as ZergStateContainer;
+    const wrapped = extractRegistrationPersistenceWrapper(container, createPersistence(snapshotFile), () => { shared = container.snapshot(); });
     let reentered = false;
     const unsubscribe = container.subscribe!(() => {
       if (reentered) return;
@@ -227,6 +225,29 @@ for (const failAt of ['command', 'shutdown-hook'] as const) {
     } finally { replaceSharedZergState(shared); }
   });
 }
+
+test('registered control shares owner persistence after startup publication and workflow reads', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'zerg-runtime-owner-persist-'));
+  const snapshotFile = join(root, 'state.json');
+  const shared = readSharedZergState();
+  const bus = eventBus();
+  replaceSharedZergState(seed());
+  const registration = registerZergSwarmExtension({ events: bus, registerCommand() { return { dispose() {} }; } }, { persistence: { snapshotFile }, subagentAdapter: fakeAdapter() });
+  try {
+    bus.emit('startup:observed');
+    const created = await registration.control.execute({ action: 'agents.create', id: 'extra', prompt: 'Extra.' });
+    assert.equal(created.ok, true);
+    const listed = await registration.control.execute({ action: 'workflows.list' });
+    assert.equal(listed.ok, true);
+    const saved = JSON.parse(readFileSync(snapshotFile, 'utf8')) as { state: ZergState };
+    assert.equal(saved.state.agentDefinitions.extra?.prompt, 'Extra.');
+    assert.equal(registration.control.getState().agentDefinitions.extra?.prompt, 'Extra.');
+  } finally {
+    registration.dispose();
+    replaceSharedZergState(shared);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('startup rollback attempts supplied adapter disposal even when it throws', () => {
   const shared = readSharedZergState();
