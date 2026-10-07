@@ -1873,12 +1873,18 @@ function cloneExtensionValue(value: unknown, context: CloneExtensionContext = cr
 function cloneExtensionRecordEntries(record: Record<string, unknown>, context: CloneExtensionContext, depth: number): ZergExtensionFields {
   const output: ZergExtensionFields = {};
   for (const [key, nested] of Object.entries(record)) {
-    Object.defineProperty(output, key, {
-      value: cloneExtensionValue(nested, context, depth + 1),
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    });
+    const value = cloneExtensionValue(nested, context, depth + 1);
+    // This fresh plain output is not exposed during recursion. Assignment makes
+    // the same own data property unless a key is inherited; keep DefineProperty
+    // for those keys (including __proto__) to bypass setters/nonwritable values.
+    // Check after cloning, since source getters can change Object.prototype.
+    // Inherited get/set fields also affect the original descriptor literal:
+    // preserve their conversion callbacks and errors, even for undefined values.
+    if (key in output || 'get' in Object.prototype || 'set' in Object.prototype) {
+      Object.defineProperty(output, key, { value, enumerable: true, configurable: true, writable: true });
+    } else {
+      output[key] = value;
+    }
   }
   return output;
 }

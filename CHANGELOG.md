@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.20] - 2026-10-07
+
+### Added
+
+- A foreground Linux-local `pi-zerg-automation` runner for explicitly enabled, hash-approved read-only workflow profiles. Strict four-field UTC occurrence requests carry no task, input, model, permission, or approval overrides; fixed inputs and the full potential graph are validated from trusted configuration.
+- Isolated state/session/agent locations, same-manager exclusive ownership, atomic event-to-attempt reservation before native scheduling, historical duplicate/conflict inspection, bounded retention with monotonic rejection/rate/clock floors, and no queue, catch-up, replay or unsafe takeover.
+- Reviewed custom scoped UTF-8 reading through public Pi SDK APIs with sealed resources, one explicit physical model/thinking policy, environment credential references, pinned safe model metadata, and cumulative read/admission/provider-preparation/runtime/output bounds.
+- Public profile/hash, admission and runner APIs; complete disabled-profile setup, manual foreground commands and a disarmed stable-occurrence external-wrapper example. Scheduler installation, publication, hard spending guarantees, OS sandboxing and DLP remain outside scope.
+
+### Fixed
+
+- Keep foreground automation alive through deadline cancellation and cleanup; persist final outcomes before the last settled owner release, and retain uncertainty instead of claiming reconnection or closure.
+- Hard quota refusals cancel the bound run so failed delivery cannot become a successful duplicate. Inert recovery evidence verifies the already-prepared writer without reacquisition; ordinary internal persistence ownership and conservative unknown/nonreusable source semantics remain unchanged.
+
 ## [1.1.19] - 2026-10-06
 
 ### Added

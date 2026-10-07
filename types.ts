@@ -1,8 +1,24 @@
 import type { WorkflowAction } from './workflow-model.js';
+
+/** Trusted foreground automation capabilities. NEVER serialized or recovered from state. */
+export interface TrustedAutomationNativeContext {
+  readonly cwd: string;
+  readonly agentDir: string;
+  readonly sessionDir: string;
+  readonly preflightedModelRuntime: import('@earendil-works/pi-coding-agent').ModelRuntime;
+  /** Non-consuming synchronous logical path/policy validation; grants no read capability. */
+  readonly scopedAccess: (path: string) => void;
+  /** ONLY consuming text delivery. Enforce finite nofollow scope/identity on every call. */
+  readonly scopedRead: (path: string) => string;
+  readonly assertPolicy: () => void;
+  /** Request preparations, not transport requests or spend. */
+  readonly beforeProviderRequest: () => void;
+  readonly expectedThinkingLevel: string;
+}
 export type { WorkflowAction, WorkflowDefinition, WorkflowRun, WorkflowView, WorkflowReply, WorkflowNativeLineage } from './workflow-model.js';
 
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.19' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.20' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];

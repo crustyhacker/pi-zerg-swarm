@@ -232,7 +232,10 @@ function extractControlPersistenceWrapper(baseContainer: ZergStateContainer, sna
   const start = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'committingPersistentState'));
   const end = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'container'));
   assert.ok(start >= 0 && end >= start, 'persistence wrapper source block missing');
-  const source = `${statements.slice(start, end + 1).map((node) => node.getText(parsed)).join('\n')}\nreturn container;`;
+  const preparedStart = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'preparedOwner'));
+  const preparedEnd = statements.findIndex((node) => ts.isVariableStatement(node) && node.declarationList.declarations.some((decl) => ts.isIdentifier(decl.name) && decl.name.text === 'assertPreparedOwner'));
+  assert.ok(preparedStart >= 0 && preparedEnd >= preparedStart, 'prepared owner initialization source missing');
+  const source = `${[...statements.slice(preparedStart, preparedEnd + 1), ...statements.slice(start, end + 1)].map((node) => node.getText(parsed)).join('\n')}\nreturn container;`;
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const persistenceManager = persistenceOverride ?? createZergPersistenceManager({ snapshotFile });
   return new Function('startupRecoveryBlock', 'baseContainer', 'persistenceManager', 'options', 'createZergState', 'updateZergState', 'snapshotZergState', 'isDeepStrictEqual', 'associatedPersistenceManager', js)(undefined, baseContainer, persistenceManager, {}, createZergState, updateZergState, snapshotZergState, isDeepStrictEqual, undefined) as ZergStateContainer;

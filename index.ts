@@ -9,8 +9,8 @@ import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type RecoveryWriterOwnerEvidence, type ZergPersistenceManager } from './persistence.js';
 import { createWorkflowService } from './workflow-runtime.js';
 import { profileHash as codingCheckProfileHash } from './workflow-checks.js';
-import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowStepEntries, workflowHash, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowServiceOptions, type WorkflowTrustedApprovalApi, type WorkflowTrustedRecoveryApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
-export type { WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
+import { WORKFLOW_EXTENSION_KEY, WORKFLOW_LIMITS, normalizeWorkflowAgent, workflowStepEntries, workflowHash, type TrustedWorkflowServiceOptions, type WorkflowAction, type WorkflowNativePort, type WorkflowNativeRequest, type WorkflowNativeOutcome, type WorkflowService, type WorkflowServiceOptions, type WorkflowTrustedApprovalApi, type WorkflowTrustedRecoveryApi, type WorkflowTrustedCodingConfig } from './workflow-model.js';
+export type { TrustedWorkflowServiceOptions, WorkflowDefinition, WorkflowAction, WorkflowReply, WorkflowView, WorkflowRun, WorkflowBinding, WorkflowRef, WorkflowSchema, WorkflowCondition, WorkflowIterationRun } from './workflow-model.js';
 import { createWorkflowScriptControlOwner, executeWorkflowScriptAction, isWorkflowScriptActionName, parseWorkflowScriptAction, WORKFLOW_SCRIPT_COMMAND_BYTES, type WorkflowScriptControlOwner } from './workflow-script-controls.js';
 import type { WorkflowScriptAction } from './workflow-script-format.js';
 export type { WorkflowScriptAction, WorkflowScriptAuthoring, WorkflowScriptDiagnostic, WorkflowScriptInspection, WorkflowScriptSpan, WorkflowScriptStepSource, WorkflowScriptPhase } from './workflow-script-format.js';
@@ -30,7 +30,7 @@ import { openZergTeamTimeline } from './ui/team-timeline.js';
 import { openZergManagementOverlay } from './ui/management-overlay.js';
 import { renderZergTimeline, renderNativeSessionReferences, renderAgentDefinitionSummary, renderAgentDefinitionsList, renderAgentTree, renderHelp, renderMonitor, renderPermissionQueueList, renderPermissionQueueStatus, renderStatusLine, renderZergLogList, renderZergLogStatus, renderZergLogSummary, renderZergManagementOverlay, renderZergSubagentRunList, renderZergSubagentRunSummary, type ZergManagementOverlayRow } from './render.js';
 import { appendZergLogRecord, applyInterventionRecord, applyModeTransition, applyRuntimeTransition, createZergState, createZergStateContainer, updateZergState, createZergSubagentRunSnapshot, enqueuePermissionRequest, getAgentDefinition, getAgentDefinitions, getPendingPermissionRequests, getPermissionQueueState, getSubagentRunSnapshot, getSubagentRunSnapshots, getZergLogs, getZergLogState, readSharedZergState, removeAgentDefinition, replaceSharedZergState, resolvePermissionRequest, seedBuiltinAgentDefinitions, snapshotZergState, upsertAgentDefinition, upsertTask, type ZergLogFilter } from './state.js';
-import { ZERG_COMMANDS, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference, type ZergTimelineFilter, type ZergSessionMessageKey } from './types.js';
+import { ZERG_COMMANDS, type TrustedAutomationNativeContext, type AgentKind, type AgentStatus, type AutomationMode, type PermissionModeTransitionInput, type StructuralPiCommand, type StructuralPiCommandContext, type StructuralPiCommandOptions, type StructuralPiExtensionContext, type StructuralPiToolDefinition, type StructuralPiTuiHandle, type TeamKind, type ZergAgentDefinition, ZERG_EXTENSION_VERSION, type ZergCommandName, type ZergCommandResult, type ZergConfigOverlayTab, type ZergControl, type ZergControlAction, type ZergControlController, type ZergControlResult, type ZergControlState, type ZergInternalPatchController, type ZergLifecycleSubstate, type ZergManagementTargetKind, type ZergOperatorMessageDeliveryStatus, type ZergOperatorMessageMode, type ZergOperatorMessageResult, type ZergPersistenceOptions, type ZergPermissionDecision, type ZergPermissionRequestKind, type ZergPiCommandHandler, type ZergRuntimeEntity, type ZergRuntimeTransition, type ZergRuntimeTransitionAction, type ZergState, type ZergStateContainer, type ZergSubagentControlAdapter, type ZergSubagentLaunchMode, type ZergSubagentLaunchRequest, type ZergSubagentRunSnapshot, type ZergNativeSessionReference, type ZergTimelineFilter, type ZergSessionMessageKey } from './types.js';
 
 type ZergIdFactory = {
   runId?: () => string;
@@ -61,7 +61,7 @@ export interface ZergCommandHandlerOptions {
   };
 }
 
-type RuntimeCommandOptions = ZergCommandHandlerOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; workflowScriptOwner?: WorkflowScriptControlOwner; startupRecoveryBlock?: StartupRecoveryBlock };
+type RuntimeCommandOptions = ZergControlOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; workflowScriptOwner?: WorkflowScriptControlOwner; startupRecoveryBlock?: StartupRecoveryBlock };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -391,7 +391,9 @@ export function registerZergSwarmExtension(
   const sessionMessageService = options.sessionMessageService ?? createOwnedMessageService(syncedStateContainer, persistenceManager, options.now);
   const runtimeOptions = { ...options, syncSharedState: true, persistenceManager, nativeTranscriptService, sessionMessageService, startupRecoveryBlock, isOwnerDisposed: () => disposed } as RuntimeCommandOptions;
   const subagentAdapter = options.subagentAdapter ?? createPiSlashBridgeAdapter(context, syncedStateContainer, runtimeOptions);
-  const control = createZergControl(syncedStateContainer, { ...runtimeOptions, subagentAdapter });
+  // The registered wrapper already owns this internal manager/commit path. Do not
+  // reinterpret runtime plumbing as the standalone externally prepared option.
+  const control = createZergControl(syncedStateContainer, { ...runtimeOptions, persistenceManager: undefined, subagentAdapter });
   runtimeOptions.workflowService = workflowControlServices.get(control);
   runtimeOptions.workflowScriptOwner = workflowScriptControlOwners.get(control);
 
@@ -561,6 +563,10 @@ const PI_COMMAND_OUTPUT_WIDTH = 240;
 export interface ZergControlOptions extends ZergCommandHandlerOptions {
   seedState?: Partial<ZergState>;
   syncSharedState?: boolean;
+  /** Host-prepared SAME manager, acquired before construction. Runner owns final release. */
+  persistenceManager?: ZergPersistenceManager;
+  trustedWorkflow?: TrustedWorkflowServiceOptions;
+  trustedAutomationNative?: TrustedAutomationNativeContext;
 }
 
 function createOwnedMessageService(container: ZergStateContainer, persistenceManager: ZergPersistenceManager | undefined, now?: () => Date): SessionMessageService {
@@ -738,7 +744,7 @@ function createDefaultWorkflowCheckAllocator(container: ZergStateContainer, pers
   };
 }
 
-function buildWorkflowRecoveryOptions(options: ZergControlOptions, persistenceManager: ZergPersistenceManager | undefined, container: ZergStateContainer, isDisposed: () => boolean, onWriter?: (owner: RecoveryWriterOwnerEvidence) => void) {
+function buildWorkflowRecoveryOptions(options: ZergControlOptions, persistenceManager: ZergPersistenceManager | undefined, container: ZergStateContainer, isDisposed: () => boolean, onWriter?: (owner: RecoveryWriterOwnerEvidence) => void, verifyPreparedOwner?: () => { owner: RecoveryWriterOwnerEvidence; expectedSnapshotHash: string }) {
   if (options.recovery?.enabled !== true) return undefined;
   if (!persistenceManager || typeof persistenceManager.acquireRecoveryOwnership !== 'function' || typeof persistenceManager.inspectRecoveryOwnership !== 'function') {
     throw new Error('Durable recovery requires configured persistenceManager/persistence with recovery ownership support when recovery.enabled is true.');
@@ -753,6 +759,8 @@ function buildWorkflowRecoveryOptions(options: ZergControlOptions, persistenceMa
     ...(options.recovery.inspectNativeSettlement ? { inspectNativeSettlement: options.recovery.inspectNativeSettlement } : {}),
     durablePort: {
       acquireWriter(request: { expectedSnapshotHash: string; verifiedDeadOwner?: RecoveryWriterOwnerEvidence }) {
+        // External ownership is never acquisition/recovery authority, even after loss.
+        if (verifyPreparedOwner) throw new Error('Externally prepared persistence cannot acquire a recovery writer.');
         assertAuthority();
         const idle = recoveryWriterIdleChecks.get(container);
         if (!idle) throw new Error('Authoritative recovery writer wrapper unavailable.');
@@ -797,6 +805,24 @@ function buildWorkflowRecoveryOptions(options: ZergControlOptions, persistenceMa
         return publish(raw as ZergState, guard);
       },
       ensureWriter() {
+        if (verifyPreparedOwner) {
+          const canonical = container.snapshot();
+          const verify = () => {
+            assertAuthority();
+            const current = verifyPreparedOwner();
+            assertAuthority();
+            if (!isDeepStrictEqual(container.read(), canonical)) throw new Error('Prepared recovery canonical state changed during writer verification.');
+            return current;
+          };
+          const idle = recoveryWriterIdleChecks.get(container);
+          if (!idle) throw new Error('Authoritative recovery writer wrapper unavailable.');
+          verify(); idle();
+          const before = verify();
+          onWriter?.(before.owner);
+          const after = verify();
+          if (!isDeepStrictEqual(after, before)) throw new Error('Prepared recovery writer owner/head changed during notification.');
+          return before.owner;
+        }
         const ownership = persistenceManager.acquireRecoveryOwnership!();
         onWriter?.(ownership.owner);
         return ownership.owner;
@@ -812,19 +838,37 @@ export function createZergControl(
   stateOrContainer: ZergStateContainer | Partial<ZergState> = createZergStateContainer(),
   options: ZergControlOptions = {},
 ): ZergControl {
+  const trustedWorkflow = options.trustedWorkflow ? Object.freeze({ ...options.trustedWorkflow }) : undefined;
   const baseContainer = isZergStateContainer(stateOrContainer)
     ? stateOrContainer
     : createZergStateContainer(seedBuiltinAgentDefinitions(createZergState({ ...options.seedState, ...stateOrContainer })));
   const associatedPersistenceManager = isZergStateContainer(stateOrContainer) ? ownedPersistenceManagers.get(stateOrContainer) : undefined;
-  const persistenceManager = associatedPersistenceManager ?? createZergPersistenceManager(options.persistence);
+  if (options.persistenceManager && (options.persistence || associatedPersistenceManager)) throw new Error('Prepared persistence manager conflicts with another writer or associated wrapper.');
+  const persistenceManager = options.persistenceManager ?? associatedPersistenceManager ?? createZergPersistenceManager(options.persistence);
+  if (options.trustedAutomationNative && (!options.persistenceManager || !options.trustedWorkflow?.onStartReservation || !options.trustedWorkflow.assertAdmission)) throw new Error('Automation requires prepared persistence and trusted reservation/admission fences.');
+  let preparedOwner: RecoveryWriterOwnerEvidence | undefined;
+  if (options.persistenceManager) {
+    const inspection = persistenceManager!.inspectRecoveryOwnership?.();
+    if (!inspection?.ownerValid || inspection.claimPresent || inspection.blocker || inspection.owner?.writerSessionId !== persistenceManager!.info.writerSessionId
+      || typeof inspection.expectedSnapshotHash !== 'string' || inspection.actualSnapshotHash !== inspection.expectedSnapshotHash || persistenceManager!.info.lastLoadError) throw new Error('Prepared persistence manager must own a fresh coherent generation before control construction.');
+    preparedOwner = Object.freeze({ ...inspection.owner! });
+  }
+  const assertPreparedOwner = () => {
+    if (!preparedOwner) return;
+    const current = persistenceManager!.inspectRecoveryOwnership?.();
+    if (!current?.ownerValid || current.claimPresent || current.blocker || !isDeepStrictEqual(current.owner, preparedOwner)
+      || typeof current.expectedSnapshotHash !== 'string' || current.actualSnapshotHash !== current.expectedSnapshotHash || persistenceManager!.info.lastLoadError) throw new Error('Prepared persistence owner/head changed; unattended publication refused.');
+    return { owner: preparedOwner, expectedSnapshotHash: current.expectedSnapshotHash };
+  };
   if (options.recovery?.enabled === true && !persistenceManager) {
     throw new Error('Durable recovery requires configured persistenceManager/persistence when recovery.enabled is true.');
   }
-  if (!associatedPersistenceManager && persistenceManager) {
+  if (!associatedPersistenceManager && !options.persistenceManager && persistenceManager) {
     persistenceManager.hydrate(baseContainer, options.now);
   }
   let startupRecoveryBlock = (options as ZergControlOptions & { startupRecoveryBlock?: StartupRecoveryBlock }).startupRecoveryBlock
     ?? inspectStartupRecoveryBlock(persistenceManager, options.now);
+  assertPreparedOwner(); // The startup inspection invokes the host clock callback.
   let committingPersistentState = false;
   let recoveryPublicationGuard: RecoveryPublicationGuard | undefined;
   let persistentStateCommitPoisoned: Error | undefined;
@@ -848,29 +892,38 @@ export function createZergControl(
     }
     committingPersistentState = true;
     try {
+      assertPreparedOwner();
+      const before = preparedOwner ? baseContainer.snapshot() : undefined;
       const nextState = computeNextState();
       recoveryPublicationGuard?.check();
       const intended = snapshotZergState(nextState);
-      persistenceManager!.save(intended, recoveryPublicationGuard ? () => {
+      persistenceManager!.save(intended, recoveryPublicationGuard || before ? () => {
         const time = (options.now ?? (() => new Date()))();
         recoveryPublicationGuard?.check();
+        assertPreparedOwner();
+        if (before && !isDeepStrictEqual(baseContainer.snapshot(), before)) throw new Error('Automation canonical state changed during persistence clock callback.');
         return time;
       } : options.now);
       recoveryPublicationGuard?.saved();
+      assertPreparedOwner();
       baseContainer.replace(nextState);
       const canonical = baseContainer.snapshot();
       // Synchronous revocations remain canonical and must reach disk while the
       // owned writer is valid. This SAME-manager follow-up is record-only.
       recoveryPublicationGuard?.check(canonical, true);
+      assertPreparedOwner();
       if (!isDeepStrictEqual(canonical, intended)) {
-        persistenceManager!.save(canonical, recoveryPublicationGuard ? () => {
+        persistenceManager!.save(canonical, recoveryPublicationGuard || preparedOwner ? () => {
           const time = (options.now ?? (() => new Date()))();
           recoveryPublicationGuard?.check(canonical, true);
+          assertPreparedOwner();
+          if (preparedOwner && !isDeepStrictEqual(baseContainer.snapshot(), canonical)) throw new Error('Automation canonical state changed during follow-up clock callback.');
           return time;
         } : options.now);
         recoveryPublicationGuard?.saved(canonical, true);
       }
       recoveryPublicationGuard?.check(canonical, true);
+      assertPreparedOwner();
       return canonical;
     } catch (error) {
       persistentStateCommitPoisoned = recoveryPublicationGuard
@@ -922,11 +975,14 @@ export function createZergControl(
     if (initializing) throw new Error('Workflow service initializing; nested request refused.');
     initializing = true;
     try {
-      const recovery = buildWorkflowRecoveryOptions(options, persistenceManager, container, () => disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.() === true, (owned) => { workflowRecoveryOwner = owned; });
+      const recovery = buildWorkflowRecoveryOptions(options, persistenceManager, container, () => disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.() === true, (owned) => { workflowRecoveryOwner = owned; }, preparedOwner ? () => assertPreparedOwner()! : undefined);
       const coding = options.recovery?.enabled === true && options.coding?.enabled === true && typeof options.coding.allocateCheckReceipt !== 'function' && persistenceManager
         ? { ...options.coding, allocateCheckReceipt: createDefaultWorkflowCheckAllocator(container, persistenceManager, options.coding, () => workflowRecoveryOwner) }
         : options.coding;
-      return service = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding, recovery });
+      const created = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding, recovery, ...trustedWorkflow });
+      service = created;
+      if (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.()) { created.dispose(); throw new Error('Workflow owner disposed during initialization.'); }
+      return created;
     } finally { initializing = false; }
   };
   // Reading a capability must not construct/persist an empty workflow ledger.
@@ -1505,7 +1561,7 @@ function isZergControlActionName(value: string): value is ZergControlAction['act
 }
 
 export { createZergPersistenceManager, recoverZergStateAfterRestart } from './persistence.js';
-export type { ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot, ZergSessionMessageKey, ZergSessionMessageInput, ZergSessionMessageReceipt, ZergSessionMessageResult } from './types.js';
+export type { TrustedAutomationNativeContext, ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot, ZergSessionMessageKey, ZergSessionMessageInput, ZergSessionMessageReceipt, ZergSessionMessageResult } from './types.js';
 
 export function createZergCommandHandler(
   stateOrReader: ZergStateSource,
@@ -4842,7 +4898,7 @@ async function runSinglePiNativeAgent(
   const sdk = await import('@earendil-works/pi-coding-agent');
   if (admission) await assertContinuation();
   workflow?.assert();
-  const cwd = admission?.review.policy.cwd ?? resolvePiNativeCwd(context);
+  const cwd = workflow?.automation?.cwd ?? admission?.review.policy.cwd ?? resolvePiNativeCwd(context);
   const modelSpec = resolvePiNativeRunModel(definition, run.request);
   const { session, sessionManager, tools } = await createPiNativeSession(sdk, definition, run.task, cwd, modelSpec,
     admission ? { admission, assert: assertContinuation } : undefined, workflow);
@@ -5545,12 +5601,14 @@ async function createPiNativeSession(
   if (definition.permissionMode === 'manual' || definition.permissionMode === 'assisted') {
     throw new Error(`Native Pi runner does not support agent permissionMode ${definition.permissionMode}; use inherit/default or automatic for native runs.`);
   }
-  const agentDir = sdk.getAgentDir();
+  const automation = workflow?.automation;
+  if (automation && (continuation || workflow?.request.coding)) throw new Error('Automation cannot recover or acquire coding capabilities.');
+  const agentDir = automation?.agentDir ?? sdk.getAgentDir();
   const workflowCoding = workflow?.request.coding && ['investigate', 'stage-write', 'review'].includes(workflow.request.coding.operation);
-  if ((continuation || (workflow && !workflowCoding)) && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for reviewed native execution.');
+  if ((continuation || (workflow && !workflowCoding && !automation)) && !sdk.DefaultResourceLoader) throw new Error('Normal resource loader required for reviewed native execution.');
   workflow?.assert();
   if (continuation) await continuation.assert();
-  const modelRuntime = await sdk.ModelRuntime.create({
+  const modelRuntime = automation?.preflightedModelRuntime ?? await sdk.ModelRuntime.create({
     authPath: resolvePath(agentDir, 'auth.json'),
     modelsPath: resolvePath(agentDir, 'models.json'),
     allowModelNetwork: false,
@@ -5567,11 +5625,30 @@ async function createPiNativeSession(
     : { ...declaredPolicy, tools: [...workflow.tools], activeTools: [...workflow.tools], customTools: [] }
     : declaredPolicy;
   const tools = toolPolicy.activeTools;
-  const settingsManager = sdk.SettingsManager.create(cwd, agentDir);
+  let assertReadSession = () => workflow!.assert();
+  const readText = (path: string) => {
+    assertReadSession();
+    const text = automation!.scopedRead(path);
+    assertReadSession();
+    if (typeof text !== 'string') throw new Error('Automation scoped read must return synchronous TEXT.');
+    return text;
+  };
+  const automationRead = automation ? sdk.createReadToolDefinition(cwd, { autoResizeImages: false, operations: {
+    access: async path => {
+      assertReadSession();
+      const result = automation.scopedAccess(path);
+      assertReadSession();
+      if (result !== undefined) throw new Error('Automation scoped access must be synchronous and non-consuming.');
+    },
+    readFile: async path => Buffer.from(readText(path), 'utf8'),
+    detectImageMimeType: async () => { assertReadSession(); return undefined; },
+  } }) : undefined;
+  if (automationRead) { automationRead.description = 'Read bounded UTF-8 text from the explicitly approved automation file set only.'; workflow!.automationRead = automationRead; }
+  const settingsManager = automation ? sdk.SettingsManager.inMemory() : sdk.SettingsManager.create(cwd, agentDir);
   // Package discovery reads scoped settings, not applyOverrides(), and reloads
   // them before loading factories. Filter this child-only manager at that boundary.
   const extensionPath = fileURLToPath(import.meta.url);
-  for (const getter of ['getGlobalSettings', 'getProjectSettings'] as const) {
+  if (!automation) for (const getter of ['getGlobalSettings', 'getProjectSettings'] as const) {
     const getSettings = settingsManager[getter].bind(settingsManager);
     settingsManager[getter] = () => {
       const settings = getSettings();
@@ -5590,12 +5667,14 @@ async function createPiNativeSession(
   settingsManager.applyOverrides({
     compaction: { enabled: false },
     retry: { enabled: !workflow, maxRetries: workflow ? 0 : 2 },
-    ...(codingTools ? { packages: [], extensions: [] } : {}),
+    ...(codingTools || automation ? { packages: [], extensions: [] } : {}),
     defaultTools: tools,
   });
   if (continuation) await continuation.assert();
   const loaderDefinition = continuation ? { ...definition, prompt: `${definition.prompt}\n\n${continuation.admission.review.policy.authorityInstruction}` } : definition;
-  const resourceLoader = codingTools
+  const resourceLoader = automation
+    ? createSealedWorkflowResourceLoader(sdk, createPiNativeSystemPrompt(loaderDefinition, task))
+    : codingTools
     ? createSealedWorkflowResourceLoader(sdk, createPiNativeSystemPrompt(loaderDefinition, task), [(pi) => {
       for (const tool of codingTools.tools) pi.registerTool(tool);
       pi.on('tool_call', (event) => { workflow?.assert(); codingTools.assertToolCall(event.toolName); return undefined; });
@@ -5606,7 +5685,7 @@ async function createPiNativeSession(
   const model = modelId ? await resolvePiNativeModel(modelRuntime, modelId) : undefined;
   if (continuation) await continuation.assert();
   workflow?.assert();
-  const sessionManager = continuation ? importNativeContinuation(sdk, continuation.admission) : sdk.SessionManager.create(cwd);
+  const sessionManager = continuation ? importNativeContinuation(sdk, continuation.admission) : sdk.SessionManager.create(cwd, automation?.sessionDir);
   if (workflow) workflow.cleanupSettled = false;
   const { session } = await sdk.createAgentSession({
     cwd,
@@ -5618,19 +5697,26 @@ async function createPiNativeSession(
     tools: toolPolicy.tools ?? [],
     ...(toolPolicy.noTools ? { noTools: toolPolicy.noTools } : {}),
     excludeTools: toolPolicy.excludeTools,
-    customTools: codingTools ? codingTools.tools as never : workflow ? [] : createPiNativeCustomTools(toolPolicy.customTools) as never,
+    customTools: automationRead ? [automationRead] as never : codingTools ? codingTools.tools as never : workflow ? [] : createPiNativeCustomTools(toolPolicy.customTools) as never,
     sessionManager,
     settingsManager,
   });
   if (workflow) {
     try {
+      assertReadSession = () => assertWorkflowSession(workflow, session);
       assertWorkflowSession(workflow, session);
       const prepare = session.agent.prepareRequest;
       session.agent.prepareRequest = async (request, signal) => {
+        if (automation) {
+          assertWorkflowSession(workflow, session);
+          if (automation.beforeProviderRequest() !== undefined) throw new Error('Automation provider guard must be synchronous.');
+          assertWorkflowSession(workflow, session);
+        }
         const prepared = await prepare?.(request, signal);
         assertWorkflowSession(workflow, session);
         const model = prepared?.model ?? request.model;
         if (`${model.provider}/${model.id}` !== modelId) throw new Error('Workflow routed model drifted.');
+        if (automation && (prepared?.thinkingLevel ?? request.thinkingLevel) !== automation.expectedThinkingLevel) throw new Error('Automation routed thinking drifted.');
         return prepared || undefined;
       };
       const payload = session.agent.onPayload;
@@ -6808,6 +6894,8 @@ interface WorkflowAdmission {
   request: WorkflowNativeRequest;
   assert(): void;
   tools: readonly string[];
+  automation?: TrustedAutomationNativeContext;
+  automationRead?: ReturnType<typeof import('@earendil-works/pi-coding-agent').createReadToolDefinition>;
   aborts: Promise<void>[];
   failures: string[];
   cleanupSettled: boolean;
@@ -6852,13 +6940,22 @@ function createOwnedWorkflowNative(
   const handles = new Map<PiNativeActiveRun, WorkflowAdmission>();
   let disposed = false;
   let uncertain = false;
-  const assertPolicy = (agent: ZergAgentDefinition) => {
+  const purePolicy = (agent: ZergAgentDefinition) => {
     if (disposed || isDisposed() || options.isOwnerDisposed?.() || uncertain) throw new Error('Workflow native owner unavailable or previous cleanup uncertain.');
     const state = container.read();
-    if (state.mode.readOnly || state.lifecycle === 'disposed') throw new Error('Workflow admission blocked by current read-only/disposed authority.');
+    if (state.mode.readOnly || (state.lifecycle === 'disposed' || state.lifecycle === 'resetting')) throw new Error('Workflow admission blocked by current read-only/disposed authority.');
     const current = getAgentDefinition(state, agent.id);
     if (!current || workflowHash(normalizeWorkflowAgent(current)) !== workflowHash(agent)) throw new Error('Workflow frozen agent definition no longer matches current policy.');
     workflowAgentTools(agent);
+  };
+  const automation = options.trustedAutomationNative ? Object.freeze({ ...options.trustedAutomationNative }) : undefined;
+  const assertPolicy = (agent: ZergAgentDefinition) => {
+    purePolicy(agent);
+    if (automation) {
+      if (automation.assertPolicy() !== undefined) throw new Error('Automation policy guard must be synchronous.');
+      purePolicy(agent);
+      if (agent.tools?.length !== 1 || agent.tools[0] !== 'read' || agent.disallowedTools?.length || splitModelAndThinking(agent.model).thinkingLevel !== automation.expectedThinkingLevel) throw new Error('Automation requires exact read-only model/thinking policy.');
+    }
   };
   const port: WorkflowNativePort = {
     preflight: assertPolicy,
@@ -6869,10 +6966,11 @@ function createOwnedWorkflowNative(
         const taskId = (options.idFactory?.taskId ?? defaultIdFactory.taskId)();
         const identity = { runId, taskId };
         const active = createPiNativeActiveRun(runId);
-        const admission: WorkflowAdmission = { request, tools: workflowAgentTools(request.agent), aborts: [], failures: [], cleanupSettled: true,
+        const admission: WorkflowAdmission = { request, automation, tools: workflowAgentTools(request.agent), aborts: [], failures: [], cleanupSettled: true,
           assert() {
             assertPolicy(request.agent);
             request.assertAdmission();
+            purePolicy(request.agent);
             if (request.signal.aborted || active.cancelRequested || active.disposed) throw new Error('Workflow unit cancelled before native admission.');
           },
         };
@@ -6892,6 +6990,7 @@ function createOwnedWorkflowNative(
           admission.assert();
           activeRuns.set(runId, active);
           const now = (options.now ?? (() => new Date()))().toISOString();
+          admission.assert();
           const lineage = { workflowRunId: request.workflowRunId, familyId: request.familyId, attemptNo: request.attemptNo, stepId: request.stepId, unitId: request.unitId, inputHash: request.inputHash,
             ...(request.blockId !== undefined ? { blockId: request.blockId } : {}),
             ...(request.iterationId !== undefined ? { iterationId: request.iterationId } : {}),
@@ -6946,6 +7045,12 @@ function assertWorkflowSession(admission: WorkflowAdmission, session: import('@e
   if (coding && ['investigate', 'stage-write', 'review'].includes(coding.operation)) {
     const expected = coding.operation === 'stage-write' ? [...WORKFLOW_NATIVE_CODING_TOOL_NAMES] : WORKFLOW_NATIVE_CODING_TOOL_NAMES.filter((name) => name !== 'workflow_stage_write');
     if (active.length !== expected.length || active.some((name) => !expected.includes(name))) throw new Error('Workflow coding tool allowlist drifted.');
+    return;
+  }
+  if (admission.automation) {
+    if (session.thinkingLevel !== admission.automation.expectedThinkingLevel) throw new Error('Automation effective thinking drifted after SDK normalization.');
+    const tools = session.getAllTools().filter(tool => tool.name === 'read');
+    if (active.length !== 1 || active[0] !== 'read' || tools.length !== 1 || tools[0]!.sourceInfo.source !== 'sdk' || tools[0]!.sourceInfo.path !== '<sdk:read>' || !admission.automationRead || session.getToolDefinition('read') !== admission.automationRead) throw new Error('Automation requires its exact reviewed scoped SDK custom read override.');
     return;
   }
   if (active.length !== admission.tools.length || active.some((name) => !admission.tools.includes(name))) throw new Error('Workflow effective tool allowlist drifted.');

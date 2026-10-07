@@ -179,7 +179,16 @@ export interface WorkflowRecoveryNativeSettlementRequest {
   workflowRunId: string; familyId: string; unitId: string; operationId: string;
   native: WorkflowNativeIdentity | null; inputHash: string; dependencyHash: string; policyHash: string;
 }
-export interface WorkflowServiceOptions { now?: () => Date; idFactory?: () => string; coding?: WorkflowTrustedCodingConfig & { enabled?: boolean; approvalHost?: unknown }; recovery?: { enabled?: boolean; durablePort?: WorkflowRecoveryDurablePort; inspectNativeSettlement?: (request: WorkflowRecoveryNativeSettlementRequest) => 'settled' | 'unknown'; sourceConfig?: WorkflowJson; identityVersionHash?: string } }
+export interface TrustedWorkflowServiceOptions {
+  /** Host-only, synchronous, COPY/FREEZE input; only automation metadata may be returned.
+   * It is validated and committed with this exact fresh attempt before scheduling. */
+  onStartReservation?: (run: Readonly<WorkflowRun>) => unknown;
+  /** Lower native family admission cap; never an estimated monetary limit. */
+  maxAdmissions?: number;
+  /** Synchronous live owner/profile fence; never recovered from snapshot metadata. */
+  assertAdmission?: () => void;
+}
+export interface WorkflowServiceOptions extends TrustedWorkflowServiceOptions { now?: () => Date; idFactory?: () => string; coding?: WorkflowTrustedCodingConfig & { enabled?: boolean; approvalHost?: unknown }; recovery?: { enabled?: boolean; durablePort?: WorkflowRecoveryDurablePort; inspectNativeSettlement?: (request: WorkflowRecoveryNativeSettlementRequest) => 'settled' | 'unknown'; sourceConfig?: WorkflowJson; identityVersionHash?: string } }
 export const WORKFLOW_LIMITS = Object.freeze({ steps: 16, fanout: 32, concurrency: 32, admissions: 256, attempts: 3,
   definitionBytes: 65536, inputBytes: 32768, resultBytes: 16384, promptBytes: 262144, aggregateBytes: 262144,
   ledgerBytes: 2097152, definitions: 16, runs: 16, depth: 24, nodes: 20000, keys: 256, stringLength: 262144 });

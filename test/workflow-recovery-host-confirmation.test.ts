@@ -161,7 +161,10 @@ function hooks(baseContainer: ZergStateContainer, manager: any, options: any = {
   const fn = parsed.statements.find((n): n is ts.FunctionDeclaration => ts.isFunctionDeclaration(n) && n.name?.text === (registered ? 'registerZergSwarmExtension' : 'createZergControl'))!;
   const statements = [...fn.body!.statements];
   const index = (name: string) => statements.findIndex(n => ts.isVariableStatement(n) && n.declarationList.declarations.some(d => ts.isIdentifier(d.name) && d.name.text === name));
-  const text = statements.slice(index('committingPersistentState'), index('nativeTranscriptService')).map(n => n.getText(parsed)).join('\n');
+  const preparedStart = index('preparedOwner'), preparedEnd = index('assertPreparedOwner');
+  if (!registered) assert.ok(preparedStart >= 0 && preparedEnd >= preparedStart, 'prepared owner initialization source missing');
+  const initialization = registered ? [] : statements.slice(preparedStart, preparedEnd + 1);
+  const text = [...initialization, ...statements.slice(index('committingPersistentState'), index('nativeTranscriptService'))].map(n => n.getText(parsed)).join('\n');
   let shared: ZergState | undefined;
   const container = new Function('startupRecoveryBlock', 'baseContainer', 'stateContainer', 'syncSharedStateFromContainer', 'persistenceManager', 'options', 'createZergState', 'updateZergState', 'snapshotZergState', 'isDeepStrictEqual', 'associatedPersistenceManager', 'ownedPersistenceManagers', 'recoveryPublications', 'recoveryWriterIdleChecks', compile(text + `\nreturn ${registered ? 'syncedStateContainer' : 'container'};`))(undefined, baseContainer, baseContainer, () => { shared = baseContainer.snapshot(); }, manager, options, createZergState, updateZergState, snapshotZergState, isDeepStrictEqual, undefined, ownedPersistenceManagers, recoveryPublications, recoveryWriterIdleChecks) as ZergStateContainer;
   const builder = parsed.statements.find((n): n is ts.FunctionDeclaration => ts.isFunctionDeclaration(n) && n.name?.text === 'buildWorkflowRecoveryOptions')!;

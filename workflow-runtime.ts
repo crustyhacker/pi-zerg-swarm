@@ -20,7 +20,7 @@ import type { WorkflowAction, WorkflowDefinition, WorkflowJson, WorkflowNativeId
   WorkflowBinding, WorkflowIterationRun, WorkflowStep, WorkflowStepRun, WorkflowUnit, WorkflowUnitStatus, WorkflowTrustedApprovalApi, WorkflowTrustedRecoveryAuthorizeRequest } from './workflow-model.js';
 import { WORKFLOW_SCRIPT_FORMAT_VERSION, WORKFLOW_SCRIPT_LANGUAGE_VERSION, WORKFLOW_SCRIPT_COMPILER_VERSION,
   WORKFLOW_SCRIPT_PARSER_VERSION } from './workflow-script-format.js';
-
+import { AUTOMATION_EXTENSION_KEY, validateAutomationLedger, validateAutomationReservation } from './automation-admission.js';
 const settled = (status: WorkflowUnitStatus) => !['queued', 'running'].includes(status);
 const terminal = (run: WorkflowRun) => ['completed', 'failed', 'cancelled', 'needs-attention'].includes(run.status);
 const errorText = (error: unknown) => error instanceof Error && error.message.length <= 1024 ? error.message : 'Workflow operation failed (missing or oversized diagnostic)';
@@ -315,6 +315,12 @@ function validateV2Ledger(run: WorkflowRun): void {
 
 /** One owned scheduler; no SDK, tools, files, eval, arbitrary loops or automatic retries. */
 export function createWorkflowService(container: ZergStateContainer, port: WorkflowNativePort, options: WorkflowServiceOptions = {}): WorkflowService {
+  const onStartReservation = options.onStartReservation;
+  const hostAdmission = options.assertAdmission;
+  const maxAdmissions = options.maxAdmissions ?? WORKFLOW_LIMITS.admissions;
+  workflowAssert(Number.isSafeInteger(maxAdmissions) && maxAdmissions >= 1 && maxAdmissions <= WORKFLOW_LIMITS.admissions, 'Native admission cap must be integer 1..256');
+  let startInProgress = false;
+  let expectedAutomationHash = onStartReservation ? workflowHash(container.read().extensions[AUTOMATION_EXTENSION_KEY] ?? null) : '';
   const hostNow = options.now ?? (() => new Date());
   let observedClock = { millis: Date.now(), ticks: process.hrtime.bigint() };
   const now = () => { const date = hostNow(); observedClock = { millis: date.getTime(), ticks: process.hrtime.bigint() }; return date; };
@@ -322,6 +328,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   const idFactory = options.idFactory ?? randomUUID;
   const existing = container.read().extensions[WORKFLOW_EXTENSION_KEY];
   const state: WorkflowState = existing === undefined ? { version: 1, definitions: [createReadOnlyReviewDefinition()], runs: [] } : recoverWorkflowState(existing);
+  if (onStartReservation && container.read().extensions[AUTOMATION_EXTENSION_KEY] !== undefined) validateAutomationLedger(container.read().extensions[AUTOMATION_EXTENSION_KEY], state);
   const owner = Symbol('workflow-owner'); owners.set(container, owner);
   const listeners = new Set<(views: ReturnType<typeof workflowView>[]) => void>();
   const approvalRegistry = createWorkflowApprovalRegistry(now);
@@ -601,18 +608,21 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   const list = () => copy(projectedRuns().map(projectedView));
   const ledgerCurrent = () => {
     workflowAssert(!authorityLost && owners.get(container) === owner, 'Workflow ledger ownership lost');
+    if (onStartReservation) workflowAssert(workflowHash(container.read().extensions[AUTOMATION_EXTENSION_KEY] ?? null) === expectedAutomationHash, 'Automation ledger changed outside its owner');
     workflowAssert(workflowHash(container.read().extensions[WORKFLOW_EXTENSION_KEY]) === expectedHash, 'Workflow ledger changed outside its owner');
   };
-  const persist = () => {
+  const persist = (automation?: ReturnType<typeof validateAutomationReservation>) => {
     if (initialized) ledgerCurrent();
     else workflowAssert(owners.get(container) === owner, 'Workflow ledger ownership lost');
+    if (onStartReservation && (automation ?? container.read().extensions[AUTOMATION_EXTENSION_KEY]) !== undefined) validateAutomationLedger(automation ?? container.read().extensions[AUTOMATION_EXTENSION_KEY], state);
     const data = workflowJson(state, WORKFLOW_LIMITS.ledgerBytes);
     expectedHash = workflowHash(data);
     const current = container.read();
-    container.update({ extensions: { ...current.extensions, [WORKFLOW_EXTENSION_KEY]: data } });
-    if (workflowHash(container.read().extensions[WORKFLOW_EXTENSION_KEY]) !== expectedHash) {
+    if (automation) expectedAutomationHash = workflowHash(automation);
+    container.update({ extensions: { ...current.extensions, [WORKFLOW_EXTENSION_KEY]: data, ...(automation ? { [AUTOMATION_EXTENSION_KEY]: automation } : {}) } });
+    if (workflowHash(container.read().extensions[WORKFLOW_EXTENSION_KEY]) !== expectedHash || (onStartReservation && workflowHash(container.read().extensions[AUTOMATION_EXTENSION_KEY] ?? null) !== expectedAutomationHash)) {
       authorityLost = true; active.forEach(a => a.controller.abort());
-      throw new Error('Workflow ledger changed during publication');
+      throw new Error('Workflow/automation ledger changed during publication');
     }
     initialized = true;
     for (const listener of [...listeners]) { try { listener(list()); } catch { /* Observers cannot alter ownership or settlement. */ } }
@@ -652,6 +662,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     recheck();
     if (run) { ownerObservation = assertRecoveryOwner(); recheck(); }
     if (run) for (const agent of Object.values(run.agents)) { port.preflight(agent); recheck(); }
+    if (hostAdmission) { workflowAssert(hostAdmission() === undefined, 'Admission guard must be synchronous'); recheck(); }
     // Enum-only host observations are not immutable certificates. Require two bounded
     // identical complete sweeps AFTER preflight, rejecting unknown or drift. There are
     // no host calls after the final pure predicate. Hidden host state still requires the
@@ -1205,7 +1216,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       workflowAssert(unit.inputHash === hashUnit(run, spec, unit.inputs), 'Materialized dependency/input identity changed');
     };
     try {
-      assertAdmission(); workflowAssert(run.admissions < 256, 'Workflow family admission budget exhausted');
+      assertAdmission(); workflowAssert(run.admissions < maxAdmissions, 'Workflow family admission budget exhausted');
       const prompt = `${spec.prompt}\n\nWORKFLOW_DATA_JSON\n${JSON.stringify({ inputs: unit.inputs, outputSchema: spec.outputSchema })}\nEND_WORKFLOW_DATA_JSON`;
       workflowAssert(Buffer.byteLength(prompt, 'utf8') <= WORKFLOW_LIMITS.promptBytes, 'Resolved workflow prompt exceeded');
       let recoveryOpId: string | undefined;
@@ -2093,10 +2104,38 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         persist(); return { ok: true, action, definition: { id: definition.id, label: definition.label, stepCount: definition.steps.length } };
       }
       if (input.action === 'workflows.start') {
-        authority(); workflowAssert(!signal?.aborted, 'Caller already cancelled'); const definition = state.definitions.find(d => d.id === input.definitionId); workflowAssert(definition, 'Workflow definition not found');
-        const run = makeRun(definition, input.inputs, input.concurrency ?? 8);
-        workflowJson({ ...state, runs: [...state.runs, run] }, WORKFLOW_LIMITS.ledgerBytes);
-        state.runs.push(run); persist(); attachSignal(run, signal); schedule(); return { ok: true, action, view: copy(workflowView(run)) };
+        if (!onStartReservation) {
+          authority(); workflowAssert(!signal?.aborted, 'Caller already cancelled'); const definition = state.definitions.find(d => d.id === input.definitionId); workflowAssert(definition, 'Workflow definition not found');
+          const run = makeRun(definition, input.inputs, input.concurrency ?? 8);
+          workflowJson({ ...state, runs: [...state.runs, run] }, WORKFLOW_LIMITS.ledgerBytes);
+          state.runs.push(run); persist(); attachSignal(run, signal); schedule(); return { ok: true, action, view: copy(workflowView(run)) };
+        }
+        workflowAssert(!startInProgress, 'Workflow start reservation already in progress');
+        startInProgress = true;
+        let selected: WorkflowRun | undefined;
+        try {
+          const recheck = () => { authority(selected); workflowAssert(!signal?.aborted, 'Caller cancelled during start reservation'); };
+          recheck(); const definition = state.definitions.find(d => d.id === input.definitionId); workflowAssert(definition, 'Workflow definition not found');
+          const run = makeRun(definition, input.inputs, input.concurrency ?? 8);
+          // makeRun invokes preflight, ID and clock hooks. None is execution authority.
+          recheck();
+          workflowJson({ ...state, runs: [...state.runs, run] }, WORKFLOW_LIMITS.ledgerBytes);
+          state.runs.push(run); selected = run; recheck();
+          const existingAutomation = container.read().extensions[AUTOMATION_EXTENSION_KEY];
+          const previousAutomation = existingAutomation === undefined ? undefined : validateAutomationLedger(existingAutomation, state);
+          const reservation = onStartReservation(freezeWorkflowData(run, WORKFLOW_LIMITS.ledgerBytes));
+          recheck();
+          const automation = validateAutomationReservation(previousAutomation, reservation, run);
+          recheck();
+          persist(automation);
+          // Publication and observers may synchronously revoke caller/owner/policy.
+          recheck(); workflowAssert(run.status === 'running', 'Workflow start revoked during publication');
+          attachSignal(run, signal); recheck();
+          schedule(); return { ok: true, action, view: copy(workflowView(run)) };
+        } catch (error) {
+          if (selected) { authorityLost = true; active.forEach(a => a.controller.abort()); }
+          throw error;
+        } finally { startInProgress = false; }
       }
       workflowAssert('workflowRunId' in input, 'Workflow run identity required');
       const run = state.runs.find(r => r.workflowRunId === input.workflowRunId); workflowAssert(run, 'Workflow run not found');
@@ -2149,6 +2188,6 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         catch (error) { authorityLost = true; run.status = 'needs-attention'; run.error = errorText(error); }
       }
     },
-    async drain() { await Promise.resolve(); while (pending.size) { await Promise.allSettled([...pending]); await Promise.resolve(); } workflowAssert(!cleanupUncertain || state.runs.every(r => r.cleanupSettled || observedSettledSources.has(r.workflowRunId)), 'Native cleanup settlement is uncertain'); },
+    async drain() { await Promise.resolve(); while (pending.size) { await Promise.allSettled([...pending]); await Promise.resolve(); } workflowAssert(!onStartReservation || !authorityLost, 'Automation publication/admission is uncertain'); workflowAssert(!cleanupUncertain || state.runs.every(r => r.cleanupSettled || observedSettledSources.has(r.workflowRunId)), 'Native cleanup settlement is uncertain'); },
   };
 }
