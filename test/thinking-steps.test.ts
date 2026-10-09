@@ -4272,7 +4272,7 @@ test('extension registers zerg_control Pi tool when registerTool is available', 
     const invalid = await tool.execute('tool-2', { action: 'bogus' }) as { details?: { ok?: boolean; error?: { code?: string; message?: string } } };
     assert.equal(invalid.details?.ok, false);
     assert.equal(invalid.details?.error?.code, 'invalid_request');
-    assert.equal(invalid.details?.error?.message, 'Unknown zerg_control action: bogus');
+    assert.equal(invalid.details?.error?.message, 'Unknown zerg_control action: bogus. Use {"action":"help"} to list supported actions.');
   } finally {
     registration.dispose();
   }

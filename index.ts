@@ -21,6 +21,8 @@ export type { WorkflowScriptAction, WorkflowScriptAuthoring, WorkflowScriptDiagn
 export { WORKFLOW_SCRIPT_FORMAT_VERSION, WORKFLOW_SCRIPT_LANGUAGE_VERSION, WORKFLOW_SCRIPT_COMPILER_VERSION, WORKFLOW_SCRIPT_PARSER_VERSION, WORKFLOW_SCRIPT_LIMITS } from './workflow-script-format.js';
 export { compileWorkflowScript, inspectWorkflowScriptDefinition } from './workflow-script.js';
 export { READ_ONLY_PARALLEL_SCRIPT, CONDITIONAL_REFINEMENT_SCRIPT, READ_ONLY_PARALLEL_DEFINITION, CONDITIONAL_REFINEMENT_DEFINITION } from './workflow-script-examples.js';
+import { ZERG_CONTROL_ACTION_NAMES, isZergControlActionName, validateControlHelpRequest, getZergControlHelpData, controlHelpEcho, unknownControlActionMessage } from './control-help.js';
+export { ZERG_CONTROL_ACTION_NAMES, ZERG_CONTROL_HELP_CATALOG } from './control-help.js';
 import { deriveThinkingSteps } from './parse.js';
 import { createNativeTranscriptService, type NativeTranscriptService } from './native-transcript.js';
 import { createSessionMessageService, OPERATOR_CUSTOM_TYPE, validateSessionMessageKey, validateSessionMessageInput, type SessionMessageService } from './session-messages.js';
@@ -1244,6 +1246,17 @@ async function executeZergControlAction(
   signal?: AbortSignal,
 ): Promise<ZergControlResult> {
   try {
+    const actionName = action && typeof action === 'object' ? (action as { action?: unknown }).action : undefined;
+    if (!isZergControlActionName(actionName)) {
+      return controlError(controlHelpEcho(actionName) as ZergControlAction['action'], 'invalid_request', unknownControlActionMessage(actionName), container.read().revision);
+    }
+    if (actionName === 'help') {
+      const failure = validateControlHelpRequest(action);
+      if (failure) return controlError('help', 'invalid_request', failure, container.read().revision);
+      const data = getZergControlHelpData((action as Extract<ZergControlAction, { action: 'help' }>).topic);
+      return controlOk('help', data, JSON.stringify(data), container.read().revision);
+    }
+    if (Object.hasOwn(action, 'topic')) return controlError(actionName, 'invalid_request', 'topic is supported only for help. Use {"action":"help","topic":"<exact action name>"}.', container.read().revision);
     if (isWorkflowScriptActionName(action.action)) {
       if (options.isOwnerDisposed?.()) throw new Error('Workflow authoring owner disposed.');
       const execute = options.workflowScriptOwner?.execute ?? executeWorkflowScriptAction;
@@ -1503,16 +1516,12 @@ async function executeZergControlAction(
       }
     }
 
-    const actionName = typeof (action as { action?: unknown }).action === 'string'
-      ? (action as { action: ZergControlAction['action'] }).action
-      : 'status';
-    return controlError(actionName, 'invalid_request', `Unknown zerg control action: ${String((action as { action?: unknown }).action)}`, container.snapshot().revision);
+    return controlError(controlHelpEcho(actionName) as ZergControlAction['action'], 'invalid_request', unknownControlActionMessage(actionName), container.read().revision);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const actionName = typeof (action as { action?: unknown }).action === 'string'
-      ? (action as { action: ZergControlAction['action'] }).action
-      : 'status';
-    return controlError(actionName, 'exception', message, container.snapshot().revision);
+    const rawAction = action && typeof action === 'object' ? (action as { action?: unknown }).action : undefined;
+    const actionName = controlHelpEcho(rawAction) as ZergControlAction['action'];
+    return controlError(actionName, 'exception', rawAction === 'help' ? controlHelpEcho(message) : message, container.read().revision);
   }
 }
 
@@ -1536,14 +1545,15 @@ function registerZergControlTool(context: StructuralPiExtensionContext, control:
   const definition: StructuralPiToolDefinition = {
     name: 'zerg_control',
     label: 'Zerg control',
-    description: 'Structured pi-zerg-swarm control API for status, agents, teams, runs, logs, interrupts, declarative read-only workflows, and non-executing recovery inspection and artifact assessment. Recovery prepare is not authorization and cannot execute recovered work.',
+    description: 'Structured pi-zerg-swarm control for inspection, configuration, native runs/sessions and bounded workflow/script actions. Use {"action":"help"} for discovery or {"action":"help","topic":"<exact action name>"} for arguments. Recovery prepare is not authorization and cannot execute recovered work.',
     promptSnippet: 'Control pi-zerg-swarm through structured actions without slash-command or terminal automation.',
-    promptGuidelines: ['Use zerg_control for pi-zerg-swarm automation instead of driving /zerg through a terminal.'],
+    promptGuidelines: ['Use zerg_control for pi-zerg-swarm automation instead of driving /zerg through a terminal.', 'If unsure of an action or its arguments, use {"action":"help"} or {"action":"help","topic":"<exact action name>"} first.'],
     parameters: {
       type: 'object',
       additionalProperties: true,
       properties: {
-        action: { type: 'string' },
+        action: { type: 'string', enum: [...ZERG_CONTROL_ACTION_NAMES], description: 'Exact public action; use help for discovery.' },
+        topic: { type: 'string', minLength: 1, maxLength: 96, description: 'Only for help: exact public action name for focused parameters, constraints and example; omit for directory.' },
         definition: { type: 'object', description: 'Bounded declarative workflow definition for workflows.define; no code or arbitrary tools.' },
         definitionId: { type: 'string', description: 'Workflow definition identity for workflows.show/start or non-executing scripts.inspect.' },
         source: { type: 'string', maxLength: 65536, description: 'Bounded restricted workflow source for scripts.validate/compile/save; never executable JavaScript or approval.' },
@@ -1594,8 +1604,14 @@ function parseZergControlToolParams(params: unknown): { ok: true; action: ZergCo
 
   const actionName = (params as { action: string }).action;
   if (!isZergControlActionName(actionName)) {
-    return { ok: false, message: `Unknown zerg_control action: ${actionName}` };
+    return { ok: false, message: unknownControlActionMessage(actionName) };
   }
+
+  if (actionName === 'help') {
+    const failure = validateControlHelpRequest(params);
+    return failure ? { ok: false, message: failure } : { ok: true, action: params as ZergControlAction };
+  }
+  if (Object.hasOwn(params, 'topic')) return { ok: false, message: 'topic is supported only for help. Use {"action":"help","topic":"<exact action name>"}.' };
 
   if (isWorkflowScriptActionName(actionName)) {
     try { return { ok: true, action: parseWorkflowScriptAction(params) }; }
@@ -1660,31 +1676,8 @@ function parseRecoverySelections(raw: unknown): { ok: true; selections?: { reuse
   return Object.keys(selections).length ? { ok: true, selections } : { ok: true, selections: {} };
 }
 
-function isZergControlActionName(value: string): value is ZergControlAction['action'] {
-  return isWorkflowScriptActionName(value) || WORKFLOW_ACTION_NAMES.has(value) || value === 'status'
-    || value === 'agents.list'
-    || value === 'agents.show'
-    || value === 'agents.create'
-    || value === 'agents.update'
-    || value === 'agents.delete'
-    || value === 'team.create'
-    || value === 'team.update'
-    || value === 'run'
-    || value === 'runs.list'
-    || value === 'runs.show'
-    || value === 'timeline.list'
-    || value === 'logs.list'
-    || value === 'session.message.send'
-    || value === 'session.messages.list'
-    || value === 'session.continuation.prepare'
-    || value === 'session.continuation.start'
-    || value === 'session.continuation.discard'
-    || value === 'message'
-    || value === 'interrupt';
-}
-
 export { createZergPersistenceManager, recoverZergStateAfterRestart } from './persistence.js';
-export type { TrustedAutomationNativeContext, ZergControl, ZergControlAction, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot, ZergSessionMessageKey, ZergSessionMessageInput, ZergSessionMessageReceipt, ZergSessionMessageResult } from './types.js';
+export type { TrustedAutomationNativeContext, ZergControl, ZergControlAction, ZergControlHelpData, ZergControlHelpParameter, ZergControlResult, ZergOperatorMessageResult, ZergPersistenceInfo, ZergPersistenceOptions, ZergRunRecoveryInfo, ZergSubagentRunSnapshot, ZergSessionMessageKey, ZergSessionMessageInput, ZergSessionMessageReceipt, ZergSessionMessageResult } from './types.js';
 
 export function createZergCommandHandler(
   stateOrReader: ZergStateSource,

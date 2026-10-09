@@ -155,7 +155,7 @@ hardware swarm project.
 
 ## Release status
 
-- Current release: **v1.1.22** (visual feature showcase; includes background activity and the Stage 9 management shortcut).
+- Current release: **v1.1.23** (structured-control help and action discovery; includes the visual showcase, background activity and Stage 9 management shortcut).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - The release path requires general, milestone, security, performance, hardening, and cleanup audits.
 - Canonical repository: https://github.com/crustyhacker/pi-zerg-swarm.
@@ -220,6 +220,40 @@ const status = await control.execute({ action: 'runs.show', runId: run.runId! })
 ```
 
 `registerZergSwarmExtension(...)` also registers a Pi custom tool named `zerg_control` when the installed Pi extension API exposes `registerTool(...)`. The tool calls the same structured control core and returns JSON-compatible `details`; callers do not need to parse slash-command output. Slash commands remain the human-facing wrapper.
+
+### Discover actions safely
+
+Use `zerg_control` help before guessing action names or arguments:
+
+```json
+{"action":"help"}
+```
+
+Request details with an **exact public action name** (including singular `team.*`):
+
+```json
+{"action":"help","topic":"agents.create"}
+```
+
+Help returns static, versioned JSON in `details.data` and bounded text: a grouped
+directory or one action's parameters, constraints, effects and illustrative
+example. It works in read-only and non-interactive operation without starting
+work, initializing a workflow ledger, reading transcripts or writing snapshots.
+Only `action` and optional `topic` are accepted; topics are exact, nonempty strings
+up to 96 characters. Unknown actions/topics stay errors; `topic` is not accepted
+on other actions. Examples are data, not requests to execute them.
+
+The directory distinguishes **inspection**, **configuration changes** and
+**execution**. Help is not an authority grant: workflow definition/script save
+does not start work, recovery `prepare` does not authorize execution, and coding
+approval/recovery authorization remain trusted host/operator interfaces—not
+model-callable tool actions. `/zerg help`, `/zerg-swarm help` and `/swarm help`
+remain the human-facing reference.
+
+This describes the source/release capability, not the currently loaded extension.
+An older installed or loaded version may still reject `help`; after an operator
+updates the installed package, Pi must reload the extension (for example with
+`/reload`) before live calls use the new schema and dispatcher.
 
 Background jobs are inspectable through `/zerg runs`, `/zerg logs`, direct `runs.*`/`logs.list`, and `/zerg interrupt`/`{ action: 'interrupt' }` while the Pi process/session remains alive. v1.1.0 also supports opt-in durable snapshots under `.pi/zerg-swarm/v1/state.json` through `persistence: { enabled: true, rootDir }`, so restart can recover run/log history and mark previously active sessions as `needs-attention` instead of losing them.
 
@@ -1019,7 +1053,8 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.19: patch release adding restricted scripted workflow authoring through the existing engine (Stage 8D)
 - v1.1.20: patch release adding approved local read-only workflow triggers and operator profiles (Stage 8E)
 - v1.1.21: patch release adding cached background activity and a configurable, conflict-checked management shortcut (Stage 9)
-- v1.1.22: documentation release introducing the visual feature showcase and public SVG diagrams (current release)
+- v1.1.22: documentation release introducing the visual feature showcase and public SVG diagrams
+- v1.1.23: bounded structured-control help, exact-action topics, schema discovery and helpful errors (current release)
 
 ## License
 

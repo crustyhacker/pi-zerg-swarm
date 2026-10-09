@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.23] - 2026-10-09
+
+### Added
+
+- Bounded, read-only `zerg_control` help: a grouped public-action directory and exact-action topics with arguments, examples, side effects, and authority restrictions.
+- A typed public-action catalog shared by structured help, the tool schema's action enum, and accepted-action discovery; trusted-only approval and recovery execution APIs remain excluded.
+
+### Fixed
+
+- Unknown structured-control actions now return bounded, sanitized errors with a help hint. Malformed help requests fail explicitly without initializing workflows, changing state, or launching work.
+
 ## [1.1.22] - 2026-10-09
 
 ### Added
