@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="1120" viewBox="0 0 1180 1120" role="img" aria-labelledby="workflow-engine-title workflow-engine-desc">
+  <title id="workflow-engine-title">Workflow engine: real review DAG and trusted staged coding</title>
+  <desc id="workflow-engine-desc">The built-in read-only-review graph discovers scoped targets, fans out native reviewers, collects findings, independently verifies them, and produces a deduplicated report consuming all dependency envelopes. Separate version-2 typed conditions and bounded repeat blocks extend the engine. Opt-in trusted coding requires investigation, human implementation approval, private stage writing, actual checks, independent review, human application approval, and deterministic apply. Models cannot grant either approval.</desc>
+  <defs>
+    <linearGradient id="backdrop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#181c2e"/>
+      <stop offset="1" stop-color="#0b111b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#b494ff"/>
+      <stop offset="0.55" stop-color="#65ddec"/>
+      <stop offset="1" stop-color="#6ce5b2"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 7 4 L 1 7" fill="none" stroke="#65ddec" stroke-width="1.5"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1180" height="1120" rx="20" fill="url(#backdrop)"/>
+  <rect x="1" y="1" width="1178" height="1118" rx="20" fill="none" stroke="#2c3a50"/>
+  <rect x="42" y="38" width="68" height="4" rx="2" fill="url(#accent)"/>
+  <path d="M 1000 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1032 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1064 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1096 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1128 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="42" y="75" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="16" font-weight="700" text-anchor="start" letter-spacing="2">PI / ZERG SWARM</text>
+  <text x="42" y="130" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="44" font-weight="700" text-anchor="start">A real engine. Not a prompt chain.</text>
+  <text x="44" y="169" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="22" font-weight="400" text-anchor="start">Validated dependencies · frozen identities · bounded native admission</text>
+  <rect x="44" y="200" width="1092" height="385" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="232" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">READ-ONLY-REVIEW / BUILT-IN DAG</text>
+  <text x="66" y="262" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">Each review and verification is a native single-agent unit. Teams are separate.</text>
+  <rect x="65" y="351" width="177" height="100" rx="12" fill="#101622" stroke="#b494ff"/>
+  <text x="153.5" y="381" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Discovery</text>
+  <text x="153.5" y="408" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Scoped targets</text>
+  <text x="153.5" y="432" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">At most 16 targets</text>
+  <rect x="308" y="294" width="170" height="70" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="393.0" y="324" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Reviewer A</text>
+  <text x="393.0" y="351" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Native unit</text>
+  <path d="M 242 401 H 277 V 329 H 305" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 478 329 H 506 V 401 H 532" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="308" y="384" width="170" height="70" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="393.0" y="414" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Reviewer B</text>
+  <text x="393.0" y="441" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Native unit</text>
+  <path d="M 242 401 H 277 V 419 H 305" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 478 419 H 506 V 401 H 532" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="308" y="474" width="170" height="70" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="393.0" y="504" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Reviewer …</text>
+  <text x="393.0" y="531" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Native unit</text>
+  <path d="M 242 401 H 277 V 509 H 305" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 478 509 H 506 V 401 H 532" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="535" y="351" width="174" height="100" rx="12" fill="#101622" stroke="#6ce5b2"/>
+  <text x="622.0" y="381" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Collect</text>
+  <text x="622.0" y="408" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Finding envelopes</text>
+  <text x="622.0" y="432" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Deterministic</text>
+  <rect x="752" y="351" width="168" height="100" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="836.0" y="381" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Verify</text>
+  <text x="836.0" y="408" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Independent units</text>
+  <text x="836.0" y="432" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">At most 32 findings</text>
+  <rect x="963" y="351" width="150" height="100" rx="12" fill="#101622" stroke="#6ce5b2"/>
+  <text x="1038.0" y="381" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Report</text>
+  <text x="1038.0" y="408" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Deduplicated</text>
+  <text x="1038.0" y="432" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Coverage visible</text>
+  <path d="M 709 401 H 749" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 920 401 H 960" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <text x="312" y="282" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">PARALLEL FAN-OUT</text>
+  <path d="M 154 451 V 558 H 1038 V 454" fill="none" stroke="#65ddec" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="4 6"/>
+  <path d="M 393 544 V 558" fill="none" stroke="#65ddec" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 6"/>
+  <path d="M 622 451 V 558" fill="none" stroke="#65ddec" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 6"/>
+  <path d="M 836 451 V 558" fill="none" stroke="#65ddec" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 6"/>
+  <text x="644" y="579" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Report consumes all dependency envelopes</text>
+  <rect x="44" y="607" width="529" height="170" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="638" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">TYPED CONDITIONS / VERSION 2</text>
+  <text x="66" y="674" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="19" font-weight="400" text-anchor="start">when: boolean · eq · comparisons · all / any</text>
+  <text x="66" y="706" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">False &gt; condition-false; no native unit created.</text>
+  <text x="66" y="739" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">Schema-checked data, not expression evaluation.</text>
+  <rect x="594" y="607" width="542" height="170" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="616" y="638" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">BOUNDED REPEAT / VERSION 2</text>
+  <text x="616" y="674" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="400" text-anchor="start">State &gt; body DAG &gt; feedback &gt; until</text>
+  <text x="616" y="706" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">1–32 iterations; cleanup settles before the next.</text>
+  <text x="616" y="739" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">Limit without convergence is not success.</text>
+  <rect x="44" y="801" width="1092" height="277" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="834" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">TRUSTED STAGED CODING / OPT-IN VERSION 3</text>
+  <rect x="66" y="855" width="226" height="87" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="179.0" y="885" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Investigate</text>
+  <text x="179.0" y="912" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Read-only stage</text>
+  <rect x="340" y="855" width="226" height="87" rx="12" fill="#101622" stroke="#b494ff"/>
+  <text x="453.0" y="885" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">HUMAN APPROVAL</text>
+  <text x="453.0" y="912" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Implementation scope</text>
+  <rect x="614" y="855" width="226" height="87" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="727.0" y="885" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Stage-write</text>
+  <text x="727.0" y="912" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Private candidate</text>
+  <rect x="888" y="855" width="226" height="87" rx="12" fill="#101622" stroke="#6ce5b2"/>
+  <text x="1001.0" y="885" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Check</text>
+  <text x="1001.0" y="912" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Actual approved profile</text>
+  <path d="M 292 899 H 337" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 566 899 H 611" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 840 899 H 885" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="888" y="965" width="226" height="87" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="1001.0" y="995" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Independent review</text>
+  <text x="1001.0" y="1022" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Candidate + check evidence</text>
+  <rect x="614" y="965" width="226" height="87" rx="12" fill="#101622" stroke="#b494ff"/>
+  <text x="727.0" y="995" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">HUMAN APPROVAL</text>
+  <text x="727.0" y="1022" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Exact application</text>
+  <rect x="340" y="965" width="226" height="87" rx="12" fill="#101622" stroke="#6ce5b2"/>
+  <text x="453.0" y="995" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Apply</text>
+  <text x="453.0" y="1022" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Approved bytes · per file</text>
+  <path d="M 1001 942 V 962" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 888 1009 H 843" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 614 1009 H 569" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <text x="66" y="988" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="start">Two distinct gates.</text>
+  <text x="66" y="1018" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="19" font-weight="400" text-anchor="start">No model grants.</text>
+  <text x="44" y="1105" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="17" font-weight="400" text-anchor="start">Model verdicts are evidence, not ground truth. Failed checks or unresolved gates block application.</text>
+</svg>

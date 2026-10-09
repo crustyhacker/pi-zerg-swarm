@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="910" viewBox="0 0 1180 910" role="img" aria-labelledby="recovery-contract-title recovery-contract-desc">
+  <title id="recovery-contract-title">Recovery contract: inert history, fresh authority, new linked attempts</title>
+  <desc id="recovery-contract-desc">With opt-in persistence and recovery, retained evidence is inspectable but inert. Inspection and preparation do not execute work. Exact trusted fresh authority is required before a new linked attempt with new task, run and Pi identities can start; coding still needs fresh implementation approval, writer, actual checks, independent review and separate application approval. Unknown relevant owner, check or native settlement blocks conflicting execution. Never automatic replay or session reconnection. Saved-history continuation is a separate reviewed new-task flow into a fresh native session.</desc>
+  <defs>
+    <linearGradient id="backdrop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#181c2e"/>
+      <stop offset="1" stop-color="#0b111b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#b494ff"/>
+      <stop offset="0.55" stop-color="#65ddec"/>
+      <stop offset="1" stop-color="#6ce5b2"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 7 4 L 1 7" fill="none" stroke="#65ddec" stroke-width="1.5"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1180" height="910" rx="20" fill="url(#backdrop)"/>
+  <rect x="1" y="1" width="1178" height="908" rx="20" fill="none" stroke="#2c3a50"/>
+  <rect x="42" y="38" width="68" height="4" rx="2" fill="url(#accent)"/>
+  <path d="M 1000 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1032 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1064 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1096 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 1128 38 v 25 l -12 12 v 30" fill="none" stroke="#273048" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="42" y="75" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="16" font-weight="700" text-anchor="start" letter-spacing="2">PI / ZERG SWARM</text>
+  <text x="42" y="130" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="42" font-weight="700" text-anchor="start">Recover evidence. Never invent authority.</text>
+  <text x="44" y="169" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="21" font-weight="400" text-anchor="start">Retained history is not a live connection, a completion proof, or permission.</text>
+  <rect x="44" y="204" width="1092" height="334" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="238" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">WORKFLOW RECOVERY / OPT-IN PERSISTENCE + RECOVERY</text>
+  <rect x="66" y="278" width="226" height="113" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="179.0" y="308" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Persist evidence</text>
+  <text x="179.0" y="335" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Checkpoint + identities</text>
+  <text x="179.0" y="359" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Retained uncertainty</text>
+  <text x="179.0" y="266" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="14" font-weight="700" text-anchor="middle">01 / OPT IN</text>
+  <rect x="340" y="278" width="226" height="113" rx="12" fill="#101622" stroke="#65ddec"/>
+  <text x="453.0" y="308" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Inspect / prepare</text>
+  <text x="453.0" y="335" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Inert assessment</text>
+  <text x="453.0" y="359" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">No execution or writes</text>
+  <text x="453.0" y="266" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="14" font-weight="700" text-anchor="middle">02 / READ ONLY</text>
+  <rect x="614" y="278" width="226" height="113" rx="12" fill="#101622" stroke="#b494ff"/>
+  <text x="727.0" y="308" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">Fresh authority</text>
+  <text x="727.0" y="335" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Exact selections + proof</text>
+  <text x="727.0" y="359" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Trusted host confirmation</text>
+  <text x="727.0" y="266" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="14" font-weight="700" text-anchor="middle">03 / TRUSTED GATE</text>
+  <rect x="888" y="278" width="226" height="113" rx="12" fill="#101622" stroke="#6ce5b2"/>
+  <text x="1001.0" y="308" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="20" font-weight="700" text-anchor="middle">NEW linked attempt</text>
+  <text x="1001.0" y="335" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">New task / run / Pi IDs</text>
+  <text x="1001.0" y="359" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="16" font-weight="400" text-anchor="middle">Fresh execution gates</text>
+  <text x="1001.0" y="266" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="14" font-weight="700" text-anchor="middle">04 / NOT RECONNECT</text>
+  <path d="M 292 334 H 337" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 566 334 H 611" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M 840 334 H 885" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="66" y="419" width="1048" height="86" rx="10" fill="#282332" stroke="#f6ce82"/>
+  <text x="86" y="451" fill="#f6ce82" font-family="Noto Sans, sans-serif" font-size="21" font-weight="700" text-anchor="start">UNKNOWN SETTLEMENT BLOCKS CONFLICTING EXECUTION</text>
+  <text x="86" y="484" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">Owner / check / native closure must be proven. PID absence or elapsed time is not proof.</text>
+  <path d="M 727 391 V 416" fill="none" stroke="#f6ce82" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="44" y="559" width="1092" height="114" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="590" fill="#b494ff" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">CODING RECOVERY STILL REQUIRES FRESH GATES</text>
+  <text x="66" y="627" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="20" font-weight="400" text-anchor="start">Implementation approval &gt; writer &gt; actual checks &gt; independent review &gt; application approval</text>
+  <text x="66" y="653" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="17" font-weight="400" text-anchor="start">Carried candidate bytes are evidence—not reused writer completion or an old approval.</text>
+  <rect x="44" y="695" width="1092" height="164" rx="12" fill="#141b28" stroke="#2c3a50"/>
+  <text x="66" y="727" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="15" font-weight="700" text-anchor="start" letter-spacing="1.4">SEPARATE FEATURE / SAVED-HISTORY CONTINUATION</text>
+  <text x="66" y="762" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="22" font-weight="700" text-anchor="start">Selected saved entry</text>
+  <path d="M 315 754 H 387" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <text x="407" y="762" fill="#edf3ff" font-family="Noto Sans, sans-serif" font-size="22" font-weight="700" text-anchor="start">Review current policy</text>
+  <path d="M 659 754 H 731" fill="none" stroke="#65ddec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <text x="751" y="762" fill="#6ce5b2" font-family="Noto Sans, sans-serif" font-size="22" font-weight="700" text-anchor="start">Approve NEW task</text>
+  <text x="66" y="801" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="19" font-weight="400" text-anchor="start">Fresh native session for one selected agent. The original history is not resumed or modified.</text>
+  <text x="66" y="832" fill="#a8b8d0" font-family="Noto Sans, sans-serif" font-size="18" font-weight="400" text-anchor="start">History does not restore workspace files, processes, credentials, queues or old permissions.</text>
+  <text x="44" y="888" fill="#65ddec" font-family="Noto Sans, sans-serif" font-size="18" font-weight="700" text-anchor="start">Never automatic replay. Never automatic reconnection. Inspection and preparation grant no execution.</text>
+</svg>

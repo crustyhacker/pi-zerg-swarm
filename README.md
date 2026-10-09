@@ -1,18 +1,164 @@
 # pi-zerg-swarm
 
-`pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
+**Build a swarm. See the work. Keep the decisions explicit.**
 
+Native parallel agents, programmable workflows, and a command center for the
+**Pi coding agent**—from a focused read-only review to human-approved staged
+implementation. Define your specialists, coordinate their work, inspect the
+exact conversations, and carry useful history into a fresh task.
 
-> **v1.1.21 release status**
-> Adds a compact background activity strip and a configurable management shortcut sharing `/zerg config`.
-> Observation and human UI preferences do not grant execution, approval or recovery authority. Existing workflow authoring, coding approvals, local automation and conservative recovery remain intact.
+![Zerg Swarm overview: native agent teams, bounded workflows, exact-session inspection, and explicit human decisions](docs/assets/swarm-hero.svg)
+
+**Workflows are the engine. Native Pi sessions do the work. You own the gates.**
+
+[Quickstart](#quickstart) · [Workflows](#workflows) ·
+[Command center](#command-center) · [Reference](#release-status) ·
+[Script language](workflow-script-language.md) · [Changelog](CHANGELOG.md)
+
+## What you can build
+
+| Your outcome | What Zerg brings |
+| --- | --- |
+| **Review in parallel, then synthesize** | Configurable specialists and explicit teams; FIFO worker admission, per-run concurrency (default **8**), then a leader pass with worker handoffs. Required worker failures remain failures. |
+| **Turn a process into a repeatable graph** | Dependency DAGs, bounded fan-out, typed conditions, schema-validated results, deterministic aggregation, and bounded feedback loops. |
+| **Move from findings to a reviewed candidate** | Trusted-host staged coding: investigation, separate implementation approval, private candidate edits, approved checks, independent review, then separate application approval. |
+| **See the exact agent—not a guessed conversation** | Parent/member/Pi session identities, live text and tool inspection, saved raw branch history, explicit messages and receipts, and a read-only team/run timeline. |
+| **Stay in your main Pi conversation** | Background native runs, a compact below-editor activity strip, and **Alt+G** management without waiting for workers to finish. |
+| **Automate without driving a terminal** | `/zerg` for humans; `zerg_control` and `createZergControl(...)` for structured control. A separate local CLI runs approved read-only workflow profiles. |
+| **Keep interrupted work inspectable** | Opt-in run/log snapshots, explicit retry attempts, and conservative workflow recovery with current evidence and fresh trusted-host authorization—not automatic replay. |
+
+## Workflows
+
+**A graph you can inspect. Parallel work you can bound. Decisions you can review.**
+
+![Workflow engine schematic: dependency graph, parallel native work, typed branching, bounded repetition, validated outputs, and separate coding approval gates](docs/assets/workflow-engine.svg)
+
+Start with the built-in **`read-only-review`**: discovery → parallel reviews →
+finding collection → independent verification → deduplicated report. Then author
+your own graphs with the same engine:
+
+- **DAG + fan-out:** declare dependencies and expand bounded arrays into native
+  units; independent work shares configured concurrency permits.
+- **Typed branches:** boolean, scalar, and numeric conditions are validated data,
+  not expression strings. Skips, failures, and missing values stay distinct.
+- **Bounded refinement:** repeat a body DAG with validated feedback state and an
+  explicit iteration ceiling; exhaustion is non-convergence, not success.
+- **Structured results:** input/output schemas and deterministic aggregates make
+  agent output usable by downstream steps. Model verdicts remain evidence, not proof.
+- **Operational controls:** monitor attempts → steps → units → bounded results;
+  pause new admissions, request cancellation, or explicitly start a settled retry.
+  Matching completed units may be reused; reuse does not establish workspace freshness.
+- **Restricted script authoring:** write the documented `workflow` / `native` /
+  `aggregate` / `repeat` / `coding` / `phase` DSL. It is **compiled as data into
+  the existing validated graph**, not executed as JavaScript. Compile/save/import
+  never starts agents or grants approval.
+
+**For coding, implementation and application are different human decisions.**
+Trusted-host configuration enables staged writing and approved deterministic
+checks; independent read-only review evaluates the candidate and actual check
+evidence. The application gate binds the exact candidate, evidence, and target
+baseline. Neither a model response nor an ordinary `zerg_control` action can
+approve these gates. Checks run trusted project code with host permissions—not
+inside an OS sandbox.
+
+**For interruption, inspect first.** Opt-in recovery preserves uncertainty,
+reconciles current evidence, and requires an exact trusted-host decision before
+a fresh linked attempt. Coding still needs fresh implementation/check/review
+and application gates. Unknown native settlement blocks conflicting execution;
+recovery is not a reconnect or an exactly-once guarantee.
+
+→ [Graphs and controls](#declarative-read-only-workflows) ·
+[Script grammar](workflow-script-language.md) ·
+[Recovery contract](#explicit-workflow-recovery-stage-8c)
+
+## Command center
+
+**One place to choose work, inspect agents, and make deliberate interventions.**
+
+![Illustrative command-center schematic, not a screenshot: background activity, management tree, exact coding view, workflow progress, and receipt-aware timeline](docs/assets/command-center.svg)
+
+*Illustrative schematic—not a screenshot, live run, or performance measurement.*
+
+- **Manage:** `/zerg config` or **Alt+G** opens selection, settings, tree/detail,
+  and intervention views. Configure agent prompts, explicit models, teams, and
+  tool allow/deny lists; unsupported native options reject before SDK startup.
+- **Watch:** the bounded activity strip distinguishes working/queued agents,
+  workflow approval waits, checks, cleanup, and uncertainty. It observes this
+  Pi owner's work—not other processes or the main conversational model.
+- **Inspect:** `/zerg sessions` chooses an exact session. Read live text,
+  available thinking, and tool arguments/results; inspect validated saved raw
+  branches without changing the native session or reconstructing effective context.
+- **Message:** explicitly send `steer` or `followUp` to an accepting live
+  session. Receipts distinguish **recorded**, **queued**, **delivered**,
+  **failed**, and **needs-attention**. Delivered means observed native
+  consumption, not model acknowledgement or task completion.
+- **Continue deliberately:** select saved history, prepare a current-policy
+  review, then explicitly authorize a **new task in a fresh native session**.
+  The old session, permissions, queues, and approvals are not resumed.
+- **Trace:** `/zerg timeline` separates operator receipts, native handoffs,
+  recorded events, and current snapshots with exact identity filters.
+
+Closing a view or hiding the strip does not cancel work. Background work lasts
+only while its owning Pi process is alive; recovered history is not live.
+
+## Quickstart
+
+Requires an existing Pi installation and **Node.js ≥22.19.0**. Review the package
+source before installing: Pi extensions run with your host permissions.
+Install from the repository using Pi's package manager, then start Pi in the
+project you want to inspect:
+
+```sh
+pi install git:github.com/crustyhacker/pi-zerg-swarm
+pi
+```
+
+This is a Git-source package install, not a claim of npm publication. Pi defaults
+to personal package settings; add `--local` to the install command for a
+project-scoped declaration, which loads only after Pi project trust is granted.
+For an already-open Pi, load the installed extension with `/reload` when ready.
+
+Inside Pi, replace **both** `provider/model` placeholders with an explicit model
+available in your Pi environment. The following starts read-only workflow work;
+it does not enable staged coding or approve application:
+
+```text
+/zerg agents update generalist --model provider/model
+/zerg agents update reviewer --model provider/model
+/zerg workflows start {"definitionId":"read-only-review","inputs":{"candidatePaths":["README.md"],"scope":"Review this file without changing it; report evidence and unresolved questions"},"concurrency":8}
+/zerg workflows monitor
+```
+
+Clear unsupported turn limits, fallback models, and permission overrides on
+these definitions before native workflow execution. In the monitor, **Enter**
+drills down and **c** opens the selected unit's exact coding view; **q/Esc**
+closes the view without cancelling work. Use **Alt+G** to open management.
+
+**Prefer a specialist or team?** Use `/zerg agents` and `/zerg team` to configure
+explicit definitions, then `/zerg run <agent-or-team> <task> --bg --fresh`.
+Team workers run first; the leader integrates after all workers settle unless
+cancelled. Native execution needs no `pi-subagents` bridge.
+
+**Need a local scheduled inspection?** The Linux-only `pi-zerg-automation` CLI
+accepts an operator-reviewed, fixed read-only profile and one occurrence
+request. Scheduling stays external; there is no daemon, catch-up queue, coding
+approval, automatic recovery, or shared cross-process live monitor.
+[Read the operator setup before enabling a profile.](#external-read-only-triggers-stage-8e)
+
+---
+
+## Reference
+
+The sections below document command grammar, API contracts, limits, and recovery
+boundaries. `pi-zerg-swarm` is a Pi coding-agent extension, **not** a Raspberry Pi
+hardware swarm project.
 
 ## Release status
 
-- Current release: **v1.1.21** (background activity and management shortcut, Stage 9).
+- Current release: **v1.1.22** (visual feature showcase; includes background activity and the Stage 9 management shortcut).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - The release path requires general, milestone, security, performance, hardening, and cleanup audits.
-- Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
+- Canonical repository: https://github.com/crustyhacker/pi-zerg-swarm.
 
 ## Pi compatibility
 
@@ -26,7 +172,7 @@ Pi supplies its SDK and TUI libraries to installed extensions. They are declared
 - `/zerg-swarm` — alias
 - `/swarm` — alias
 
-At v1.1.0 these commands display help, status, expanded tree visibility, deterministic thinking-step parser output, Claude Code-style runtime agent-definition configuration, native Pi SDK-backed run execution, task-first subagent spawn state, explicit fresh/fork launch-mode metadata, command-host permission queue state, fine-grained lifecycle substate hints, bounded structured log/output inspection, restart-durable run/log recovery snapshots, process-lifetime background run status/interrupt/message support, and a componentized Pi-native interactive management TUI for live tree/detail/settings/chat/footer management views through snapshot-safe shared-state-backed Pi command handlers.
+These commands display help, status, expanded tree visibility, deterministic thinking-step parser output, Claude Code-style runtime agent-definition configuration, native Pi SDK-backed run execution, task-first subagent spawn state, explicit fresh/fork launch-mode metadata, command-host permission queue state, fine-grained lifecycle substate hints, bounded structured log/output inspection, restart-durable run/log recovery snapshots, process-lifetime background run status/interrupt/message support, and a componentized Pi-native interactive management TUI for live tree/detail/settings/chat/footer management views through snapshot-safe shared-state-backed Pi command handlers.
 Command-host control grammar is available via `/zerg mode status|manual|assisted|automatic|revert [reason]`, `/zerg intervene agent|subagent|leader ...`, `/zerg agents list|show|create|update|delete` with per-agent `--model`, `--fallback-models`, `--max-turns`, tools, and permission settings, `/zerg agent`/`/zerg team` lifecycle configuration flags for team leaders/members/model metadata, `/zerg runs list|show <run-id>`, `/zerg permission status|list|request|approve|deny|cancel`, `/zerg logs status|list|show|json`, `/zerg config`, and `/zerg run <agent-or-team> <task> [--bg] [--fresh|--fork] [--model <model>]`; `/zerg run` does not require `pi-subagents` and uses the native Pi SDK runner when no slash bridge responds.
 
 `/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane for the separate coding overlay, or **t** on a team/run for its timeline. The explicit live composer is distinct from the management intervention history. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
@@ -454,7 +600,7 @@ Use Node **>=22.19.0** and a package installation exposing `pi-zerg-automation`.
 
 Choose canonical absolute paths outside interactive Pi state. For example, `/srv/zerg-operator/profiles/nightly-readonly.json` controls `/srv/zerg-project`, with separate `/srv/zerg-operator/state/snapshot.json`, `/srv/zerg-operator/agent`, and `/srv/zerg-operator/sessions`. The operator must first provision the project, profiles directory, and snapshot's parent under protected ancestry; prefer owner-only directories (`0700`) and nonsecret profile files (`0600`). Every component must be effective-UID/root-owned and not group/other-writable, without symlinks; files must be regular and single-link. A root-owned sticky ancestor such as `/tmp` requires the very next directory to be protected and effective-UID-owned. Do not reuse the interactive snapshot, agent, or session directory. Existing snapshots must be private (`0600`); an absent snapshot is allowed. Only the configured agent/session directories may be created by the runner after fresh exclusive acquisition. It does not repair permissions.
 
-The following **operator bootstrap** uses only pure public APIs and produces a complete **disabled, unapproved** profile. Review/adapt the paths, fixed scope, and physical model before saving its JSON as `nightly-readonly.json`; this code neither saves nor starts a workflow. The catalog selection shown is an example, not proof that the selected SDK/provider supports it on your host.
+The following **operator bootstrap** uses only pure public APIs and produces a complete **disabled, unapproved** profile. Review/adapt the paths, fixed scope, and physical model before saving its JSON as `nightly-readonly.json`; this code neither saves nor starts a workflow. Replace `your-provider` and `your-model` with the same explicit physical catalog selection in both model fields; the placeholders are not runnable model IDs or proof of SDK/provider support on your host.
 
 ```js
 import { createJiti } from 'jiti';
@@ -478,8 +624,8 @@ const profile = {
   definition, definitionId: definition.id, definitionHash: workflowHash(definition),
   fixedInputs: {}, readPaths: ['README.md'],
   agents: [{ id: 'reader', label: 'Reader', prompt: 'Read only the approved text scope.',
-    source: 'runtime', model: 'openai/gpt-4.1:off', tools: ['read'], permissionMode: 'inherit' }],
-  modelPolicy: { provider: 'openai', id: 'gpt-4.1', thinkingLevel: 'off' },
+    source: 'runtime', model: 'your-provider/your-model:off', tools: ['read'], permissionMode: 'inherit' }],
+  modelPolicy: { provider: 'your-provider', id: 'your-model', thinkingLevel: 'off' },
   credentialSourceRef: { kind: 'env', name: 'ZERG_AUTOMATION_API_KEY' },
   modelConfigFile: null,
   limits: { maxEventAgeMs: 300000, maxFutureSkewMs: 30000, minIntervalMs: 60000,
@@ -727,40 +873,32 @@ Previews are bounded (1,024 body and 256 summary UTF-16 code units; 65,536 aggre
 
 ## Architecture
 
-```mermaid
-flowchart TB
-  subgraph Runtime["Public command runtime (implemented)"]
-    PiContext["Pi extension context"] --> Index["index.ts command entry"]
-    Index --> State["state.ts shared state"]
-    Index --> Patch["internal-patch.ts safe bridge"]
-    Patch --> State
-    Parse["parse.ts thinking-step parser"] --> State
-    State --> Render["render.ts text renderers"]
-    Render --> Operator["operator output"]
-  end
+![Recovery contract schematic: inert restored history, current evidence assessment, exact trusted-host authorization, and a fresh linked attempt with fresh coding gates](docs/assets/recovery-contract.svg)
 
-  Parse -->|"thinking-step derivation"| Render
-  Index -->|"registered commands"| Operator
-```
+The current runtime connects slash commands, the `zerg_control` tool, and
+`createZergControl(...)` to the same structured control core in `index.ts`.
+Shared state and bounded logs feed management, coding, timeline, and workflow
+views; the activity strip is a display-only projection, not a scheduler.
 
-```mermaid
-flowchart TD
-  subgraph CommandHost["Command-host flows (implemented)"]
-    Operator["operator"] --> Host["/zerg mode + /zerg intervene command surface"]
-    Host --> Views["help / status / tree"]
-    Views --> Snapshots["shared snapshots + audit records"]
-    Snapshots -->|"renders"| Rendered["visible runtime text"]
-  end
+- **Native execution:** Pi SDK sessions own agent conversations. Team workers
+  use FIFO concurrency lanes; the leader starts after workers settle. Exact
+  session references connect owned live observation and explicit saved-history
+  inspection to the correct parent/member/Pi identity.
+- **Workflow execution:** `workflow-model.ts` validates data graphs and schemas;
+  `workflow-runtime.ts` schedules dependencies, bounded expansion, and attempts.
+  Script authoring compiles into this engine rather than introducing a second
+  runtime. Trusted coding adds staged files, approved checks, independent review,
+  and separate implementation/application approvals.
+- **Durable evidence:** opt-in Zerg snapshots retain run/log/workflow/receipt
+  state; Pi JSONL remains the sole native transcript store. Recovery inspection
+  is inert. Eligible recovery execution uses fresh linked attempts and fresh
+  authority, never restored live sessions or persisted approvals.
+- **Local triggers:** `automation-cli.mjs` / `automation-runner.ts` invoke the
+  same workflow engine in an isolated foreground owner. Historical status/report
+  inspection does not reconnect to that owner or join an interactive strip.
 
-  subgraph Planned["Planned runtime"]
-    Leader["team leader"] --> SubA["subagent"]
-    SubA --> Queue["task queue"]
-  end
-
-  Host -.-> Leader
-```
-
-Future milestones keep runtime, hooks, tasks, and rendering separate so monitoring can evolve without coupling to private Pi internals.
+The diagrams are schematics of these contracts, not screenshots or guarantees
+of filesystem confinement, provider cost, or exactly-once effects.
 
 ## Package shape
 
@@ -880,7 +1018,8 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.18: patch release adding explicit durable workflow recovery and fresh linked execution (Stage 8C)
 - v1.1.19: patch release adding restricted scripted workflow authoring through the existing engine (Stage 8D)
 - v1.1.20: patch release adding approved local read-only workflow triggers and operator profiles (Stage 8E)
-- v1.1.21: patch release adding cached background activity and a configurable, conflict-checked management shortcut (Stage 9; current release)
+- v1.1.21: patch release adding cached background activity and a configurable, conflict-checked management shortcut (Stage 9)
+- v1.1.22: documentation release introducing the visual feature showcase and public SVG diagrams (current release)
 
 ## License
 

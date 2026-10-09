@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.22] - 2026-10-09
+
+### Added
+
+- A visual GitHub feature showcase with four accessible, self-contained SVG diagrams for native swarms, workflow orchestration, the management control room, and explicit recovery.
+- Outcome-focused introductions and navigation covering agent teams, typed workflow graphs, staged coding approvals, exact-session observation and messaging, background activity, and local read-only automation.
+
+### Changed
+
+- Replace obsolete planned-runtime architecture guidance with the implemented native execution and workflow model, while retaining the detailed reference and authority boundaries.
+- Include public diagram assets in the explicit package allowlist so README illustrations remain available to packaged readers. Runtime behavior is unchanged.
+
 ## [1.1.21] - 2026-10-09
 
 ### Added
