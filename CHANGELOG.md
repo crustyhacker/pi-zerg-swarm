@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.24] - 2026-10-09
+
+### Added
+
+- An original, self-contained 1980s-style pixel-art swarm logo for the GitHub landing page, with accessible SVG title and description.
+- An explicit non-affiliation note distinguishing the project's original agent-drone artwork from Blizzard characters and assets.
+
+### Changed
+
+- Refresh README branding and make structured-control action help easier to find. Runtime behavior and approval boundaries are unchanged.
+
 ## [1.1.23] - 2026-10-09
 
 ### Added

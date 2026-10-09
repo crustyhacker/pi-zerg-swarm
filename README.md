@@ -1,5 +1,7 @@
 # pi-zerg-swarm
 
+![pi-zerg-swarm: an original neon pixel-art swarm of coordinated agent drones](docs/assets/swarm-logo.svg)
+
 **Build a swarm. See the work. Keep the decisions explicit.**
 
 Native parallel agents, programmable workflows, and a command center for the
@@ -12,7 +14,7 @@ exact conversations, and carry useful history into a fresh task.
 **Workflows are the engine. Native Pi sessions do the work. You own the gates.**
 
 [Quickstart](#quickstart) · [Workflows](#workflows) ·
-[Command center](#command-center) · [Reference](#release-status) ·
+[Command center](#command-center) · [API help](#discover-actions-safely) · [Reference](#release-status) ·
 [Script language](workflow-script-language.md) · [Changelog](CHANGELOG.md)
 
 ## What you can build
@@ -24,7 +26,7 @@ exact conversations, and carry useful history into a fresh task.
 | **Move from findings to a reviewed candidate** | Trusted-host staged coding: investigation, separate implementation approval, private candidate edits, approved checks, independent review, then separate application approval. |
 | **See the exact agent—not a guessed conversation** | Parent/member/Pi session identities, live text and tool inspection, saved raw branch history, explicit messages and receipts, and a read-only team/run timeline. |
 | **Stay in your main Pi conversation** | Background native runs, a compact below-editor activity strip, and **Alt+G** management without waiting for workers to finish. |
-| **Automate without driving a terminal** | `/zerg` for humans; `zerg_control` and `createZergControl(...)` for structured control. A separate local CLI runs approved read-only workflow profiles. |
+| **Automate without driving a terminal** | `/zerg` for humans; `zerg_control` and `createZergControl(...)` for structured control, with [read-only action help](#discover-actions-safely) when you need the exact arguments. A separate local CLI runs approved read-only workflow profiles. |
 | **Keep interrupted work inspectable** | Opt-in run/log snapshots, explicit retry attempts, and conservative workflow recovery with current evidence and fresh trusted-host authorization—not automatic replay. |
 
 ## Workflows
@@ -155,7 +157,7 @@ hardware swarm project.
 
 ## Release status
 
-- Current release: **v1.1.23** (structured-control help and action discovery; includes the visual showcase, background activity and Stage 9 management shortcut).
+- Current release: **v1.1.24** (original retro swarm branding; includes structured-control help, workflows, background activity and the Stage 9 management shortcut).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - The release path requires general, milestone, security, performance, hardening, and cleanup audits.
 - Canonical repository: https://github.com/crustyhacker/pi-zerg-swarm.
@@ -1054,7 +1056,14 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.20: patch release adding approved local read-only workflow triggers and operator profiles (Stage 8E)
 - v1.1.21: patch release adding cached background activity and a configurable, conflict-checked management shortcut (Stage 9)
 - v1.1.22: documentation release introducing the visual feature showcase and public SVG diagrams
-- v1.1.23: bounded structured-control help, exact-action topics, schema discovery and helpful errors (current release)
+- v1.1.23: bounded structured-control help, exact-action topics, schema discovery and helpful errors
+- v1.1.24: original retro swarm logo and refreshed GitHub presentation (current release)
+
+## Artwork and affiliation
+
+The pixel-art swarm logo is original artwork depicting abstract agent drones,
+not Blizzard characters or game assets. This independent Pi extension is not
+affiliated with, endorsed by, or sponsored by Blizzard Entertainment.
 
 ## License
 
