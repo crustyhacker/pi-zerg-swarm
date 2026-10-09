@@ -10,6 +10,8 @@ import type { WorkflowDefinition, WorkflowReply } from '../workflow-model.js';
 import { createZergPersistenceManager } from '../persistence.js';
 
 const fakeSource = `
+// Deliberately unsupported: no shortcut resolver or registration capability.
+export class ExtensionRunner {}
 const h = new Proxy({}, {get:(_t,k)=>globalThis.__zergRecoveryControlFakeHost[k],set:(_t,k,v)=>{globalThis.__zergRecoveryControlFakeHost[k]=v;return true;}});
 export const getAgentDir = () => '/fake-owned-agent';
 export const ModelRuntime = { async create() { h.loads++; return { getAvailable: () => [{provider:'fake',id:'model'}] }; } };
@@ -33,6 +35,8 @@ const fakeUrl = `data:text/javascript,${encodeURIComponent(fakeSource)}`;
 const sdkHook = registerHooks({ resolve(specifier, context, next) { return specifier === '@earendil-works/pi-coding-agent' ? { url: fakeUrl, shortCircuit: true } : next(specifier, context); } });
 after(() => sdkHook.deregister());
 const { createZergControl, registerZergSwarmExtension } = await import('../index.js');
+const { installManagementShortcutCatalogGuard } = await import('../internal-patch.js');
+const { ExtensionRunner } = await import(fakeUrl);
 
 type FakeHost = Record<string, any>;
 let host: FakeHost;
@@ -42,6 +46,26 @@ const definition = (): WorkflowDefinition => ({ id: 'recovery-control', version:
 function reply(result: any): WorkflowReply { assert.equal(result.ok, true, result.error?.message); return result.data as WorkflowReply; }
 async function start(control: any) { const saved = await control.execute({ action: 'agents.create', id: 'safe', prompt: 'Read only.', model: 'fake/model', tools: ['read'] }); assert.equal(saved.ok, true, saved.error?.message); reply(await control.execute({ action: 'workflows.define', definition: definition() })); const started = reply(await control.execute({ action: 'workflows.start', definitionId: 'recovery-control', inputs: {}, concurrency: 1 })); await control.drain?.(); return started.view!.workflowRunId; }
 async function bytes(root: string) { const out: Record<string,string> = {}; const walk = (dir: string, prefix='') => { for (const name of readdirSync(dir)) { const path = join(dir, name), rel = prefix ? `${prefix}/${name}` : name; if (statSync(path).isDirectory()) walk(path, rel); else out[rel] = readFileSync(path, 'utf8'); } }; walk(root); return JSON.stringify(out); }
+
+test('fake Pi shortcut bridge stays unsupported, inert and unregistered', () => {
+  reset(); const prototype = ExtensionRunner.prototype;
+  const before = Object.getOwnPropertyDescriptors(prototype), parent = Object.getPrototypeOf(prototype);
+  let registrations = 0, callbacks = 0;
+  assert.equal(Object.hasOwn(prototype, 'getShortcuts'), false);
+  const guard = installManagementShortcutCatalogGuard({
+    handler() {}, ownerCommandHandler() {}, candidate: 'alt+g',
+    enabled() { callbacks++; return true; }, register() { registrations++; },
+    validate() { callbacks++; return { ok: true }; }, onCatalog() { callbacks++; },
+  });
+  assert.equal(guard.installed, false); assert.equal(registrations, 0); assert.equal(callbacks, 0);
+  assert.deepEqual(Object.getOwnPropertyDescriptors(prototype), before);
+  assert.equal(Object.getPrototypeOf(prototype), parent);
+  guard.dispose(); guard.dispose();
+  assert.deepEqual(Object.getOwnPropertyDescriptors(prototype), before);
+  assert.equal(Object.getPrototypeOf(prototype), parent);
+  assert.equal(registrations, 0); assert.equal(callbacks, 0);
+  assert.equal(host.loads, 0); assert.equal(host.creates, 0); assert.equal(host.providers, 0);
+});
 
 test('recovery inspect and prepare structured tool validate exact IDs, selections and no authorization fields', async () => {
   reset(); let tool: any; const extension = registerZergSwarmExtension({ registerTool(value) { tool = value; }, registerCommand() {} });

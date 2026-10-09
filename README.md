@@ -3,13 +3,13 @@
 `pi-zerg-swarm` is a Pi coding-agent extension for native configurable agent teams, direct structured control, and zerg-style subagent orchestration. It is **not** a Raspberry Pi hardware swarm project.
 
 
-> **v1.1.20 release status**
-> Adds approved, bounded read-only workflows through a foreground local automation runner with explicit profiles, isolated ownership and durable duplicate-event protection.
-> Existing workflow authoring, coding approvals and conservative recovery remain intact. Triggers cannot grant recovery/mutation authority, replay interrupted work, install schedules or provide an OS sandbox.
+> **v1.1.21 release status**
+> Adds a compact background activity strip and a configurable management shortcut sharing `/zerg config`.
+> Observation and human UI preferences do not grant execution, approval or recovery authority. Existing workflow authoring, coding approvals, local automation and conservative recovery remain intact.
 
 ## Release status
 
-- Current release: **v1.1.20** (approved local read-only workflow triggers, Stage 8E).
+- Current release: **v1.1.21** (background activity and management shortcut, Stage 9).
 - Historical milestones preserved for audit traceability: v0.8.0 implementation milestone and v0.8.1 audit follow-up patch.
 - The release path requires general, milestone, security, performance, hardening, and cleanup audits.
 - Canonical repository metadata is configured for the public repo: https://github.com/fluxgear/pi-zerg-swarm.
@@ -30,6 +30,35 @@ At v1.1.0 these commands display help, status, expanded tree visibility, determi
 Command-host control grammar is available via `/zerg mode status|manual|assisted|automatic|revert [reason]`, `/zerg intervene agent|subagent|leader ...`, `/zerg agents list|show|create|update|delete` with per-agent `--model`, `--fallback-models`, `--max-turns`, tools, and permission settings, `/zerg agent`/`/zerg team` lifecycle configuration flags for team leaders/members/model metadata, `/zerg runs list|show <run-id>`, `/zerg permission status|list|request|approve|deny|cancel`, `/zerg logs status|list|show|json`, `/zerg config`, and `/zerg run <agent-or-team> <task> [--bg] [--fresh|--fork] [--model <model>]`; `/zerg run` does not require `pi-subagents` and uses the native Pi SDK runner when no slash bridge responds.
 
 `/zerg config` is intended to stay simple: **Select** an agent/team/task, use **Settings** for mode/read-only/controller/permissions, and use **Message** to record an operator intervention. Press **v** in the tree/detail pane for the separate coding overlay, or **t** on a team/run for its timeline. The explicit live composer is distinct from the management intervention history. The overlay uses Pi theme colors when available and keeps the current key hints visible in the footer.
+
+## Background activity and management shortcut
+
+Interactive Pi displays a compact Zerg widget below the editor while this Pi owner has observable background work. It covers standalone native agents, queued team members and the genuinely active leader, and native/workflow phases without counting an orchestration run or reused result as another agent. Checks, approval waits, cancellation and uncertain cleanup are distinct from agents working. The main conversational Pi model is not a background worker.
+
+Illustrative examples, **not live data**:
+
+```text
+● Zerg · Review: working · 3 agents working · 2 agents queued  [alt+g] Manage
+! Zerg · Workflow attempt 1: waiting approval · 2 agents working  [alt+g] Manage
+```
+
+Fixed, non-expanding workflows show completed top-level steps; skipped, failed and reused work remain separate. Repeat/fan-out totals are unknown rather than an expansion ceiling or invented percentage. Elapsed time belongs to the displayed run/attempt. Successful, settled local completion remains for five seconds, then disappears when idle. Recovered or disconnected records never imply live execution. Separate-process one-shot automation is **not live-tracked**; Zerg does not scan other state directories or reconnect history.
+
+**Alt+G** opens the same management view as `/zerg config`, including when the strip is hidden or no work is running. It does not wait for background work, approve anything or change execution selection. Closing management or hiding the strip does not cancel work. The widget leaves the main editor, footer and other extensions' widgets intact; narrow/short terminals reduce or hide its bounded, at-most-two-line display.
+
+In management, focus **Settings**, then press **o** for UI preferences. Enter a shortcut such as `alt+j`, `off` to disable it, or `default` to reset to `alt+g`; press Enter to save and Escape to return. **Ctrl+V** toggles strip visibility immediately. Shortcut changes—including disable/reset—remain **pending until `/reload`**. Settings distinguish the desired value from the actual active binding; the strip shows only the active key. `/zerg config`, `/zerg-swarm config` and `/swarm config` remain available.
+
+Preferences use the dedicated `<agent-dir>/zerg-swarm/ui.json` file (normally `~/.pi/agent/zerg-swarm/ui.json`):
+
+```json
+{"version":1,"activityStrip":true,"managementShortcut":"alt+g"}
+```
+
+A missing file uses defaults without writing it. Human settings actions save only this file, not Pi's keybindings or model configuration. The portable shortcut subset accepts Ctrl/Alt-modified letters and digits; unmodified printable keys, unsupported modifiers and known terminal-equivalent collisions are rejected. Invalid edits preserve the previous valid setting. Startup/reload conflicts disable Zerg's binding instead of taking another action's key, with a bounded warning and command fallback.
+
+Conflict checks cover effective Pi/user bindings and observed extension shortcut registrations, including legacy ambiguities such as Ctrl+I/Tab and Ctrl+M/Enter. The narrowly guarded catalog integration is verified for Pi 1.0.0/1.0.4; unsupported or changed host resolvers fail closed. Desktop/window-manager bindings, terminal-emulator mappings, private input handlers, unbracketed paste identical to a keypress, and arbitrary live rebinding without host table reconstruction cannot be universally detected. The opener rejects bracketed paste, malformed/mixed packets, key repeats/releases and unrelated modal input; no raw input is consumed or rewritten by its observer.
+
+Print, JSON and RPC operation does not initialize the widget or require terminal input. The strip and shortcut are observation/navigation only: no agents, approvals, retries, recovery execution, policy changes or provider requests are caused by rendering.
 
 ## Direct automation API
 
@@ -776,7 +805,7 @@ npm test
 npm run check:package
 npm run check:version
 ```
-`npm run build` performs strict TypeScript no-emit checking. `npm test` runs parser plus command-surface coverage, direct control API/tool registration coverage, state/container behavior, registration snapshot semantics, internal-patch event-bus wrapping/duplicate/rollback/dispose paths, render/lifecycle/mode/permission/log regressions, and focused M9 UI coverage for management overlay lifecycle, tree navigation, settings/actions, chat delivery semantics, and fake-Pi shared-state parity checks using Node's built-in test runner and `tsx`.
+`npm run build` performs strict TypeScript no-emit checking. `npm test` runs test files serially to keep lifecycle and timing checks independent of cross-file test load. It runs parser plus command-surface coverage, direct control API/tool registration coverage, state/container behavior, registration snapshot semantics, internal-patch event-bus wrapping/duplicate/rollback/dispose paths, render/lifecycle/mode/permission/log regressions, and focused M9 UI coverage for management overlay lifecycle, tree navigation, settings/actions, chat delivery semantics, and fake-Pi shared-state parity checks using Node's built-in test runner and `tsx`.
 `npm run check:package` validates MIT/license metadata, package/build private-path guards, package-lock↔package version sync, and repository metadata fields for release discoverability and consistency.
 `npm run check:version` confirms that the package release tag matching `package.json` is at `HEAD` in post-tag state. During explicit pre-tag release prep, skip this check until the release tag exists at `HEAD`; if run earlier, the failure is expected.
 
@@ -850,7 +879,8 @@ These Linux/Python/installed-Pi fixtures use empty owned environments, scripted 
 - v1.1.17: patch release adding trusted staged coding with separate approval gates
 - v1.1.18: patch release adding explicit durable workflow recovery and fresh linked execution (Stage 8C)
 - v1.1.19: patch release adding restricted scripted workflow authoring through the existing engine (Stage 8D)
-- v1.1.20: patch release adding approved local read-only workflow triggers and operator profiles (Stage 8E; current release)
+- v1.1.20: patch release adding approved local read-only workflow triggers and operator profiles (Stage 8E)
+- v1.1.21: patch release adding cached background activity and a configurable, conflict-checked management shortcut (Stage 9; current release)
 
 ## License
 

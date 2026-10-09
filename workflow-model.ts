@@ -1,3 +1,4 @@
+import type { ActivitySource, WorkflowActivitySnapshot } from './activity.js';
 import { createHash } from 'node:crypto';
 import type { ZergAgentDefinition } from './types.js';
 import { validateCodingPolicy } from './workflow-coding.js';
@@ -142,6 +143,8 @@ export interface WorkflowTrustedApprovalApi {
   inspect(id?: string): Array<{ id: string; kind: WorkflowCodingApprovalKind; status: string; requestHash: string; consumed: boolean; createdAt: string; decidedAt?: string; reason?: string; request: Record<string, unknown>; scope: Record<string, unknown> }>;
 }
 export interface WorkflowService {
+  /** Optional cached display-only source; observation never initializes or admits work. */
+  readonly activity?: ActivitySource<WorkflowActivitySnapshot>;
   execute(action: WorkflowAction, signal?: AbortSignal): Promise<WorkflowReply>;
   list(): WorkflowView[]; get(workflowRunId: string): WorkflowRun | undefined;
   readonly approvals: WorkflowTrustedApprovalApi;

@@ -1,3 +1,5 @@
+import { DEFAULT_MANAGEMENT_SHORTCUT } from './preferences.js';
+import type { ManagementUiPreferencesFacade } from './management-shortcut.js';
 import { Input, type Component, type Focusable } from '@earendil-works/pi-tui';
 import type { AutomationMode, StructuralPiCommandContext, StructuralPiCustomComponent, StructuralPiTuiHandle, ZergControlController, ZergManagementTargetKind, ZergManagementUiState, ZergOperatorMessageDeliveryStatus, ZergState } from '../types.js';
 import { sanitizeTranscriptText } from './agent-overlay.js';
@@ -27,12 +29,13 @@ export interface ZergManagementOverlayOptions {
   getSnapshot(): ZergState;
   subscribe(listener: () => void): () => void;
   adapterKind: string;
+  uiPreferences?: ManagementUiPreferencesFacade;
   actions: ZergManagementOverlayActions;
   viewTimeline?(target: { id: string; kind: ZergManagementTargetKind } | undefined): Promise<void>;
   viewCoding?(target: { id: string; kind: ZergManagementTargetKind } | undefined): Promise<void>;
 }
 
-export async function openZergManagementOverlay(context: StructuralPiCommandContext, options: ZergManagementOverlayOptions): Promise<void> {
+export async function openZergManagementOverlay(context: Pick<StructuralPiCommandContext, 'ui'>, options: ZergManagementOverlayOptions): Promise<void> {
   let component: ZergManagementOverlayComponent | undefined;
   try {
     await Promise.resolve(context.ui?.custom?.(
@@ -51,6 +54,8 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   private readonly treeState = createTreePaneState();
   private readonly settingsState = createSettingsPaneState();
   private readonly chatInput = new Input();
+  private readonly preferencesInput = new Input();
+  private unsubscribePreferences: () => void = () => undefined;
   private codingViewerOpen = false;
   private disposed = false;
   private unsubscribe: () => void = () => undefined;
@@ -64,6 +69,15 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     private readonly done: (() => void) | undefined,
     private readonly options: ZergManagementOverlayOptions,
   ) {
+    this.preferencesInput.onSubmit = (value) => {
+      const shortcut = value.trim().toLowerCase() === 'off' ? null : value.trim().toLowerCase() === 'default' ? DEFAULT_MANAGEMENT_SHORTCUT : value;
+      const result = this.options.uiPreferences?.saveHuman({ managementShortcut: shortcut });
+      this.uiState.statusMessage = result?.ok ? 'UI preferences saved; shortcut changes require /reload' : result?.reason ?? 'UI preferences unavailable';
+      this.requestRender();
+    };
+    this.preferencesInput.onEscape = () => { this.settingsState.preferencesOpen = false; this.requestRender(); };
+    try { this.unsubscribePreferences = options.uiPreferences?.subscribe(() => this.requestRender()) ?? (() => undefined); }
+    catch { /* Preferences observation does not change existing controls. */ }
     this.chatInput.onSubmit = (value) => {
       this.uiState.chatDraft = value;
       this.uiState.statusMessage = sendChatDraft(this.options.getSnapshot(), this.uiState, this.options.actions);
@@ -89,6 +103,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     const safeHeight = height;
     if (safeWidth < 72 || safeHeight < 18) {
       this.chatInput.focused = false;
+      this.preferencesInput.focused = false;
       return [styleText(this.theme, 'warning', 'zerg config: resize terminal (72 columns / 18 rows); Esc closes')]
         .slice(0, safeHeight).map((line) => fitRawLine(line, safeWidth));
     }
@@ -96,13 +111,21 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     const footer = renderManagementFooter(snapshot, this.uiState, this.options.adapterKind, safeWidth, this.theme);
     const header = this.renderHeader(snapshot, safeWidth);
     const bodyHeight = Math.max(8, safeHeight - header.length - footer.length - 1);
+    if (this.settingsState.preferencesOpen && this.options.uiPreferences) {
+      this.chatInput.focused = false;
+      this.preferencesInput.focused = this.focused;
+      const preferences = renderSettingsPane(snapshot, this.uiState, this.settingsState, this.options.adapterKind, safeWidth, bodyHeight, this.theme, this.options.uiPreferences, this.preferencesInput.render(Math.max(8, safeWidth - 4)));
+      this.cachedWidth = width; this.cachedHeight = height;
+      return this.cachedLines = [...header, ...preferences, '', ...footer].map((line) => fitRawLine(line, safeWidth)).slice(0, safeHeight);
+    }
     const topHeight = Math.max(4, Math.floor(bodyHeight * 0.58));
     const bottomHeight = Math.max(4, bodyHeight - topHeight);
     const leftWidth = Math.max(30, Math.floor((safeWidth - 2) * 0.42));
     const rightWidth = safeWidth - 2 - leftWidth;
     const tree = renderTreePane(snapshot, this.uiState, this.treeState, leftWidth, topHeight, this.theme);
     const detail = renderDetailPane(snapshot, this.uiState, rightWidth, topHeight, this.theme);
-    const settings = renderSettingsPane(snapshot, this.uiState, this.settingsState, this.options.adapterKind, leftWidth, bottomHeight, this.theme);
+    this.preferencesInput.focused = this.focused && this.uiState.focusedPane === 'settings' && !!this.settingsState.preferencesOpen;
+    const settings = renderSettingsPane(snapshot, this.uiState, this.settingsState, this.options.adapterKind, leftWidth, bottomHeight, this.theme, this.options.uiPreferences);
     this.chatInput.focused = this.focused && this.uiState.focusedPane === 'chat';
     const composerLines = this.chatInput.render(Math.max(8, rightWidth - 12));
     const chat = renderChatPane(snapshot, this.uiState, rightWidth, bottomHeight, composerLines, this.theme);
@@ -124,6 +147,18 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
 
   handleInput(data: string): void {
     if (this.disposed) return;
+    // Own text BEFORE legacy global keys: typing r/m/a/u/c/i/p/d cannot change authority.
+    if (this.settingsState.preferencesOpen && this.options.uiPreferences) {
+      if (matchesKey(data, 'ctrl+v')) {
+        const result = this.options.uiPreferences.saveHuman({ activityStrip: !this.options.uiPreferences.snapshot().activityStrip });
+        this.uiState.statusMessage = result.ok ? 'Activity strip visibility saved (immediate)' : result.reason;
+      } else if (data.length > 4096) this.uiState.statusMessage = 'UI preference input exceeds limit';
+      else {
+        this.preferencesInput.handleInput(data);
+        if (this.preferencesInput.getValue().length > 128) this.preferencesInput.setValue(this.preferencesInput.getValue().slice(0, 128));
+      }
+      this.requestRender(); return;
+    }
     if (matchesKey(data, 'escape') || ((data === 'q' || data === 'Q') && (this.uiState.focusedPane !== 'chat' || this.uiState.chatDraft.length === 0))) {
       this.dispose();
       return;
@@ -182,6 +217,7 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
     const unsubscribe = this.unsubscribe;
     this.unsubscribe = () => undefined;
     try { unsubscribe(); } catch { /* A failing observer cannot block host completion. */ }
+    try { this.unsubscribePreferences(); } catch { /* Observer only. */ }
     try { this.done?.(); } catch { /* Host completion is attempted once. */ }
   }
 
@@ -340,7 +376,12 @@ export class ZergManagementOverlayComponent implements StructuralPiCustomCompone
   }
 
   private handleSettingsInput(data: string): void {
-    if (matchesKey(data, 'up')) {
+    if ((data === 'o' || data === 'O') && this.options.uiPreferences) {
+      this.settingsState.preferencesOpen = true;
+      this.settingsState.confirmation = undefined;
+      this.preferencesInput.setValue(this.options.uiPreferences.snapshot().desired ?? 'off');
+      this.uiState.statusMessage = 'editing UI preferences (no execution authority changes)';
+    } else if (matchesKey(data, 'up')) {
       movePendingPermissionCursor(this.settingsState, this.options.getSnapshot(), -1);
       this.uiState.statusMessage = 'permission cursor moved';
     } else if (matchesKey(data, 'down')) {

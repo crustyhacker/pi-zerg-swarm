@@ -1,3 +1,4 @@
+import type { ManagementUiPreferencesFacade } from './management-shortcut.js';
 import type { AutomationMode, ZergControlController, ZergManagementUiState, ZergPermissionRequest, ZergState } from '../types.js';
 import { renderPane, sanitizeUiText, styleText, type UiThemeLike } from './components.js';
 
@@ -11,6 +12,7 @@ export interface SettingsPaneActions {
 
 export interface SettingsPaneState {
   pendingCursor: number;
+  preferencesOpen?: boolean;
   confirmation?: { action: 'approve' | 'deny'; requestId: string };
 }
 
@@ -53,7 +55,22 @@ export function cycleController(state: ZergState, actions: SettingsPaneActions):
   return actions.setController(next);
 }
 
-export function renderSettingsPane(state: ZergState, uiState: ZergManagementUiState, settingsState: SettingsPaneState, adapterKind: string, width: number, height: number, theme?: UiThemeLike): string[] {
+export function renderSettingsPane(state: ZergState, uiState: ZergManagementUiState, settingsState: SettingsPaneState, adapterKind: string, width: number, height: number, theme?: UiThemeLike, preferences?: ManagementUiPreferencesFacade, inputLines: string[] = []): string[] {
+  if (settingsState.preferencesOpen && preferences) {
+    const view = preferences.snapshot();
+    const lines = [
+      `Activity strip: ${view.activityStrip ? 'shown' : 'hidden'} (immediate)`,
+      `Active: ${view.active ?? 'disabled/unavailable'}`,
+      `Desired: ${view.desired ?? 'disabled'}${view.pending ? ' (pending /reload)' : ''}`,
+      ...(view.reason ? [sanitizeUiText(view.reason)] : []),
+      `Fallback: ${view.fallback}`,
+      ...(view.alternative ? [`Validated alternate: ${view.alternative}`] : []),
+      'Shortcut: type key, off, or default; Enter saves',
+      ...inputLines,
+      'Ctrl+v strip | Esc back; shortcut changes require /reload',
+    ];
+    return renderPane(lines, { title: '2 UI preferences', focused: uiState.focusedPane === 'settings', width, height, theme });
+  }
   const pending = getPendingPermissionRows(state);
   settingsState.pendingCursor = pending.length === 0 ? 0 : Math.max(0, Math.min(settingsState.pendingCursor, pending.length - 1));
   const controller = getControlController(state);
@@ -64,7 +81,7 @@ export function renderSettingsPane(state: ZergState, uiState: ZergManagementUiSt
     `${styleText(theme, 'accent', 'Controller')} ${controller}   ${styleText(theme, 'accent', 'Adapter')} ${sanitizeUiText(adapterKind)}`,
     `Selected: ${sanitizeUiText(uiState.selectedTargetKind ?? 'none')} ${sanitizeUiText(uiState.selectedTargetId)}`.trim(),
     '',
-    'Quick keys:',
+    preferences ? 'Quick keys: o UI preferences (when settings focused)' : 'Quick keys:',
     '  r read-only   m manual   a assisted   u automatic   c controller',
     '',
     `Pending approvals (${pending.length})`,

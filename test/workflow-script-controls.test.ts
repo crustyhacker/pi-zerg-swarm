@@ -9,8 +9,22 @@ import { createZergState, createZergStateContainer } from '../state.js';
 import type { StructuralPiToolDefinition, ZergControlAction, ZergStateContainer } from '../types.js';
 import type { WorkflowDefinition, WorkflowState } from '../workflow-model.js';
 
-// native-history's existing static SessionManager import is not SDK execution.
-let staticHistoryLoads = 0, sdkLoads = 0;
+// History's existing static API import is allowed; the shortcut bridge is inert.
+// Preferences get only a throwing static facade, never an agent directory.
+// Every other Pi-root request remains forbidden.
+let staticHistoryLoads = 0, staticBridgeLoads = 0, staticPreferencesLoads = 0, sdkLoads = 0, preferenceDirCalls = 0, controlledRejections = 0;
+const bridgeParents = new Set(['../internal-patch.ts', '../internal-patch.js'].map(path => new URL(path, import.meta.url).href));
+const bridgeUrl = `data:text/javascript,${encodeURIComponent('export class ExtensionRunner {}')}`;
+const preferencesParents = new Set(['../ui/preferences.ts', '../ui/preferences.js'].map(path => new URL(path, import.meta.url).href));
+(globalThis as any).__scriptControlPreferenceDirCall = () => { preferenceDirCalls++; };
+const preferencesUrl = `data:text/javascript,${encodeURIComponent('export function getAgentDir() { globalThis.__scriptControlPreferenceDirCall(); throw new Error("Agent directory lookup forbidden in authoring tests."); }')}`;
+function resolvePiRoot(parentURL: string | undefined, controlledNegative = false) {
+  if (parentURL?.endsWith('/native-history.ts') || parentURL?.endsWith('/native-history.js')) { staticHistoryLoads++; return undefined; }
+  if (parentURL && bridgeParents.has(parentURL)) { staticBridgeLoads++; return { url: bridgeUrl, shortCircuit: true }; }
+  if (parentURL && preferencesParents.has(parentURL)) { staticPreferencesLoads++; return { url: preferencesUrl, shortCircuit: true }; }
+  if (controlledNegative) controlledRejections++; else sdkLoads++;
+  throw new Error('SDK/session/provider execution forbidden in authoring tests.');
+}
 let mutateRead: (() => void) | undefined;
 (globalThis as any).__scriptControlReadMutation = () => mutateRead?.();
 const parserChildren: Array<{ child: ChildProcess; closed: boolean }> = [];
@@ -22,16 +36,44 @@ const processWrapper = `export * from 'child_process'; import {spawn as real} fr
 const fsWrapper = `export * from 'fs'; import {readSync as read} from 'fs'; export function readSync(...args){const result=read(...args);globalThis.__scriptControlReadMutation?.();return result;}`;
 const hook = registerHooks({ resolve(specifier, context, next) {
   if (specifier === '@earendil-works/pi-coding-agent') {
-    if (context.parentURL?.endsWith('/native-history.ts') || context.parentURL?.endsWith('/native-history.js')) { staticHistoryLoads++; return next(specifier, context); }
-    sdkLoads++; throw new Error('SDK/session/provider execution forbidden in authoring tests.');
+    return resolvePiRoot(context.parentURL) ?? next(specifier, context);
   }
   if (specifier === 'node:child_process' && context.parentURL?.includes('/workflow-script-process.')) return { url: `data:text/javascript,${encodeURIComponent(processWrapper)}`, shortCircuit: true };
   if (specifier === 'node:fs' && context.parentURL?.includes('/workflow-script-controls.')) return { url: `data:text/javascript,${encodeURIComponent(fsWrapper)}`, shortCircuit: true };
   return next(specifier, context);
 } });
-after(() => { hook.deregister(); delete (globalThis as any).__scriptControlReadMutation; delete (globalThis as any).__scriptControlSpawn; });
+after(() => { hook.deregister(); delete (globalThis as any).__scriptControlReadMutation; delete (globalThis as any).__scriptControlSpawn; delete (globalThis as any).__scriptControlPreferenceDirCall; });
 const { createZergControl, createPiZergCommandHandler, registerZergSwarmExtension } = await import('../index.js');
 const { parseWorkflowScriptAction, readWorkflowScriptFile, executeWorkflowScriptAction } = await import('../workflow-script-controls.js');
+
+test('authoring static imports account for history, inert bridge and uncalled preferences facade', async () => {
+  assert.equal(staticHistoryLoads, 1); assert.equal(staticBridgeLoads, 1); assert.equal(staticPreferencesLoads, 1);
+  assert.equal(sdkLoads, 0); assert.equal(preferenceDirCalls, 0);
+  const { ExtensionRunner } = await import(bridgeUrl);
+  assert.deepEqual(Reflect.ownKeys(ExtensionRunner.prototype), ['constructor']);
+  assert.equal(Object.hasOwn(ExtensionRunner.prototype, 'getShortcuts'), false);
+  const preferencesFacade = await import(preferencesUrl);
+  assert.deepEqual(Object.keys(preferencesFacade), ['getAgentDir']);
+  assert.equal(typeof preferencesFacade.getAgentDir, 'function'); // Do not invoke: nonTUI authoring must never call it.
+  assert.equal(preferenceDirCalls, 0);
+});
+
+test('authoring guard rejects other Pi-root parents with separately counted negative probes', () => {
+  const parents = [undefined, new URL('../index.ts', import.meta.url).href,
+    new URL('../workflow-script-controls.ts', import.meta.url).href,
+    new URL('../nested/internal-patch.ts', import.meta.url).href,
+    'file:///unrelated/internal-patch.ts', new URL('../internal-patch.ts?other', import.meta.url).href,
+    ...['../nested/ui/preferences.ts', '../nested/ui/preferences.js', '../preferences.ts', '../preferences.js',
+      '../ui/preferences.ts?other', '../ui/preferences.js?other', '../ui/preferences.ts#other', '../ui/preferences.js#other']
+      .map(path => new URL(path, import.meta.url).href),
+    'file:///unrelated/ui/preferences.ts', 'file:///unrelated/ui/preferences.js'];
+  assert.equal(controlledRejections, 0);
+  for (const parent of parents) assert.throws(() => resolvePiRoot(parent, true), /SDK\/session\/provider execution forbidden/);
+  assert.equal(controlledRejections, parents.length);
+  assert.equal(staticHistoryLoads, 1); assert.equal(staticBridgeLoads, 1); assert.equal(staticPreferencesLoads, 1);
+  assert.equal(sdkLoads, 0); assert.equal(preferenceDirCalls, 0);
+});
+
 
 const source = `workflow({id:"script-control",label:"Control test",inputSchema:{type:"object",properties:{},additionalProperties:false}},()=>{
 const review=native("review",{dependsOn:[],inputs:{},agentId:"safe",prompt:"/literal",outputSchema:{type:"object",properties:{ok:{type:"boolean"}},required:["ok"],additionalProperties:false}});
@@ -43,7 +85,7 @@ function fixture() {
     replace: state => { writes++; return base.replace(state); }, update: (state, options) => { writes++; return base.update(state, options); } };
   const off = base.subscribe!(() => { notifications++; });
   const control = createZergControl(container, { subagentAdapter: { kind: 'fake', launch() { launches++; throw new Error('No native launch authority.'); } } });
-  return { control, container, close: () => { off(); control.dispose(); }, get effects() { return { writes, launches, notifications, sdkLoads }; } };
+  return { control, container, close: () => { off(); control.dispose(); }, get effects() { return { writes, launches, notifications, sdkLoads, preferenceDirCalls }; } };
 }
 const payload = (result: Awaited<ReturnType<ReturnType<typeof fixture>['control']['execute']>>) => { assert.equal(result.ok, true, result.error?.message); return result.data as any; };
 
@@ -406,6 +448,10 @@ test('reload-style disposal drains the old compiler owner and permits a fresh re
 
 test('authoring leaves every actual parser child closed and never dynamically initializes the native SDK', () => {
   assert.equal(staticHistoryLoads, 1, 'Only the pre-existing static history API import is allowed');
+  assert.equal(staticBridgeLoads, 1, 'Only the exact static shortcut bridge import receives the inert facade');
+  assert.equal(staticPreferencesLoads, 1, 'Only the exact static preferences parent receives the throwing facade');
+  assert.equal(preferenceDirCalls, 0, 'NonTUI authoring never looks up a real or manufactured agent directory');
+  assert.equal(controlledRejections, 16, 'Deliberate guard probes are counted separately from authoring SDK attempts');
   assert.equal(sdkLoads, 0); assert.ok(parserChildren.length > 0);
   assert.ok(parserChildren.every(record => record.closed));
   for (const record of parserChildren) if (record.child.pid) assert.throws(() => process.kill(record.child.pid!, 0), (error: NodeJS.ErrnoException) => error.code === 'ESRCH');

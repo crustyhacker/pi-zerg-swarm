@@ -18,7 +18,7 @@ export interface TrustedAutomationNativeContext {
 export type { WorkflowAction, WorkflowDefinition, WorkflowRun, WorkflowView, WorkflowReply, WorkflowNativeLineage } from './workflow-model.js';
 
 export const ZERG_COMMANDS = ['zerg', 'zerg-swarm', 'swarm'] as const;
-export const ZERG_EXTENSION_VERSION = '1.1.20' as const;
+export const ZERG_EXTENSION_VERSION = '1.1.21' as const;
 export type ZergCommandName = (typeof ZERG_COMMANDS)[number];
 export const ZERG_COMMAND_INVOCATIONS = ['/zerg', '/zerg-swarm', '/swarm'] as const;
 export type ZergCommandInvocation = (typeof ZERG_COMMAND_INVOCATIONS)[number];
@@ -352,6 +352,8 @@ export interface ZergLogState {
 
 export interface ZergSubagentControlAdapter {
   readonly kind: 'pi-native' | 'pi-slash-bridge' | 'fake' | 'unavailable';
+  /** Compact owner observation; kind/status/session retention is not execution proof. */
+  readonly activity?: import('./activity.js').ActivitySource<import('./activity.js').NativeActivitySnapshot>;
   launch(request: ZergSubagentLaunchRequest): ZergSubagentControlResult;
   interrupt?(runId?: string): ZergSubagentControlResult;
   sendMessage?(targetId: string, body: string, runId?: string, mode?: ZergOperatorMessageMode): ZergOperatorMessageResult | Promise<ZergOperatorMessageResult>;
@@ -692,6 +694,8 @@ export interface StructuralPiCustomComponent {
 export interface StructuralPiTuiHandle {
   terminal?: { rows?: number; columns?: number };
   requestRender?(force?: boolean): void;
+  hasOverlay?(): boolean;
+  getFocusedComponent?(): unknown;
 }
 
 export type ZergConfigOverlayTab = 'monitor' | 'control' | 'targets' | 'permissions' | 'lifecycle' | 'logs' | 'intervene' | 'config';
@@ -749,6 +753,9 @@ export interface StructuralPiCommandContext {
       options?: StructuralPiCustomOptions | Record<string, unknown>,
     ): Promise<unknown> | { close?(): void; dispose?(): void } | unknown;
     confirm?(message: string, details?: string): Promise<boolean> | boolean;
+    /** Public TUI-only widget and passive input capabilities; absent on legacy hosts. */
+    setWidget?: import('@earendil-works/pi-coding-agent').ExtensionUIContext['setWidget'];
+    onTerminalInput?: import('@earendil-works/pi-coding-agent').ExtensionUIContext['onTerminalInput'];
   };
 }
 
@@ -782,6 +789,7 @@ export interface StructuralPiToolDefinition {
 }
 
 export interface StructuralPiExtensionContext {
+  registerShortcut?: import('@earendil-works/pi-coding-agent').ExtensionAPI['registerShortcut'];
   on?(eventName: unknown, handler: (...args: unknown[]) => unknown): unknown;
   registerCommand?(name: ZergCommandName, options: StructuralPiCommandOptions): unknown;
   registerTool?(definition: StructuralPiToolDefinition): unknown;

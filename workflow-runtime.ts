@@ -1,3 +1,5 @@
+import { ACTIVITY_LIMITS, createActivityChannel } from './activity.js';
+import type { ActivityProgress, WorkflowActivityRun, WorkflowActivitySnapshot, WorkflowActivityUnit } from './activity.js';
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
@@ -441,7 +443,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     const ctx = () => { workflowAssert(session.effectContext, 'Coding workspace effect lacks current admitted unit context'); return session.effectContext; };
     const remember = (key: string, opId: string | undefined) => { if (opId) opIds.set(key, opId); };
     const find = (key: string) => opIds.get(key);
-    const save = () => { try { validateRunRecovery(ctx().run); stamp(ctx().run); persist(); } catch (error) { authorityLost = true; cleanupUncertain = true; active.forEach(a => a.controller.abort()); throw error; } };
+    const save = () => { try { validateRunRecovery(ctx().run); stamp(ctx().run); persist(); } catch (error) { authorityLost = true; cleanupUncertain = true; active.forEach(a => a.controller.abort()); refreshActivity(); throw error; } };
     const reserveEffect = (intent: WorkspaceEffectIntent, capacity: import('./workflow-workspace.js').WorkspaceEffectCapacity, pendingOpId?: string) => {
       const c = ctx();
       const kind: RecoveryOperationKind = intent.kind === 'destination-write' ? 'application' : 'stage-write';
@@ -507,7 +509,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         }, WORKFLOW_LIMITS.ledgerBytes) };
         let opId: string | undefined;
         try { opId = recoveryEffectIntent(c.run, c.spec, c.unit, kind, [intent.path], { [intent.path]: intent.preimageHash }, { [intent.path]: intent.postimageHash }, intent.generation); }
-        catch (error) { authorityLost = true; cleanupUncertain = true; active.forEach(a => a.controller.abort()); throw error; }
+        catch (error) { authorityLost = true; cleanupUncertain = true; active.forEach(a => a.controller.abort()); refreshActivity(); throw error; }
         remember(`${intent.generation}:${intent.sequence}`, opId);
         // Publication observers may add bounded retained history synchronously.
         // Re-project the canonical ledger with the actual pending intent before
@@ -589,6 +591,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       } catch { /* The local view remains explicitly uncertain. */ }
     }
     recoveryDiagnostic = { reason: recoveryAuthorizationPoisoned, localView: 'stale-or-uncertain', publication: diagnosticRuns ? 'canonical-selection-observed' : 'uncertain' };
+    refreshActivity();
   };
   // Never hydrated. Selection/origin are history, not executable authority.
   const liveRecoveryPlans = new Map<string, { generation: string; fingerprint: string; units: Set<string>; settledSources: Set<string>; settlementChecks: Array<() => boolean>; settlementObservers: Array<() => WorkflowJson>; carry?: { manifest?: unknown; partialOptions?: import('./workflow-workspace.js').InspectPartialArtifactsOptions; allowedPaths: string[]; remainingPaths: string[]; satisfiedPaths: string[]; observationHash: string }; sourceHistoryHash: string }>();
@@ -604,6 +607,78 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
   let initialized = false;
 
   const projectedRuns = () => diagnosticRuns ?? state.runs;
+  // Observer-local identities distinguish inert restored terminal history from this owner.
+  const restoredActivityIds = new Set(state.runs.map(run => run.workflowRunId));
+  const activityApplying = new Set<string>();
+  const activityChannel = createActivityChannel<WorkflowActivitySnapshot>({ revision: 0,
+    available: true, uncertain: false, runs: [], clipped: false });
+  let activityRevision = 0;
+  const refreshActivity = () => {
+    try {
+      const runs: WorkflowActivityRun[] = [];
+      let clipped = projectedRuns().length > ACTIVITY_LIMITS.workflowRuns;
+      const uncertain = authorityLost || owners.get(container) !== owner || !!recoveryDiagnostic || (disposed && active.size > 0);
+      for (const run of projectedRuns().slice(0, ACTIVITY_LIMITS.workflowRuns)) {
+        const units: WorkflowActivityUnit[] = [];
+        const progress: ActivityProgress = { basis: 'top-level-steps',
+          total: run.definition.steps.some(spec => spec.kind === 'repeat' || spec.fanout) ? null : run.definition.steps.length,
+          completed: 0, reused: 0, failed: 0, skipped: 0, cancelled: 0, unverified: 0, reusedUnits: 0 };
+        let addresses = 0;
+        const append = (step: WorkflowStepRun, spec: WorkflowStep, blockId?: string, iterationId?: string, iterationNo?: number) => {
+          if (++addresses > ACTIVITY_LIMITS.workflowUnits) { clipped = true; return; }
+          for (const unit of step.units) {
+            if (units.length >= ACTIVITY_LIMITS.workflowUnits) { clipped = true; break; }
+            const key = `${run.workflowRunId}/${unit.id}`;
+            const admission = active.get(key);
+            const applying = activityApplying.has(key);
+            const cleanup = applying ? 'pending' as const : unit.cleanupSettled ? 'settled' as const
+              : uncertain || unit.status === 'unverified' || run.recovered ? 'unknown' as const : 'pending' as const;
+            units.push({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo,
+              stepId: step.id, unitId: unit.id, inputHash: unit.inputHash,
+              ...(blockId !== undefined ? { blockId, iterationId, iterationNo } : {}),
+              status: unit.status, kind: spec.kind, cleanup,
+              admitted: !!admission && !admission.controller.signal.aborted && !uncertain && unit.status === 'running',
+              reused: !!unit.reusedFrom,
+              ...(unit.native ? { nativeRunId: unit.native.runId, nativeTaskId: unit.native.taskId } : {}),
+              ...(unit.coding ? { phase: applying ? 'applying' : unit.coding.phase,
+                approvalStatus: unit.coding.approvalStatus } : {}) });
+            if (unit.reusedFrom) progress.reusedUnits++;
+          }
+        };
+        for (const step of run.steps) {
+          const spec = run.definition.steps.find(candidate => candidate.id === step.id);
+          if (!spec) throw new Error('Unknown activity step');
+          if (step.status === 'completed') {
+            if (step.units.length > 0 && step.units.every(unit => !!unit.reusedFrom)) progress.reused++;
+            else progress.completed++;
+          } else if (step.status === 'failed' || step.status === 'skipped' || step.status === 'cancelled' || step.status === 'unverified') progress[step.status]++;
+          append(step, spec);
+          for (const iteration of step.iterations ?? []) {
+            if (addresses >= ACTIVITY_LIMITS.workflowUnits) { clipped = true; break; }
+            for (const body of iteration.steps) {
+              const bodySpec = spec.body?.find(candidate => `${iteration.id}/${candidate.id}` === body.id);
+              if (!bodySpec) throw new Error('Unknown activity body step');
+              append(body, bodySpec, step.id, iteration.id, iteration.index + 1);
+              if (addresses >= ACTIVITY_LIMITS.workflowUnits) break;
+            }
+          }
+        }
+        const cleanup = run.cleanupSettled ? 'settled' as const
+          : uncertain || run.status === 'needs-attention' || run.recovered ? 'unknown' as const : 'pending' as const;
+        runs.push({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo,
+          retryOf: run.retryOf, recoveryOf: run.recoveryOf, supersededBy: run.supersededBy,
+          definitionId: run.definition.id, label: run.definition.label.slice(0, 128), startedAt: run.createdAt, updatedAt: run.updatedAt,
+          status: run.status, recovered: run.recovered, local: !restoredActivityIds.has(run.workflowRunId),
+          cleanup, uncertain, progress, units });
+      }
+      activityChannel.publish({ revision: ++activityRevision, available: true, uncertain, runs, clipped });
+    } catch {
+      // Never retain a stale claim of computation if observation itself fails.
+      try { activityChannel.publish({ revision: ++activityRevision, available: false, uncertain: true, runs: [], clipped: true }); }
+      catch { /* Observer failure is not an execution outcome. */ }
+    }
+  };
+
   const projectedView = (run: WorkflowRun) => ({ ...workflowView(run), ...(recoveryDiagnostic ? { recoveryDiagnostic } : {}) });
   const list = () => copy(projectedRuns().map(projectedView));
   const ledgerCurrent = () => {
@@ -612,6 +687,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     workflowAssert(workflowHash(container.read().extensions[WORKFLOW_EXTENSION_KEY]) === expectedHash, 'Workflow ledger changed outside its owner');
   };
   const persist = (automation?: ReturnType<typeof validateAutomationReservation>) => {
+    try {
     if (initialized) ledgerCurrent();
     else workflowAssert(owners.get(container) === owner, 'Workflow ledger ownership lost');
     if (onStartReservation && (automation ?? container.read().extensions[AUTOMATION_EXTENSION_KEY]) !== undefined) validateAutomationLedger(automation ?? container.read().extensions[AUTOMATION_EXTENSION_KEY], state);
@@ -626,6 +702,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     }
     initialized = true;
     for (const listener of [...listeners]) { try { listener(list()); } catch { /* Observers cannot alter ownership or settlement. */ } }
+    } finally { refreshActivity(); }
   };
   const stamp = (run: WorkflowRun) => { run.updatedAt = now().toISOString(); };
   // Callback-free predicates are the final step after EVERY trusted host callback.
@@ -1013,7 +1090,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     if (active.size >= globalCap() || runActiveCount(run) >= run.concurrency) return false;
     workflowAssert(run.admissions < WORKFLOW_LIMITS.admissions, 'Workflow family admission budget exhausted');
     const controller = new AbortController(); const activeKey = `${run.workflowRunId}/${unit.id}`;
-    const poisonJournal = (error: unknown) => { authorityLost = true; unit.status = 'unverified'; unit.cleanupSettled = false; run.cleanupSettled = false; cleanupUncertain = true; controller.abort(); unit.error = errorText(error); };
+    const poisonJournal = (error: unknown) => { authorityLost = true; unit.status = 'unverified'; unit.cleanupSettled = false; run.cleanupSettled = false; cleanupUncertain = true; controller.abort(); unit.error = errorText(error); refreshActivity(); };
     const journalPersist = () => { try { validateRunRecovery(run); stamp(run); persist(); } catch (error) { poisonJournal(error); throw error; } };
     const recoveryCodingOpId = recoveryEnabled ? recoveryAdmissionIntent(run, spec, unit, op === 'check' ? 'check' : op === 'review' ? 'review' : op === 'apply' ? 'application-gate' : 'native') : undefined;
     active.set(activeKey, { run, unit, controller }); run.admissions++; validateRunRecovery(run); run.cleanupSettled = false; unit.cleanupSettled = false;
@@ -1187,7 +1264,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         const record = approvalRegistry.request(req); unit.coding = { ...(unit.coding?.evidence ? { evidence: unit.coding.evidence } : {}), ...(unit.coding?.workspace ? { workspace: unit.coding.workspace } : {}), phase: 'awaiting-application-approval', approvalId: record.id, approvalStatus: record.status, candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence) }; unit.status = 'running'; unit.cleanupSettled = true; outputStep(spec, step); stamp(run); persist();
         if (record.status !== 'granted') return;
         const beforeApply = session.workspace.inspect(); workflowAssert(beforeApply.hash === session.candidateHash, 'Workspace candidate changed after review/check gates');
-        const grant = unit.coding?.approvalId ? approvalRegistry.consumeFingerprint('application', unit.coding.approvalId, approvalRegistry.inspect(unit.coding.approvalId)[0].requestHash) : approvalRegistry.consume('application', req); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash); assertRunnable(run, controller, unit); operationBegan = true; session.effectContext = { run, spec, unit }; let applied: ReturnType<RuntimeCodingWorkspace['apply']>; try { applied = session.workspace.apply(session.candidateHash); } finally { delete session.effectContext; }
+        const grant = unit.coding?.approvalId ? approvalRegistry.consumeFingerprint('application', unit.coding.approvalId, approvalRegistry.inspect(unit.coding.approvalId)[0].requestHash) : approvalRegistry.consume('application', req); approvalRegistry.requireLiveFingerprint('implementation', session.implApprovalId, session.implRequestHash); assertRunnable(run, controller, unit); operationBegan = true; session.effectContext = { run, spec, unit }; let applied: ReturnType<RuntimeCodingWorkspace['apply']>; activityApplying.add(activeKey); refreshActivity(); try { applied = session.workspace.apply(session.candidateHash); } finally { delete session.effectContext; activityApplying.delete(activeKey); refreshActivity(); }
         const outcome = { status: applied.status, candidateHash: session.candidateHash, appliedPaths: applied.appliedPaths, rejectedPaths: applied.status === 'applied' ? [] : session.workspace.inspect().changedPaths.filter(p => !applied.appliedPaths.includes(p)), diagnostics: applied.error ? [applied.error] : [], outcomeHash: workflowHash(applied) };
         unit.coding = { phase: applied.status === 'applied' ? 'applied' : applied.status === 'partial' ? 'apply-partial-uncertain' : 'apply-rejected', candidateHash: session.candidateHash, evidenceHash: workflowHash(session.evidence), consumedApprovalId: grant.approvalId, appliedPaths: applied.appliedPaths, rejectedPaths: outcome.rejectedPaths, ...(applied.error ? { error: applied.error } : {}), outcome: boundedJson(outcome), evidence: boundedJson(session.evidence), workspace: workflowJson(recoveryEnabled ? { ...asRecord(unit.coding?.workspace), recoveryManifest: session.workspace.recoveryManifest?.() ?? { error: 'workspace-manifest-unavailable-after-apply' }, ...(session.continuationProvenance ? { continuationProvenance: session.continuationProvenance } : {}) } : { stageRoot: session.workspace.stageRoot }, WORKFLOW_LIMITS.ledgerBytes) };
         if (applied.status !== 'applied') { budgetResult(unit, freezeWorkflowData(outcome as unknown as WorkflowJson, WORKFLOW_LIMITS.resultBytes)); unit.status = 'failed'; unit.cleanupSettled = applied.status === 'rejected'; if (applied.status === 'partial') cleanupUncertain = true; throw new Error(applied.error ?? 'Apply rejected'); }
@@ -1202,7 +1279,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       else if (!unit.cleanupSettled) { unit.status = 'unverified'; cleanupUncertain = true; }
       else if (unit.status !== 'failed') unit.status = 'failed'; unit.error = errorText(error);  if (unit.cleanupSettled) active.delete(activeKey);
       if (recoveryEnabled && recoveryCodingOpId && !(run.recovery?.operations.find(o => o.id === recoveryCodingOpId)?.result)) recoveryAdmissionResult(run, recoveryCodingOpId, unit.status === 'cancelled' ? 'cancelled' : unit.status === 'unverified' ? 'uncertain' : 'failed', unit.cleanupSettled ? 'settled' : 'uncertain', { coding: unit.coding ?? null, error: unit.error ?? null });
-      outputStep(spec, step); stamp(run); finishRun(run); if (!authorityLost) journalPersist(); }).finally(() => { pending.delete(operation); schedule(); });
+      outputStep(spec, step); stamp(run); finishRun(run); if (!authorityLost) journalPersist(); }).finally(() => { pending.delete(operation); schedule(); refreshActivity(); });
     pending.add(operation); return true;
   };
   const launch = (run: WorkflowRun, spec: WorkflowStep, step: WorkflowStepRun, unit: WorkflowUnit) => {
@@ -1227,14 +1304,15 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
         workflowAssert(identityValid(identity) && !unit.native, 'Missing/duplicate/invalid native identity');
         workflowAssert(!state.runs.some(r => workflowStepEntries(r).some(({ step: s }) => s.units.some(u => u !== unit && !u.reusedFrom && u.native && (u.native.runId === identity.runId || u.native.taskId === identity.taskId)))), 'Native identity collision');
         try { unit.native = copy(identity); persist(); assertAdmission(); }
-        catch (error) { if (recoveryEnabled) { authorityLost = true; unit.status = 'unverified'; unit.cleanupSettled = false; cleanupUncertain = true; controller.abort(); } throw error; }
+        catch (error) { if (recoveryEnabled) { authorityLost = true; unit.status = 'unverified'; unit.cleanupSettled = false; cleanupUncertain = true; controller.abort(); } refreshActivity(); throw error; }
       };
       const operation = Promise.resolve().then(() => { assertAdmission(); invoked = true; return port.execute({ workflowRunId: run.workflowRunId, familyId: run.familyId, attemptNo: run.attemptNo, ...lineage(run, spec.id), stepId: spec.id, unitId: unit.id, inputHash: unit.inputHash,
         agent: freezeWorkflowData(run.agents[spec.agentId!], WORKFLOW_LIMITS.definitionBytes), prompt, signal: controller.signal, assertAdmission, onIdentity }); })
         .then(outcome => complete(outcome), error => complete({ status: invoked ? 'unverified' : 'cancelled', error: errorText(error), cleanupSettled: !invoked }))
-        .finally(() => { pending.delete(operation); schedule(); });
+        .finally(() => { pending.delete(operation); schedule(); refreshActivity(); });
       pending.add(operation);
       function complete(rawOutcome: WorkflowNativeOutcome) {
+        try {
         let outcome = rawOutcome;
         try {
           workflowAssert(outcome && typeof outcome === 'object' && !Array.isArray(outcome) && Object.getPrototypeOf(outcome) === Object.prototype && Object.getOwnPropertySymbols(outcome).length === 0, 'Invalid native outcome');
@@ -1293,6 +1371,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
             try { persist(); } catch { authorityLost = true; active.forEach(a => a.controller.abort()); }
           }
         }
+        } finally { refreshActivity(); }
       }
     } catch (error) {
       if (!invoked) { active.delete(key); unit.cleanupSettled = true; unit.status = run.status === 'paused' ? 'queued' : run.status === 'cancelling' ? 'cancelled' : 'failed'; }
@@ -1335,7 +1414,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     } catch (error) {
       authorityLost = true; liveRecoveryPlans.clear(); active.forEach(a => a.controller.abort());
       for (const run of state.runs) if (!terminal(run)) { run.status = 'needs-attention'; run.error = errorText(error); }
-    } finally { pumping = false; }
+    } finally { pumping = false; refreshActivity(); }
   }
   function schedule() { if (!scheduled && !disposed && !authorityLost) { scheduled = true; queueMicrotask(pump); } }
 
@@ -2050,6 +2129,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       if (!signal?.aborted && publishedChild.status === 'running') { liveRecoveryPlans.set(publishedChild.workflowRunId, livePlan); schedule(); }
       return { ok: !signal?.aborted, action: 'workflows.recovery.prepare', ...(signal?.aborted ? { error: 'Caller cancelled after durable selection; selected child cancelled before execution' } : {}), view: copy(workflowView(publishedChild)), assessment: copy(finalAssessment) as WorkflowJson };
     } catch (error) { if (committed && !recoveryDiagnostic) poisonRecovery(error, state); return { ok: false, action: 'workflows.recovery.prepare', error: errorText(error), ...(recoveryDiagnostic ? { recoveryDiagnostic: copy(recoveryDiagnostic) } : {}) }; }
+    finally { refreshActivity(); }
   };
 
   const makeRun = (definition: WorkflowDefinition, inputs: WorkflowJson, concurrency: number, previous?: WorkflowRun): WorkflowRun => {
@@ -2166,6 +2246,7 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
       }
       return { ok: true, action, view: copy(workflowView(run)) };
     } catch (error) { return { ok: false, action, error: errorText(error) }; }
+    finally { refreshActivity(); }
   };
   if (existing === undefined) persist();
   else { expectedHash = workflowHash(container.read().extensions[WORKFLOW_EXTENSION_KEY]); initialized = true; }
@@ -2176,17 +2257,20 @@ export function createWorkflowService(container: ZergStateContainer, port: Workf
     revoke(id, request, reason) { approvalEpoch++; const record = approvalRegistry.revoke(id, request, reason); schedule(); return record; },
     inspect: id => { approvalEpoch++; return approvalRegistry.inspect(id) as unknown as ReturnType<WorkflowTrustedApprovalApi['inspect']>; },
   };
-  return { execute, list, get: id => { const run = projectedRuns().find(r => r.workflowRunId === id); return run ? copy(run) : undefined; }, approvals,
+  refreshActivity();
+  return { activity: activityChannel.source, execute, list, get: id => { const run = projectedRuns().find(r => r.workflowRunId === id); return run ? copy(run) : undefined; }, approvals,
     ...(recoveryEnabled ? { recovery: { prepare: (workflowRunId: string, selections?: { reuseUnitIds?: string[]; rerunUnitIds?: string[] }) => execute({ action: 'workflows.recovery.prepare', workflowRunId, ...(selections !== undefined ? { selections } : {}) } as WorkflowAction), authorize: recoveryAuthorize } } : {}),
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     dispose() {
       if (disposed) return; disposed = true;
+      try {
       // Cleanup requests precede every observable/fallible ledger publication.
       liveRecoveryPlans.clear(); active.forEach(a => a.controller.abort()); abortListeners.forEach(remove => remove()); abortListeners.clear(); listeners.clear();
       if (owners.get(container) === owner && !authorityLost) for (const run of state.runs) if (!terminal(run)) {
         try { cancelRun(run); }
         catch (error) { authorityLost = true; run.status = 'needs-attention'; run.error = errorText(error); }
       }
+      } finally { refreshActivity(); }
     },
     async drain() { await Promise.resolve(); while (pending.size) { await Promise.allSettled([...pending]); await Promise.resolve(); } workflowAssert(!onStartReservation || !authorityLost, 'Automation publication/admission is uncertain'); workflowAssert(!cleanupUncertain || state.runs.every(r => r.cleanupSettled || observedSettledSources.has(r.workflowRunId)), 'Native cleanup settlement is uncertain'); },
   };

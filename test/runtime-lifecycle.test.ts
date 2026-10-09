@@ -282,22 +282,34 @@ test('throwing bridge unsubscriber does not block other cleanup; fault remains t
 test('native abort isolates sync throws and async rejections and still signals siblings without SDK startup', async () => {
   const functionNode = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'requestPiNativeAbort');
   assert.ok(functionNode);
-  const js = ts.transpileModule(functionNode.getText(parsed), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  const observerNode = parsed.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'observeActivity');
+  assert.ok(observerNode);
+  const js = ts.transpileModule(`${observerNode.getText(parsed)}\n${functionNode.getText(parsed)}`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const abort = new Function('workflowActiveAdmissions', `${js}\nreturn requestPiNativeAbort;`)(new WeakMap()) as (id: string, runs: Map<string, unknown>) => { ok: boolean; message: string };
-  const calls: string[] = [];
-  const active = { cancelRequested: false, sessions: new Set([
-    { abort() { calls.push('sync'); throw new Error('sync abort fault'); } },
-    { abort() { calls.push('async'); return Promise.reject(new Error('async abort fault')); } },
-    { abort() { calls.push('sibling'); } },
-  ]) };
-  const result = abort('run', new Map([['run', active]]));
-  assert.equal(result.ok, true);
-  assert.equal(active.cancelRequested, true);
-  assert.deepEqual(calls, ['sync', 'async', 'sibling']);
-  assert.match(result.message, /2 native session\(s\)/);
-  assert.match(result.message, /1 native abort callback\(s\) threw/);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(abort('missing', new Map()).ok, false);
+  for (const throwingObserver of [false, true]) {
+    const calls: string[] = [], observations: Array<[string, boolean]> = [];
+    const active = { cancelRequested: false, activity: { cancel(runId: string) {
+      observations.push([runId, active.cancelRequested]);
+      if (throwingObserver) throw new Error('activity observer fault');
+    } }, sessions: new Set([
+      { abort() { calls.push('sync'); throw new Error('sync abort fault'); } },
+      { abort() { calls.push('async'); return Promise.reject(new Error('async abort fault')); } },
+      { abort() { calls.push('sibling'); } },
+    ]) };
+    const runs = new Map([['run', active]]);
+    const result = abort('run', runs);
+    assert.equal(result.ok, true);
+    assert.equal(active.cancelRequested, true);
+    assert.deepEqual(observations, [['run', true]], 'Activity observes cancellation only after the owner flag is set');
+    assert.deepEqual(calls, ['sync', 'async', 'sibling']);
+    assert.match(result.message, /2 native session\(s\)/);
+    assert.match(result.message, /1 native abort callback\(s\) threw/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(abort('missing', new Map()).ok, false);
+    assert.equal(abort('missing', runs).ok, false);
+    assert.deepEqual(observations, [['run', true]], 'Missing runs must not observe activity');
+    assert.deepEqual(calls, ['sync', 'async', 'sibling']);
+  }
 });
 
 for (const revoke of ['signal', 'owner-dispose'] as const) {

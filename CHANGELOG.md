@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.21] - 2026-10-09
+
+### Added
+
+- Compact, bounded background activity below Pi's editor for locally observable standalone agents, team queues/leaders and workflows, with exact identity deduplication, honest phases/progress and inert recovered-history labels.
+- Configurable Alt+G management opener sharing `/zerg config`, dedicated human UI preferences, independent strip visibility, active-versus-pending reload status, and conservative Pi/user/extension/terminal-equivalence conflict checks with command fallback.
+
+### Changed
+
+- Cached, event-coalesced observation and active-only elapsed updates isolate rendering failures and lifecycle cleanup from native execution, approvals, tools/models and workflow authority. Existing editor/footer/widgets and non-interactive operation remain independent.
+- Run test files serially without relaxing lifecycle or performance assertions; quota acceptance validates complete read-event sets without assuming parallel tool completion order.
+
 ## [1.1.20] - 2026-10-07
 
 ### Added

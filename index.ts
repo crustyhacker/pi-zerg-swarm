@@ -5,6 +5,10 @@ import { dirname, isAbsolute, join, resolve as resolvePath, sep } from 'node:pat
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { activityLineage, createActivityChannel, createNativeActivityRecorder, UNAVAILABLE_WORKFLOW_ACTIVITY, type NativeActivityRecorder, type WorkflowActivitySnapshot, type ActivityPhase } from './activity.js';
+import { createBackgroundActivityController, type BackgroundActivityController } from './ui/background-activity.js';
+import { createUiPreferences } from './ui/preferences.js';
+import { createManagementShortcutController, type ManagementUiPreferencesFacade } from './ui/management-shortcut.js';
 import { installInternalPatch } from './internal-patch.js';
 import { createZergPersistenceManager, type RecoveryWriterOwnerEvidence, type ZergPersistenceManager } from './persistence.js';
 import { createWorkflowService } from './workflow-runtime.js';
@@ -61,7 +65,7 @@ export interface ZergCommandHandlerOptions {
   };
 }
 
-type RuntimeCommandOptions = ZergControlOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; workflowScriptOwner?: WorkflowScriptControlOwner; startupRecoveryBlock?: StartupRecoveryBlock };
+type RuntimeCommandOptions = ZergControlOptions & { syncSharedState?: boolean; persistenceManager?: ZergPersistenceManager; isOwnerDisposed?: () => boolean; workflowService?: WorkflowService; workflowScriptOwner?: WorkflowScriptControlOwner; startupRecoveryBlock?: StartupRecoveryBlock; nativeActivity?: NativeActivityRecorder };
 
 export interface ZergExtensionRegistration {
   commands: ZergCommandName[];
@@ -141,6 +145,7 @@ type PiNativeActiveRun = {
   sessionTargets: Map<string, PiNativeSessionHandle>;
   sessionTargetKeys: Map<string, PiNativeSessionHandle>;
   disposed: boolean;
+  activity?: NativeActivityRecorder;
   promise?: Promise<void>;
 };
 
@@ -299,9 +304,19 @@ export function registerZergSwarmExtension(
   const toolDisposers: DisposableRegistration[] = [];
   const sessionDisposers: DisposableRegistration[] = [];
 
+  const permissionActivity = createActivityChannel(0);
+  const publishPermissionCount = (state: ZergState) => observeActivity(() => {
+    const queue = state.extensions.zergPermissions as { pendingCount?: unknown } | undefined;
+    const count = typeof queue?.pendingCount === 'number' && Number.isSafeInteger(queue.pendingCount)
+      && queue.pendingCount >= 0 ? queue.pendingCount : 0;
+    if (count !== permissionActivity.source.snapshot()) permissionActivity.publish(count);
+  });
   const syncSharedStateFromContainer = () => {
-    replaceSharedZergState(stateContainer.snapshot());
+    const snapshot = stateContainer.snapshot(); // The original shared-publication clone, reused below.
+    replaceSharedZergState(snapshot);
+    publishPermissionCount(snapshot);
   };
+  publishPermissionCount(stateContainer.read());
 
   let disposed = false;
   let committingPersistentState = false;
@@ -396,11 +411,13 @@ export function registerZergSwarmExtension(
   const control = createZergControl(syncedStateContainer, { ...runtimeOptions, persistenceManager: undefined, subagentAdapter });
   runtimeOptions.workflowService = workflowControlServices.get(control);
   runtimeOptions.workflowScriptOwner = workflowScriptControlOwners.get(control);
+  let disposeActivityUi = () => {};
 
   try {
     if (typeof context.on === 'function') {
       const shutdownDisposer = normalizeDisposableRegistration(context.on('session_shutdown', async () => {
         let firstError: unknown;
+        disposeActivityUi();
         for (const cleanup of [() => control.dispose(), () => subagentAdapter.dispose?.(), () => control.drain?.(),
           () => shutdownSessionMessages(sessionMessageService), () => shutdownNativeTranscript(nativeTranscriptService)]) {
           try { await cleanup(); } catch (error) { firstError ??= error; }
@@ -414,6 +431,91 @@ export function registerZergSwarmExtension(
       : installInternalPatch(context, syncedStateContainer);
     patch = installedPatch;
     const handler = createPiZergCommandHandler(syncedStateContainer, { ...runtimeOptions, subagentAdapter } as RuntimeCommandOptions);
+    const opener = managementOpeners.get(handler)!;
+    let shortcut: ReturnType<typeof createManagementShortcutController> | undefined;
+    let background: BackgroundActivityController | undefined;
+    let removePreferences: (() => void) | undefined;
+    let uiContext: StructuralPiCommandContext | undefined;
+    let uiGeneration = 0, uiDisposed = false;
+    let retireWidget: (() => void) | undefined;
+    const updatePreferences = () => observeActivity(() => {
+      const status = shortcut?.settings.snapshot();
+      if (!status) return;
+      background?.setVisible(status.activityStrip);
+      background?.setActiveShortcut(status.active ?? undefined);
+    });
+    disposeActivityUi = () => {
+      if (uiDisposed) return;
+      uiDisposed = true; ++uiGeneration; uiContext = undefined;
+      observeActivity(() => retireWidget?.()); retireWidget = undefined;
+      observeActivity(() => background?.dispose());
+      observeActivity(() => shortcut?.dispose());
+      observeActivity(() => removePreferences?.()); removePreferences = undefined;
+      opener.setPreferences(undefined);
+    };
+    const attachActivityUi = (ctx: StructuralPiCommandContext) => {
+      if (uiDisposed || disposed) return;
+      if (ctx === uiContext) return;
+      const generation = ++uiGeneration;
+      uiContext = ctx;
+      observeActivity(() => retireWidget?.()); retireWidget = undefined;
+      observeActivity(() => shortcut?.detach());
+      if (generation !== uiGeneration || uiDisposed) return;
+      // RPC can have dialogs. Neither RPC nor an unknown legacy mode grants new TUI resources.
+      if (ctx.mode !== 'tui' || ctx.hasUI !== true || typeof ctx.ui?.setWidget !== 'function') return;
+      if (!background) {
+        try {
+          const preferences = createUiPreferences(); // ONCE, at the first real TUI, never in print/RPC/JSON.
+          if (typeof context.registerShortcut === 'function') {
+            shortcut = createManagementShortcutController({
+              pi: { registerShortcut: context.registerShortcut.bind(context) }, preferences,
+              ownerCommandHandler: handler, openManagement: (ctx) => opener.openManagement(ctx as unknown as StructuralPiCommandContext), isOpening: opener.isOpening,
+              onChange: updatePreferences, warn: (reason) => uiContext?.ui?.notify?.(reason, 'warning'),
+            });
+            opener.setPreferences(shortcut.settings);
+            removePreferences = shortcut.settings.subscribe(updatePreferences);
+          }
+          background = createBackgroundActivityController({ native: subagentAdapter.activity,
+            workflows: runtimeOptions.workflowService?.activity, permissions: permissionActivity.source,
+            visible: preferences.snapshot().desired.activityStrip,
+            onTui: (tui) => {
+              const observed = tui as (typeof tui & { getFocusedComponent?: () => unknown });
+              observeActivity(() => shortcut?.setTui(observed && typeof observed.hasOverlay === 'function'
+                && typeof observed.getFocusedComponent === 'function' ? observed as Required<Pick<NonNullable<typeof observed>, 'hasOverlay' | 'getFocusedComponent'>> : undefined));
+              updatePreferences();
+            },
+          });
+        } catch {
+          // Retire partial observers; fail closed for this UI generation, never the runner.
+          disposeActivityUi(); return;
+        }
+      }
+      if (generation !== uiGeneration || uiDisposed) return;
+      shortcut?.attach(ctx); // Passive guard must precede normal host shortcut-table construction.
+      if (generation !== uiGeneration || uiDisposed) return;
+      const retire = background.attach({ mode: ctx.mode, hasUI: true, ui: ctx.ui as { setWidget: NonNullable<NonNullable<StructuralPiCommandContext['ui']>['setWidget']> } });
+      if (generation !== uiGeneration || uiDisposed) retire(); else retireWidget = retire;
+      updatePreferences();
+    };
+    if (typeof context.on === 'function') {
+      const listen = (event: string, callback: (...args: unknown[]) => void) => {
+        const disposer = normalizeDisposableRegistration(context.on!(event, callback));
+        if (disposer) sessionDisposers.push(disposer);
+      };
+      listen('session_start', (_event, ctx) => observeActivity(() => {
+        if (ctx && typeof ctx === 'object') attachActivityUi(ctx as StructuralPiCommandContext);
+      }));
+      const observePrompt = (ctx: unknown, start: boolean) => observeActivity(() => {
+        const current = ctx as StructuralPiCommandContext | undefined;
+        // Pi supplies fresh context objects per event; compare the actual public UI owner.
+        if (!uiDisposed && current?.mode === 'tui' && current.hasUI === true
+          && current.ui === uiContext?.ui) {
+          if (start) shortcut?.promptStart(); else shortcut?.promptEnd();
+        }
+      });
+      listen('ui_prompt_start', (_event, ctx) => observePrompt(ctx, true));
+      listen('ui_prompt_end', (_event, ctx) => observePrompt(ctx, false));
+    }
 
     for (const name of ZERG_COMMANDS) {
       const commandDisposer = registerCommand(context, {
@@ -442,6 +544,7 @@ export function registerZergSwarmExtension(
       });
     }
   } catch (error) {
+    disposeActivityUi();
     disposeStartupResources(commandDisposers, patch);
     for (const sessionDisposer of sessionDisposers.splice(0)) {
       try {
@@ -482,6 +585,7 @@ export function registerZergSwarmExtension(
       }
 
       disposed = true;
+      disposeActivityUi();
       shutdownSessionMessages(sessionMessageService);
       shutdownNativeTranscript(nativeTranscriptService);
       let firstError: unknown;
@@ -966,6 +1070,18 @@ export function createZergControl(
   const unavailable: WorkflowNativePort = { preflight() { throw new Error('Workflows require an owned native runner; adapter kind/metadata is not authority.'); }, async execute() { throw new Error('Workflow native owner unavailable.'); } };
   // Lazy ledger initialization preserves ordinary control construction/revisions.
   let service: WorkflowService | undefined;
+  const workflowActivity = createActivityChannel<WorkflowActivitySnapshot>({ ...UNAVAILABLE_WORKFLOW_ACTIVITY });
+  let removeWorkflowActivity: (() => void) | undefined;
+  const attachWorkflowActivity = (created: WorkflowService) => {
+    const source = created.activity;
+    if (!source) return;
+    const refresh = () => {
+      try { workflowActivity.publish(source.snapshot()); }
+      catch { observeActivity(() => workflowActivity.publish({ ...UNAVAILABLE_WORKFLOW_ACTIVITY, uncertain: true })); }
+    };
+    try { removeWorkflowActivity = source.subscribe(refresh); refresh(); }
+    catch { workflowActivity.publish({ ...UNAVAILABLE_WORKFLOW_ACTIVITY, uncertain: true }); }
+  };
   let initializing = false;
   let workflowRecoveryOwner: RecoveryWriterOwnerEvidence | undefined;
   const getService = () => {
@@ -981,6 +1097,7 @@ export function createZergControl(
         : options.coding;
       const created = createWorkflowService(container, owner?.port ?? unavailable, { now: options.now, coding, recovery, ...trustedWorkflow });
       service = created;
+      attachWorkflowActivity(created);
       if (disposed || (options as RuntimeCommandOptions).isOwnerDisposed?.()) { created.dispose(); throw new Error('Workflow owner disposed during initialization.'); }
       return created;
     } finally { initializing = false; }
@@ -1003,6 +1120,7 @@ export function createZergControl(
     },
   } : undefined;
   const workflowService: WorkflowService = {
+    activity: workflowActivity.source,
     execute: (action, signal) => {
       if ((action.action === 'workflows.recovery.inspect' || action.action === 'workflows.recovery.prepare') && container.read().extensions.workflows === undefined) {
         return Promise.resolve({ ok: false, action: action.action, error: 'Workflow run not found; recovery inspection does not initialize a ledger.' });
@@ -1018,7 +1136,12 @@ export function createZergControl(
     }, list: () => getService().list(),
     get: (id) => getService().get(id), get approvals() { return getService().approvals; },
     get recovery() { return recoveryProxy; }, subscribe: (listener) => getService().subscribe(listener),
-    dispose: () => service?.dispose(), drain: async () => { await service?.drain(); },
+    dispose: () => {
+      try { service?.dispose(); } finally {
+        observeActivity(() => removeWorkflowActivity?.()); removeWorkflowActivity = undefined;
+        workflowActivity.publish({ ...UNAVAILABLE_WORKFLOW_ACTIVITY, uncertain: !!service });
+      }
+    }, drain: async () => { await service?.drain(); },
   };
   runtimeOptions.workflowService = workflowService;
 
@@ -3701,9 +3824,10 @@ function isTerminalRunSnapshot(run: ZergSubagentRunSnapshot): boolean {
   return run.status === 'done' || run.status === 'failed' || run.status === 'cancelled' || run.substate === 'completed' || run.substate === 'failed' || run.substate === 'cancelled';
 }
 
-function createPiNativeActiveRun(runId: string): PiNativeActiveRun {
+function createPiNativeActiveRun(runId: string, activity?: NativeActivityRecorder): PiNativeActiveRun {
   return {
     runId,
+    activity,
     cancelRequested: false,
     sessions: new Set<PiNativeSessionHandle>(),
     sessionTargets: new Map<string, PiNativeSessionHandle>(),
@@ -3718,6 +3842,7 @@ function requestPiNativeAbort(runId: string, activeRuns: PiNativeActiveRunRegist
     return { ok: false, message: `No active cancellable native zerg run: ${runId}` };
   }
   activeRun.cancelRequested = true;
+  observeActivity(() => activeRun.activity?.cancel(runId));
   const workflow = workflowActiveAdmissions.get(activeRun);
   if (workflow) {
     signalWorkflowAbort(activeRun, workflow);
@@ -3797,6 +3922,7 @@ function createPiSlashBridgeAdapter(
     return createPiNativeAdapter(context, container, options);
   }
 
+  options = { ...options, nativeActivity: createNativeActivityRecorder() };
   type PendingRun = ZergSubagentRunSnapshot & { launched: boolean; started: boolean; completed: boolean };
   type FallbackLaunch = { promise: Promise<void>; timer: ReturnType<typeof setTimeout>; settle(): void };
   const runsById = new Map<string, PendingRun>();
@@ -4094,6 +4220,7 @@ function createPiSlashBridgeAdapter(
   const workflowOwner = createOwnedWorkflowNative(context, container, options, activeRuns, () => disposed);
   const adapter: ZergSubagentControlAdapter = {
     kind: 'pi-native',
+    activity: options.nativeActivity!.source,
     listAgentDefinitions() {
       return getAgentDefinitions(container.read());
     },
@@ -4267,7 +4394,7 @@ function createPiSlashBridgeAdapter(
             data: { launchMode, model: request.model, fallbackModels: request.fallbackModels, maxTurns: request.maxTurns },
           });
           if (rejectIfBlocked()) return;
-          const activeRun = createPiNativeActiveRun(requestId);
+          const activeRun = createPiNativeActiveRun(requestId, options.nativeActivity);
           activeRuns.set(requestId, activeRun);
           activeRun.promise = runPiNativeZergRequest(context, container, options, request, requestId, taskId, launchMode, activeRun)
             .finally(() => { activeRuns.delete(requestId); settle(); });
@@ -4419,7 +4546,7 @@ function installNativeContinuationService(
           sourceFingerprint: admission.review.sourceFingerprint, policyDigest: admission.review.policyDigest, policy } };
       const now = options.now ?? (() => new Date());
       const state = upsertTask(container.read(), { id: taskId, title: request.task, ownerAgentId: runId, status: 'running', updatedAt: now().toISOString(), metadata });
-      const activeRun = createPiNativeActiveRun(runId);
+      const activeRun = createPiNativeActiveRun(runId, options.nativeActivity);
       activeRuns.set(runId, activeRun);
       own?.(runId);
       try {
@@ -4449,7 +4576,7 @@ function createPiNativeAdapter(
   let disposed = false;
   const associatedManager = ownedPersistenceManagers.get(container);
   const persistenceManager = associatedManager ?? options.persistenceManager ?? createZergPersistenceManager(options.persistence);
-  const runtimeOptions = { ...options, persistenceManager } as RuntimeCommandOptions;
+  const runtimeOptions = { ...options, persistenceManager, nativeActivity: createNativeActivityRecorder() } as RuntimeCommandOptions;
   // An authoritative host wrapper already hydrated this exact manager/container.
   // Rehydrating would publish through its writer before fresh recovery ownership;
   // an independent save would bypass its startup inert block and single-save path.
@@ -4466,6 +4593,7 @@ function createPiNativeAdapter(
   const workflowOwner = createOwnedWorkflowNative(context, container, runtimeOptions, activeRuns, () => disposed);
   const adapter: ZergSubagentControlAdapter = {
     kind: 'pi-native',
+    activity: runtimeOptions.nativeActivity!.source,
     listAgentDefinitions() {
       return getAgentDefinitions(container.read());
     },
@@ -4489,7 +4617,7 @@ function createPiNativeAdapter(
       const definition = getAgentDefinition(container.read(), request.agent);
       const label = definition?.label ?? request.agent;
       // Own the empty cancellation handle before any observable publication.
-      const activeRun = createPiNativeActiveRun(requestId);
+      const activeRun = createPiNativeActiveRun(requestId, runtimeOptions.nativeActivity);
       activeRuns.set(requestId, activeRun);
       const blockedAfterPublication = () => activeRun.cancelRequested
         ? 'adapter launch cancelled: interrupt requested'
@@ -4688,6 +4816,10 @@ async function runPiNativeZergRequest(
   const coordPath = resolvePath(cwd, coordDir);
   const workerConcurrency = request.concurrency ?? DEFAULT_NATIVE_WORKER_CONCURRENCY;
   let failedMemberSummaries: Array<{ agentId: string; status: 'failed' | 'cancelled'; message?: string }> = [];
+  let observedTerminal: ActivityPhase = 'unknown';
+  let observedEndedAt: string | undefined;
+  observeActivity(() => options.nativeActivity?.begin({ runId, taskId, teamId: ledTeam?.id, label: ledTeam?.label ?? leaderDefinition?.label ?? request.agent, startedAt: state.agents[runId]?.runtime?.startedAt ?? '', phase: 'starting' }));
+  if (activeRun?.cancelRequested) observeActivity(() => options.nativeActivity?.cancel(runId));
 
   try {
     if (missingMemberIds.length > 0) {
@@ -4721,6 +4853,8 @@ async function runPiNativeZergRequest(
     if (runnableMemberDefinitions.length > 0) {
       const startedAt = timestamp();
       setRunMetadata(container, runId, { memberProgress: runnableMemberDefinitions.map((definition) => ({ agentId: definition.id, runId: `${runId}-${definition.id}`, status: 'queued', handoffPath: `${coordDir}/${definition.id}.md` })) }, options);
+      for (const definition of runnableMemberDefinitions) observeActivity(() => options.nativeActivity?.member(runId, {
+        parentRunId: runId, memberRunId: `${runId}-${definition.id}`, taskId, agentDefinitionId: definition.id, phase: 'queued', cleanup: 'pending', observedExecution: false }));
       const summaries: Array<{ agentId: string; status: 'done' | 'failed' | 'cancelled'; message?: string }> = new Array(runnableMemberDefinitions.length);
       let nextIndex = 0;
       const work = async () => {
@@ -4743,6 +4877,7 @@ async function runPiNativeZergRequest(
           if (activeRun?.cancelRequested) {
             const message = 'cancel requested before session start';
             summaries[index] = { agentId: definition.id, status: 'cancelled', message };
+            observeActivity(() => options.nativeActivity?.patch(runId, workerRun.runId, { phase: 'cancelled', cleanup: 'settled', observedExecution: false }));
             updateMemberProgress(workerRun, definition.id, 'cancelled', { completedAt: timestamp(), handoffPath: workerRun.handoffPath, message });
             continue;
           }
@@ -4787,6 +4922,7 @@ async function runPiNativeZergRequest(
       });
 
     const doneAt = timestamp();
+    observedEndedAt = doneAt;
     const wasCancelled = activeRun?.cancelRequested === true || leaderResult.status === 'cancelled';
     const leaderFailed = leaderResult.status === 'failed';
     const hasRequiredMemberFailure = !wasCancelled && failedMemberSummaries.length > 0;
@@ -4833,9 +4969,11 @@ async function runPiNativeZergRequest(
       taskId,
       data: { finalSummary, concurrency: workerConcurrency, ...(failedMemberSummaries.length > 0 ? { failedMemberSummaries } : {}) },
     });
+    observedTerminal = wasCancelled ? 'cancelled' : failedRun ? 'failed' : 'completed';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const failedAt = timestamp();
+    observedEndedAt = failedAt;
     const failed = applyRuntimeTransition(container.read(), {
       entity: 'agent',
       action: 'fail',
@@ -4859,6 +4997,9 @@ async function runPiNativeZergRequest(
       teamId: ledTeam?.id,
       taskId,
     });
+    observedTerminal = activeRun?.cancelRequested ? 'cancelled' : 'failed';
+  } finally {
+    observeActivity(() => options.nativeActivity?.finish(runId, observedTerminal, observedEndedAt));
   }
 }
 
@@ -4875,7 +5016,33 @@ type PiNativeRunContext = {
   teamStartedAt?: string;
 };
 
-async function runSinglePiNativeAgent(
+function observeActivity(callback: () => void): void {
+  try { callback(); } catch { /* Display observation cannot change owner outcomes. */ }
+}
+function nativeMemberLineages(run: PiNativeRunContext) {
+  const state = run.container.read();
+  return { lineage: activityLineage(state.agents[run.parentRunId]?.metadata?.workflow),
+    taskLineage: activityLineage(state.tasks[run.taskId ?? '']?.metadata?.workflow) };
+}
+async function runSinglePiNativeAgent(context: StructuralPiExtensionContext, definition: ZergAgentDefinition, run: PiNativeRunContext) {
+  if (!run.activeRun?.cancelRequested) observeActivity(() => run.options.nativeActivity?.member(run.parentRunId, {
+    parentRunId: run.parentRunId, memberRunId: run.runId, taskId: run.taskId, agentDefinitionId: definition.id,
+    phase: 'starting', cleanup: 'pending', observedExecution: false, ...nativeMemberLineages(run),
+  }));
+  try {
+    const result = await executeSinglePiNativeAgent(context, definition, run);
+    observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, {
+      phase: result.status === 'done' ? 'completed' : result.status, observedExecution: false,
+    }));
+    return result;
+  } catch (error) {
+    observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, {
+      phase: 'unknown', cleanup: 'unknown', observedExecution: false,
+    }));
+    throw error;
+  }
+}
+async function executeSinglePiNativeAgent(
   context: StructuralPiExtensionContext,
   definition: ZergAgentDefinition,
   run: PiNativeRunContext,
@@ -4960,10 +5127,14 @@ async function runSinglePiNativeAgent(
     if (admission) appendNativeContinuationMarker(sessionManager, admission);
     sessionManager.appendSessionInfo(`zerg ${run.runId} (${definition.id})`.slice(0, 160));
     setNativeSessionReference(run, reference);
+    observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, {
+      piSessionId: reference!.piSessionId, attachment: 'attached', ...nativeMemberLineages(run),
+    }));
     registerPiNativeSessionTarget(run.activeRun, definition.id, sessionHandle);
     if (run.runId === run.parentRunId) registerPiNativeSessionTarget(run.activeRun, run.parentRunId, sessionHandle);
     updateMemberProgress(run, definition.id, 'starting', { ...(run.runId === run.parentRunId ? { startedAt: updateAt() } : {}), handoffPath: run.handoffPath });
     unsubscribe = session.subscribe((event: { type?: string; [key: string]: unknown }) => {
+      observeActivity(() => run.options.nativeActivity?.event(run.parentRunId, run.runId, event.type));
       if (admission || workflow ? freshTurnStarted && event.type === 'message_end' && isPiNativeAssistantMessage(event.message)
         : event.type === 'message_end' || event.type === 'turn_end' || event.type === 'agent_end') {
         captureResponse(event);
@@ -4993,7 +5164,7 @@ async function runSinglePiNativeAgent(
 
     if (admission) await assertContinuation();
     await session.bindExtensions({ mode: 'print', abortHandler: () => {
-      if (run.activeRun) { if (workflow) signalWorkflowAbort(run.activeRun, workflow); else run.activeRun.cancelRequested = true; }
+      if (run.activeRun) { if (workflow) signalWorkflowAbort(run.activeRun, workflow); else { run.activeRun.cancelRequested = true; observeActivity(() => run.activeRun?.activity?.cancel(run.parentRunId)); } }
     } });
     if (workflow) assertWorkflowSession(workflow, session);
     if (admission) {
@@ -5039,6 +5210,7 @@ async function runSinglePiNativeAgent(
         else { freshTurnStarted = false; capturedResponse = undefined; assistantOutcome = undefined; }
       } }
       : { source: 'extension' as never });
+    observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, { phase: 'cleanup', observedExecution: false }));
     if (!admission && !workflow) {
       captureResponse(promptResult);
       capturedResponse = extractPiNativePromptResponse(sessionHandle.messages);
@@ -5115,6 +5287,7 @@ async function runSinglePiNativeAgent(
     if (!workflow) updateMemberProgress(run, definition.id, status, { completedAt: updateAt(), handoffPath: run.handoffPath, message });
     return { agentId: definition.id, status, message };
   } finally {
+    observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, { phase: 'cleanup', observedExecution: false }));
     if (workflow) {
       await cleanupWorkflowSession(workflow, session, sdk, [
         () => releaseMessages?.(), () => releaseTranscript?.(),
@@ -5125,6 +5298,8 @@ async function runSinglePiNativeAgent(
       try { if (reference) setNativeSessionReference(run, { ...reference,
         attachment: workflow.cleanupSettled ? 'disposed' : 'unavailable', ...(workflow.cleanupSettled ? { disposedAt: updateAt() } : {}),
       }); } catch (error) { workflow.failures.push(workflowFailure(error)); workflow.cleanupSettled = false; }
+      observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, {
+        cleanup: workflow.cleanupSettled ? 'settled' : 'unknown', attachment: workflow.cleanupSettled ? 'disposed' : 'unavailable', observedExecution: false }));
     } else {
     try { releaseMessages?.(); } catch { /* Messaging cleanup never owns SDK disposal. */ }
     try { releaseTranscript?.(); } catch { /* Observer cleanup never owns SDK disposal. */ }
@@ -5142,6 +5317,8 @@ async function runSinglePiNativeAgent(
         session.dispose();
         disposed = true;
       } finally {
+        observeActivity(() => run.options.nativeActivity?.patch(run.parentRunId, run.runId, {
+          cleanup: disposed ? 'settled' : 'unknown', attachment: disposed ? 'disposed' : 'unavailable', observedExecution: false }));
         if (reference) setNativeSessionReference(run, {
           ...reference, attachment: disposed ? 'disposed' : 'unavailable',
           ...(disposed ? { disposedAt: updateAt() } : {}),
@@ -6255,6 +6432,11 @@ function createManagementOverlayActions(stateOrReader: ZergStateSource, runtimeO
   };
 }
 
+const managementOpeners = new WeakMap<ZergPiCommandHandler, {
+  openManagement(context: StructuralPiCommandContext): Promise<void>;
+  isOpening(): boolean;
+  setPreferences(facade: ManagementUiPreferencesFacade | undefined): void;
+}>();
 export function createPiZergCommandHandler(
   stateOrReader: ZergStateSource,
   options: ZergCommandHandlerOptions = {},
@@ -6285,7 +6467,9 @@ export function createPiZergCommandHandler(
     }),
   });
 
-  return async (input: string, context: StructuralPiCommandContext): Promise<void> => {
+  let opening = false;
+  let uiPreferences: ManagementUiPreferencesFacade | undefined;
+  const dispatch = async (input: string, context: StructuralPiCommandContext): Promise<void> => {
     const routed = stripOptionalZergInvocation(input.trimStart());
     if (/^workflows(?:\s|$)/i.test(routed)) {
       const container = getWritableStateContainer(stateOrReader);
@@ -6373,6 +6557,7 @@ export function createPiZergCommandHandler(
       if (normalized.topic === 'config') {
         try {
           await openZergManagementOverlay(context, {
+            uiPreferences,
             getSnapshot: () => resolveZergStateSnapshot(stateOrReader),
             subscribe: (listener) => subscribeToZergState(stateOrReader, listener),
             adapterKind: runtimeOptions.subagentAdapter?.kind ?? 'unavailable',
@@ -6712,6 +6897,16 @@ export function createPiZergCommandHandler(
 
     context.ui?.notify?.(output, 'info');
   };
+  const openManagement = (context: StructuralPiCommandContext): Promise<void> => {
+    if (opening) return Promise.resolve();
+    opening = true; // Shared singleton latch BEFORE scaffold/custom UI can await or reenter.
+    return dispatch('config', context).finally(() => { opening = false; });
+  };
+  const handler: ZergPiCommandHandler = (input, context) => normalizeZergCommandInput(input).topic === 'config'
+    ? openManagement(context) : dispatch(input, context);
+  managementOpeners.set(handler, { openManagement, isOpening: () => opening,
+    setPreferences: (facade) => { uiPreferences = facade; } });
+  return handler;
 }
 
 function resolveZergStateSnapshot(stateOrReader: ZergStateSource): ZergState {
@@ -6926,6 +7121,7 @@ function workflowAgentTools(agent: ZergAgentDefinition): readonly string[] {
 }
 function signalWorkflowAbort(active: PiNativeActiveRun, admission: WorkflowAdmission): void {
   active.cancelRequested = true;
+  observeActivity(() => active.activity?.cancel(active.runId));
   for (const session of active.sessions) {
     // Retain promises independently of the active routing registry, even on dispose.
     try { admission.aborts.push(Promise.resolve(session.abort?.()).catch((error) => { admission.failures.push(workflowFailure(error)); })); }
@@ -6965,7 +7161,7 @@ function createOwnedWorkflowNative(
         const runId = (options.idFactory?.runId ?? defaultIdFactory.runId)();
         const taskId = (options.idFactory?.taskId ?? defaultIdFactory.taskId)();
         const identity = { runId, taskId };
-        const active = createPiNativeActiveRun(runId);
+        const active = createPiNativeActiveRun(runId, options.nativeActivity);
         const admission: WorkflowAdmission = { request, automation, tools: workflowAgentTools(request.agent), aborts: [], failures: [], cleanupSettled: true,
           assert() {
             assertPolicy(request.agent);
@@ -6999,6 +7195,7 @@ function createOwnedWorkflowNative(
           const started = applyRuntimeTransition(taskState, { entity: 'agent', action: 'start', id: runId, label: request.agent.label, kind: 'subagent', substate: 'starting', activity: 'read-only workflow unit', metadata: { taskId, agentDefinitionId: request.agent.id, launchMode: 'fresh', workflow: lineage } }, { now: () => new Date(now) });
           published = true;
           container.replace(started);
+          observeActivity(() => options.nativeActivity?.begin({ runId, taskId, label: request.agent.label, startedAt: now, phase: 'starting' }));
           admission.assert();
           await runSinglePiNativeAgent(context, request.agent, { task: request.prompt, runId, taskId, parentRunId: runId, request: nativeRequest, options, container, activeRun: active });
           outcome = admission.result ?? { status: active.cancelRequested ? 'cancelled' : 'unverified', error: 'No exact workflow assistant outcome captured.', cleanupSettled: admission.cleanupSettled };
@@ -7024,6 +7221,7 @@ function createOwnedWorkflowNative(
             container.replace(updateRunTaskLifecycle(stopped, taskId, status, status === 'done' ? 'completed' : status, reason, now));
           } catch (error) { outcome = { ...outcome, status: 'unverified', error: `Workflow terminal publication failed: ${workflowFailure(error)}` }; }
         }
+        observeActivity(() => options.nativeActivity?.finish(runId, outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : outcome.status === 'failed' ? 'failed' : 'unknown'));
         return outcome;
       });
       jobs.add(job);

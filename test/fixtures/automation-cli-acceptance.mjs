@@ -40,6 +40,25 @@ export function assertSettledSessionEvidence(own) {
  const generation=created[0].owner?.generation;assert.ok(generation);
  for(const e of own.filter(e=>e.ownerCreated||e.snapshotCommitted||e.ownerRemoved))assert.equal(e.owner?.generation,generation,'owner generation must match throughout');
 }
+// SDK reads are parallel: quota outcomes belong to the full issued ID set,
+// not to assistant ordinal or completion order. Also used by pure offline tests.
+export function assertQuotaReadEvidence(events,{issuedToolCallIds,readText,successCount,maxReadBytes}) {
+ assert.equal(issuedToolCallIds.length,successCount+1);
+ assert.deepEqual(issuedToolCallIds,[...issuedToolCallIds.keys()].map(i=>'read'+i));
+ assert.equal(events.length,issuedToolCallIds.length);
+ const ids=events.map(e=>e.toolCallId);assert.equal(new Set(ids).size,ids.length,'duplicate read ID');
+ assert.deepEqual([...ids].sort(),[...issuedToolCallIds].sort(),'every issued read ID must appear exactly once');
+ const delivered=events.filter(e=>e.isError===false),errors=events.filter(e=>e.isError===true);
+ assert.equal(delivered.length,successCount);assert.equal(errors.length,1);
+ const textHash=hash(readText),textBytes=Buffer.byteLength(readText);
+ for(const e of delivered){assert.equal(e.textHash,textHash);assert.equal(e.textBytes,textBytes);}
+ const total=delivered.reduce((n,e)=>n+e.textBytes,0);
+ assert.equal(total,successCount*textBytes);assert.ok(total<=maxReadBytes);if(successCount===2)assert.equal(total,maxReadBytes);
+ assert.ok(total+textBytes>maxReadBytes,'one further read must exceed the cumulative quota');
+ const denied=errors[0];assert.notEqual(denied.textHash,textHash);assert.ok(denied.textBytes>0);
+ const refusal=['read-byte-limit','Operation aborted'].find(text=>hash(text)===denied.textHash);
+ assert.ok(refusal,'public SDK refusal text must match quota error or its abort');assert.equal(denied.textBytes,Buffer.byteLength(refusal));
+}
 export async function acceptance(layout,evidence,focus) {
  assert.equal(process.env.ZERG_WORKFLOW_AUTOMATION_ACCEPTANCE,'parent-approved');
  assert.ok(focus===undefined||focus==='quota-outcome'||focus==='lifecycle-proof','unsupported acceptance focus');
@@ -59,6 +78,7 @@ export async function acceptance(layout,evidence,focus) {
   const root=fs.mkdtempSync('/tmp/s8e-final-b2-'+name+'-');owned.push(root);
   for(const d of ['profiles','project','state','agents','sessions','home','home/.pi','home/.pi/agent','project/.pi'])fs.mkdirSync(root+'/'+d,{mode:0o700});
   const readText=options.readText??'SCOPED_ACCEPTANCE_TEXT';
+  const paths=options.readPathsRequested??['public.txt'];
   fs.writeFileSync(root+'/project/public.txt',readText,{mode:0o600});fs.writeFileSync(root+'/outside.txt','OUTSIDE_SENTINEL',{mode:0o600});fs.symlinkSync(root+'/outside.txt',root+'/project/link.txt');
   const sentinel='RESOURCE_TRAP_DO_NOT_LOAD';for(const f of ['project/AGENTS.md','project/.pi/settings.json','home/.pi/agent/auth.json','home/.pi/agent/models.json','home/.pi/agent/settings.json'])fs.writeFileSync(root+'/'+f,sentinel,{mode:0o600});
   const requests=[],durable=[],processes=[],children=[];let observedResolve;const observed=new Promise(r=>observedResolve=r);
@@ -70,7 +90,6 @@ export async function acceptance(layout,evidence,focus) {
     if(options.hold)return;
     if(options.providerFailure){res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:'PROVIDER_SECRET_TEXT',type:'invalid_request_error'}}));return;}
     const hasTools=body.messages.some(m=>m.role==='tool');
-    const paths=options.readPathsRequested??['public.txt'];
     const delta=!hasTools?{role:'assistant',tool_calls:paths.map((p,i)=>({index:i,id:'read'+i,type:'function',function:{name:'read',arguments:JSON.stringify({path:p})}}))}:{role:'assistant',content:options.longOutput?'PROVIDER_SECRET_TEXT'.repeat(3000):JSON.stringify('ok')};
     res.writeHead(200,{'content-type':'text/event-stream'});
     for(const chunk of [{id:'fixture',object:'chat.completion.chunk',created:1,model:'dummy',choices:[{index:0,delta,finish_reason:null}]},{id:'fixture',object:'chat.completion.chunk',created:1,model:'dummy',choices:[{index:0,delta:{},finish_reason:hasTools?'stop':'tool_calls'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}}])res.write('data: '+JSON.stringify(chunk)+'\n\n');res.end('data: [DONE]\n\n');
@@ -102,7 +121,7 @@ export async function acceptance(layout,evidence,focus) {
    children.push({child,done});return {child,done};
   }
   const beforeState=()=>{const rows=[];function walk(dir){for(const f of fs.readdirSync(dir).sort()){const p=dir+'/'+f;if(fs.lstatSync(p).isDirectory())walk(p);else rows.push([path.relative(root+'/state',p),hash(fs.readFileSync(p))]);}}walk(root+'/state');return rows;};
-  const waitObserved=async()=>{let timer;try{await Promise.race([observed,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('provider-not-observed')),20000);})]);}finally{clearTimeout(timer);}};const context={root,profile,save,event,requests,durable,start,observed,waitObserved,beforeState,readText};
+  const waitObserved=async()=>{let timer;try{await Promise.race([observed,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('provider-not-observed')),20000);})]);}finally{clearTimeout(timer);}};const context={root,profile,save,event,requests,durable,start,observed,waitObserved,beforeState,readText,issuedToolCallIds:paths.map((_,i)=>'read'+i)};
   let pass=false,error;
   try{await execute(context);for(const p of processes){if(!p.signal)assert.ok(p.result,JSON.stringify(p));assert.ok(!p.stdout.includes('DUMMY-NOT-CREDENTIAL'));assert.ok(!p.stdout.includes('PROVIDER_SECRET_TEXT'));assert.ok(!p.stdout.includes('SCOPED_ACCEPTANCE_TEXT'));assert.ok(!p.stdout.includes(readText));assert.ok(!p.stdout.includes(sentinel));assert.ok(p.stdout.length<=1024);}
    const probes=fs.existsSync(root+'/probe.jsonl')?fs.readFileSync(root+'/probe.jsonl','utf8').trim().split('\n').filter(Boolean).map(s=>JSON.parse(s)):[];
@@ -116,10 +135,7 @@ export async function acceptance(layout,evidence,focus) {
  const quotaFailure=async(c,reason,successCount)=>{
   const p=await c.start().done;assert.notEqual(p.code,0);assert.equal(p.result.reasonCode,reason);
   const events=fs.readFileSync(c.root+'/probe.jsonl','utf8').trim().split('\n').map(s=>JSON.parse(s)).filter(e=>e.pid===p.pid&&e.toolExecutionEnd);
-  assert.equal(events.length,successCount+1);const delivered=events.slice(0,successCount),denied=events.at(-1);
-  for(const e of delivered){assert.equal(e.isError,false);assert.equal(e.textHash,hash(c.readText));assert.equal(e.textBytes,Buffer.byteLength(c.readText));}
-  assert.equal(delivered.reduce((n,e)=>n+e.textBytes,0),successCount*Buffer.byteLength(c.readText));assert.ok(delivered.reduce((n,e)=>n+e.textBytes,0)<=c.profile.limits.maxReadBytes);if(successCount===2)assert.equal(delivered.reduce((n,e)=>n+e.textBytes,0),c.profile.limits.maxReadBytes);
-  assert.equal(denied.isError,true);assert.notEqual(denied.textHash,hash(c.readText));assert.ok(denied.textBytes>0);assert.ok([hash('read-byte-limit'),hash('Operation aborted')].includes(denied.textHash),'public SDK refusal text must match quota error or its abort');assert.equal(denied.toolCallId,'read'+successCount);
+  assertQuotaReadEvidence(events,{issuedToolCallIds:c.issuedToolCallIds,readText:c.readText,successCount,maxReadBytes:c.profile.limits.maxReadBytes});
   const count=c.requests.length;const before=c.beforeState();const duplicates=[];
   for(const op of ['run','status','report'])duplicates.push(await c.start(op).done);
   assert.equal(c.requests.length,count);assert.deepEqual(c.beforeState(),before);

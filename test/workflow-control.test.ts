@@ -13,6 +13,8 @@ import type { ZergControl, ZergStateContainer, StructuralPiCommandOptions } from
 // This module never starts the SDK. Dynamic SDK imports resolve only to this
 // bounded in-memory fake: no files, resources, tools, model transport or PTY.
 const fakeSource = `
+// Deliberately unsupported: no shortcut resolver or registration capability.
+export class ExtensionRunner {}
 const h = new Proxy({}, {get:(_t,k)=>globalThis.__zergWorkflowFakeHost[k],set:(_t,k,v)=>{globalThis.__zergWorkflowFakeHost[k]=v;return true;}});
 export const getAgentDir = () => '/fake-owned-agent';
 export const ModelRuntime = { async create() { h.loads++; await h.setup?.(); return { getAvailable: () => [{provider:'fake',id:'model'}] }; } };
@@ -44,6 +46,8 @@ const sdkHook = registerHooks({ resolve(specifier, context, next) {
 } });
 after(() => sdkHook.deregister());
 const { createZergControl, registerZergSwarmExtension } = await import('../index.js');
+const { installManagementShortcutCatalogGuard } = await import('../internal-patch.js');
+const { ExtensionRunner } = await import(fakeUrl);
 const { recoverZergStateAfterRestart } = await import('../persistence.js');
 
 type FakeHost = Record<string, any>;
@@ -94,6 +98,26 @@ function makeCodingRoot(label: string) {
   mkdirSync(join(root, 'src')); writeFileSync(join(root, 'src/a.txt'), 'old\n'); writeFileSync(join(root, 'src/readonly.txt'), `${'x'.repeat(5000)}\n`);
   return { root, staging };
 }
+
+test('fake Pi shortcut bridge stays unsupported, inert and unregistered', () => {
+  reset(); const prototype = ExtensionRunner.prototype;
+  const before = Object.getOwnPropertyDescriptors(prototype), parent = Object.getPrototypeOf(prototype);
+  let registrations = 0, callbacks = 0;
+  assert.equal(Object.hasOwn(prototype, 'getShortcuts'), false);
+  const guard = installManagementShortcutCatalogGuard({
+    handler() {}, ownerCommandHandler() {}, candidate: 'alt+g',
+    enabled() { callbacks++; return true; }, register() { registrations++; },
+    validate() { callbacks++; return { ok: true }; }, onCatalog() { callbacks++; },
+  });
+  assert.equal(guard.installed, false); assert.equal(registrations, 0); assert.equal(callbacks, 0);
+  assert.deepEqual(Object.getOwnPropertyDescriptors(prototype), before);
+  assert.equal(Object.getPrototypeOf(prototype), parent);
+  guard.dispose(); guard.dispose();
+  assert.deepEqual(Object.getOwnPropertyDescriptors(prototype), before);
+  assert.equal(Object.getPrototypeOf(prototype), parent);
+  assert.equal(registrations, 0); assert.equal(callbacks, 0);
+  assert.equal(host.loads, 0); assert.equal(host.creates, 0); assert.equal(host.providers, 0);
+});
 
 test('workflow control does not trust fabricated native adapter kind or authority metadata', async () => {
   reset(); let launched = 0;
